@@ -32,7 +32,7 @@ Obsidian Graph 默认用**文件名**作节点标签。原先 32 个模块各有
 ### 1. 模块 MOC 主干图（首选默认）
 
 ```text
-tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_archive -path:_TEMPLATE -path:sglang
+tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_TEMPLATE -path:sglang
 ```
 
 用途：32 个模块的入口页（`*-MOC`），看清阅读体系骨架，节点数约 30。
@@ -40,7 +40,7 @@ tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_archive -path:_TEMPLATE -pat
 ### 2. 核心概念层
 
 ```text
-tag:#sglang/doc/concept -path:_archive -path:_TEMPLATE
+tag:#sglang/doc/concept -path:_TEMPLATE
 ```
 
 用途：各模块「是什么」——节点标签如 `07-Scheduler-核心概念`、`15-RadixAttention-核心概念`。
@@ -48,7 +48,7 @@ tag:#sglang/doc/concept -path:_archive -path:_TEMPLATE
 ### 3. 数据流 / 交互层
 
 ```text
-tag:#sglang/doc/dataflow -path:_archive -path:_TEMPLATE
+tag:#sglang/doc/dataflow -path:_TEMPLATE
 ```
 
 用途：ZMQ、HTTP、GPU 边界与 IO 结构。
@@ -56,7 +56,7 @@ tag:#sglang/doc/dataflow -path:_archive -path:_TEMPLATE
 ### 4. 源码走读层（最深）
 
 ```text
-tag:#sglang/doc/walkthrough -path:_archive -path:_TEMPLATE
+tag:#sglang/doc/walkthrough -path:_TEMPLATE
 ```
 
 用途：各模块主文档；节点较密，建议配合 Local Graph。
@@ -72,7 +72,7 @@ path:sglang_reading/02-请求调度 tag:#sglang/doc/concept
 ### 6. 索引与 onboarding（总结与索引）
 
 ```text
-tag:#sglang/index-layer -path:_archive
+tag:#sglang/index-layer
 ```
 
 用途：全链路追踪、导读路径、术语表等总结层。
@@ -80,7 +80,7 @@ tag:#sglang/index-layer -path:_archive
 ### 7. 排除 checkpoint 与噪声
 
 ```text
-path:sglang_reading -tag:#sglang/doc/checkpoint -path:_archive -path:_TEMPLATE -path:sglang
+path:sglang_reading -tag:#sglang/doc/checkpoint -path:_TEMPLATE -path:sglang
 ```
 
 用途：日常阅读关系图；去掉验收清单节点。
@@ -88,7 +88,7 @@ path:sglang_reading -tag:#sglang/doc/checkpoint -path:_archive -path:_TEMPLATE -
 ### 8. 全库可读图（仍不含 upstream 源码）
 
 ```text
--path:sglang -path:90_meta -path:_archive -path:_TEMPLATE
+-path:sglang -path:90_meta -path:_TEMPLATE
 ```
 
 ## 图谱颜色分组（已写入 `.obsidian/graph.json`）
@@ -106,7 +106,7 @@ path:sglang_reading -tag:#sglang/doc/checkpoint -path:_archive -path:_TEMPLATE -
 | `[doc_type:faq]` | 珊瑚 | FAQ |
 | `[doc_type:checkpoint]` | 灰 | 验收 |
 
-**默认过滤：** `path:sglang_reading -path:_archive -path:_TEMPLATE`（勿用 `-path:sglang`，会误排除 `sglang_reading`）
+**默认过滤：** `path:sglang_reading -path:_TEMPLATE`（勿用 `-path:sglang`，会误排除 `sglang_reading`）
 
 详情见 [[91_dashboard/graph-hub]]。
 

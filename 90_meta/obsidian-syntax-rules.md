@@ -186,7 +186,7 @@ Obsidian 标注块可用于调试备忘：
 默认过滤（复制到 Graph 搜索框）：
 
 ```text
-tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_archive -path:_TEMPLATE -path:sglang
+tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_TEMPLATE -path:sglang
 ```
 
 详见 [[obsidian-graph-presets]]。
@@ -208,9 +208,8 @@ tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_archive -path:_TEMPLATE -pat
 
 | 脚本 | 用途 |
 |------|------|
-| `90_meta/obsidian_fix_reading_order.mjs` | 批次文件加 `00`–`05` 阅读序前缀 + 双链重写 |
 | `90_meta/audit_wikilinks.mjs` | 扫描断链与 sidebar 排序 |
-| `90_meta/obsidian_fix_remaining_links.py` | 修补残留旧路径链接 |
+| `90_meta/audit_moc.py` | 批次六件套完整性审计 |
 | `90_meta/obsidian_cleanup_wikilinks.py` | 清理丑陋 alias、目录链接 |
 | `90_meta/fix_mermaid_newlines.py` | Mermaid `\n` → `<br/>` |
 

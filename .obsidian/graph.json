@@ -1,6 +1,6 @@
 {
   "collapse-filter": false,
-  "search": "path:sglang_reading -path:_archive -path:_TEMPLATE",
+  "search": "path:sglang_reading -path:_TEMPLATE",
   "showTags": false,
   "showAttachments": false,
   "hideUnresolved": false,

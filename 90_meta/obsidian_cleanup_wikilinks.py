@@ -99,7 +99,7 @@ def main() -> None:
     sglang_upstream = VAULT / "sglang"
     for base in (ROOT, VAULT):
         for md in base.rglob("*.md"):
-            if "_archive" in md.parts or "_TEMPLATE" in md.parts:
+            if "_TEMPLATE" in md.parts:
                 continue
             if sglang_upstream in md.parents:
                 continue

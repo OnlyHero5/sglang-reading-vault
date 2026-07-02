@@ -37,12 +37,18 @@ updated: 2026-07-02
 
 ## 更新摘要
 
+**2026-07-02 · 清理无用中间资产**
+
+- 删除 `_qa/` 生成脚本、`_archive/` 草稿、一次性迁移工具及 `audit_report.txt`
+- 删除已完成迁移脚本 `obsidian_fix_reading_order.mjs`、`obsidian_fix_remaining_links.py`
+- 同步图谱 / Dataview 过滤式，移除 `-path:_archive`
+
 **2026-07-02 · MOC 完整性审计与阶段导航补全**
 
 - 全库审计：**31/31 专题批次六件套完整**（无缺失正文、无薄 stub）；可运行 `python 90_meta/audit_moc.py` 复验
 - **新建** 阶段 MOC：`03-模型执行`、`04-内存与Attention`、`05-高级特性`、`06-扩展组件`
 - **修复断链**：26-sgl-kernel `25-Quantization` → `19-Quantization`；32-CheckpointEngine `README` → `07-总结与索引-MOC`
-- **新建** `07-总结与索引/_archive/_archive-MOC.md`；`07-总结与索引-MOC` 补 frontmatter
+- **补全** `07-总结与索引-MOC` frontmatter（早期草稿目录已后续删除）
 - `index.md` 阶段表指向完整 7 阶段 MOC 链
 
 **2026-07-02 · 标杆补全（评估剩余项 v3）**
@@ -69,14 +75,14 @@ updated: 2026-07-02
 - 升级批次 21–23 README 为 rich 模板（mermaid + Persona + 验证建议）
 - 扩充 12/17 ModelLoader·Attention 03；10/01 补 MultiDetokenizerRouter 与 skip-tokenizer 决策树
 - HTTP/gRPC 04-关键问题 补全 ETC Comment；09/04 增验证建议；07/03 修正架构图
-- 06/07 03 概念摘录替换为 io_struct 实码；`_archive/` 收缩为 redirect  stub
+- 06/07 03 概念摘录替换为 io_struct 实码
 - 31/32 checkpoint 读者自测勾选完成
 
 **2026-07-02 · 内容补齐**
 
 - 索引层补齐 12 核心概念、用户故事、设计追问与 gRPC 全链路追踪
 - 新建批次 31（可观测性）、32（CheckpointEngine 权重热更新）
-- 旧版草稿归档至 `07-总结与索引/_archive/`
+- 旧版 batch-30 草稿已归档后删除（现用 onboard 六件套）
 - 32 批专题文档全部完成
 
 **2026-07-02 · 可读性优化**

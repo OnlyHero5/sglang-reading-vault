@@ -20,7 +20,7 @@ TABLE WITHOUT ID
   length(filter(rows, (r) => r.doc_type = "moc")) AS "MOC",
   length(filter(rows, (r) => r.doc_type = "walkthrough")) AS "走读"
 FROM "sglang_reading"
-WHERE batch AND !contains(file.path, "_archive") AND !contains(file.path, "_TEMPLATE")
+WHERE batch AND !contains(file.path, "_TEMPLATE")
 GROUP BY batch
 SORT number(batch) ASC
 ```
@@ -42,7 +42,6 @@ TABLE WITHOUT ID
   link(file.link, title) AS "文档",
   file.folder AS "目录"
 FROM "sglang_reading/07-总结与索引"
-WHERE !contains(file.path, "_archive")
 SORT file.name ASC
 ```
 

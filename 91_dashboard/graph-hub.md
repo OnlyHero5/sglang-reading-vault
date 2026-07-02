@@ -19,7 +19,7 @@ updated: 2026-07-02
 ## 当前默认过滤（`.obsidian/graph.json`）
 
 ```text
-path:sglang_reading -path:_archive -path:_TEMPLATE
+path:sglang_reading -path:_TEMPLATE
 ```
 
 > **勿用** `-path:sglang` — Obsidian 会误匹配 `sglang_reading`，导致图谱空白。
@@ -47,19 +47,19 @@ path:sglang_reading -path:_archive -path:_TEMPLATE
 **模块骨架（最简）**
 
 ```text
-tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_archive -path:_TEMPLATE
+tag:#sglang/doc/moc OR tag:#sglang/stage-moc -path:_TEMPLATE
 ```
 
 **概念学习**
 
 ```text
-tag:#sglang/doc/concept -path:_archive
+tag:#sglang/doc/concept -path:_TEMPLATE
 ```
 
 **含 checkpoint 全量**
 
 ```text
-path:sglang_reading -path:_archive -path:_TEMPLATE -path:sglang
+path:sglang_reading -path:_TEMPLATE -path:sglang
 ```
 
 ## Local Graph 推荐起点

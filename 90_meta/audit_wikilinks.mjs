@@ -10,7 +10,7 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VAULT = path.resolve(__dirname, "..");
 const READING = path.join(VAULT, "sglang_reading");
-const SKIP = new Set(["_archive", "_TEMPLATE", ".obsidian", ".git", "sglang"]);
+const SKIP = new Set(["_TEMPLATE", ".obsidian", ".git", "sglang"]);
 
 /** @type {Map<string, string[]>} basename -> full paths relative to VAULT */
 const notesByBase = new Map();
