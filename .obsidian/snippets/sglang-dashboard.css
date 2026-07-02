@@ -1,0 +1,17 @@
+/* SGLang 源码阅读 vault — Dataview 仪表盘样式 */
+.markdown-preview-view .91_dashboard h2,
+.markdown-source-view .91_dashboard h2 {
+  margin-top: 1.6em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.markdown-preview-view .91_dashboard table,
+.markdown-source-view .91_dashboard table {
+  font-size: 0.92em;
+}
+
+.markdown-preview-view .91_dashboard .dataview.table-view-table thead th,
+.markdown-source-view .91_dashboard .dataview.table-view-table thead th {
+  background: var(--background-secondary);
+}

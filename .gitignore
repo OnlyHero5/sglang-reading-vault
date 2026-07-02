@@ -1,0 +1,33 @@
+# ── upstream 源码（本地对照用，请单独 clone）────────────────
+sglang/
+
+# ── OS ──────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# ── Node ────────────────────────────────────────────────────
+node_modules/
+
+# ── Obsidian 会话态（每人不同，不纳入版本库）────────────────
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/plugins/obsidian-git/data.json
+
+# ── 编辑器 / 工具 ───────────────────────────────────────────
+.cursor/
+.understand-anything/
+*.swp
+*.swo
+*~

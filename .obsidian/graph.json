@@ -1,0 +1,100 @@
+{
+  "collapse-filter": false,
+  "search": "path:sglang_reading -path:_archive -path:_TEMPLATE",
+  "showTags": false,
+  "showAttachments": false,
+  "hideUnresolved": false,
+  "showOrphans": true,
+  "collapse-color-groups": false,
+  "colorGroups": [
+    {
+      "query": "[type:index-doc]",
+      "color": {
+        "a": 1,
+        "rgb": 15073767
+      }
+    },
+    {
+      "query": "[type:index]",
+      "color": {
+        "a": 1,
+        "rgb": 15073767
+      }
+    },
+    {
+      "query": "[type:stage-moc]",
+      "color": {
+        "a": 1,
+        "rgb": 5987165
+      }
+    },
+    {
+      "query": "[doc_type:moc]",
+      "color": {
+        "a": 1,
+        "rgb": 7350967
+      }
+    },
+    {
+      "query": "[doc_type:concept]",
+      "color": {
+        "a": 1,
+        "rgb": 5140164
+      }
+    },
+    {
+      "query": "[doc_type:dataflow]",
+      "color": {
+        "a": 1,
+        "rgb": 16756291
+      }
+    },
+    {
+      "query": "[doc_type:walkthrough]",
+      "color": {
+        "a": 1,
+        "rgb": 10845885
+      }
+    },
+    {
+      "query": "[doc_type:faq]",
+      "color": {
+        "a": 1,
+        "rgb": 15466691
+      }
+    },
+    {
+      "query": "[doc_type:checkpoint]",
+      "color": {
+        "a": 1,
+        "rgb": 9803158
+      }
+    },
+    {
+      "query": "path:91_dashboard",
+      "color": {
+        "a": 1,
+        "rgb": 8900331
+      }
+    },
+    {
+      "query": "path:90_meta",
+      "color": {
+        "a": 1,
+        "rgb": 6710886
+      }
+    }
+  ],
+  "collapse-display": false,
+  "showArrow": true,
+  "textFadeMultiplier": 0,
+  "nodeSizeMultiplier": 1,
+  "lineSizeMultiplier": 1,
+  "collapse-forces": false,
+  "centerStrength": 0.518713248970312,
+  "repelStrength": 10,
+  "linkStrength": 1,
+  "linkDistance": 250,
+  "scale": 0.7132754626224416,
+  "close": false
+}

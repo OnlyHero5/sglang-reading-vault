@@ -1,0 +1,78 @@
+# MOC 完整性审计报告
+
+> 生成时间：2026-07-02  
+> 范围：`sglang_reading/` 全部 `*-MOC.md` 及五件套文档
+
+---
+
+## 结论摘要
+
+| 检查项 | 结果 |
+|--------|------|
+| 批次 00、02–32 六件套（MOC + 5 篇正文） | **31/31 完整** |
+| 正文薄 stub（<500 字） | **0** |
+| 每批代码块 ≥15、总行数 ≥200 | **全部通过**（最少 56 块 / ~921 行） |
+| 阶段 MOC（导航层） | **原缺 4 个，已补全** |
+| MOC 内断链 | **原 2 处，已修复** |
+
+**说明：** 用户感知的「MOC 有文档未实现」，经全库扫描后，**专题批次（02–32）五件套均已存在且含内嵌源码**。主要缺口是 **阶段导航 MOC 不完整**（仅 I、II 有阶段 MOC，III–VI 缺失）及 **少量错误双链**，而非 31 个专题批次正文缺失。
+
+---
+
+## 1. 批次六件套（专题层）
+
+以下 31 个目录均含完整 6 文件：
+
+`00-方法论`, `02-启动链路` … `32-CheckpointEngine`（见 progress.md 批次表）
+
+`07-总结与索引` 使用 onboard 命名（`01-项目总览` … `06-复杂度热点` + 索引文档），与 `_TEMPLATE` 约定等效。
+
+---
+
+## 2. 阶段 MOC（导航层）
+
+| 阶段 | 文件 | 状态 |
+|------|------|------|
+| I 启动与入口 | `01-启动与入口/01-启动与入口-MOC.md` | ✅ 已有 |
+| II 请求调度 | `02-请求调度/02-请求调度-MOC.md` | ✅ 已有 |
+| III 模型执行 | `03-模型执行/03-模型执行-MOC.md` | ✅ **本次新建** |
+| IV 内存与 Attention | `04-内存与Attention/04-内存与Attention-MOC.md` | ✅ **本次新建** |
+| V 高级特性 | `05-高级特性/05-高级特性-MOC.md` | ✅ **本次新建** |
+| VI 扩展组件 | `06-扩展组件/06-扩展组件-MOC.md` | ✅ **本次新建** |
+| VII 总结与索引 | `07-总结与索引/07-总结与索引-MOC.md` | ✅ 补 frontmatter |
+
+阶段 MOC ** intentionally 不含** `{阶段}-核心概念.md` 等五件套——子批次已覆盖；阶段 MOC 提供 mermaid 总览 + 阅读顺序 + 验收。
+
+---
+
+## 3. 已修复断链
+
+| 文件 | 原链接 | 修正 |
+|------|--------|------|
+| `26-sgl-kernel-MOC.md` | `[[25-Quantization-MOC]]` | `[[19-Quantization-MOC]]` |
+| `32-CheckpointEngine-MOC.md` | `[[README\|07-总结与索引]]` | `[[07-总结与索引-MOC]]` |
+| `SGLang源码阅读指南.md` | `[[_archive-MOC]]` | 新建 `_archive/_archive-MOC.md` |
+
+---
+
+## 4. understand-anything 对齐
+
+| 项 | 路径 | 状态 |
+|----|------|------|
+| 知识图谱 | `sglang/.understand-anything/knowledge-graph.json` | ✅ commit `70df09b` |
+| 业务域图 | `sglang/.understand-anything/domain-graph.json` | ✅ |
+| 写作侧引用 | PLAN.md §Skills 合规表 | 图谱供写作，读者不读 JSON |
+
+如需 vault 根目录图谱，可对 `sglang/` 运行 `/understand --language zh` 增量更新。
+
+---
+
+## 5. 建议后续（可选）
+
+1. 阶段 I/II 若需「阶段五件套」合成文，可另开任务（非 PLAN 强制）。
+2. 清理 batch 文档 `aliases: 01-核心概念` 等泛化别名，减少 Obsidian 歧义解析。
+3. Dataview `module-board` 可增加 `type = stage-moc` 查询段。
+
+---
+
+*审计脚本：`90_meta/audit_moc.py`*
