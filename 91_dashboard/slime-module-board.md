@@ -12,7 +12,7 @@ updated: 2026-07-03
 # Slime 模块总览
 
 ```dataview
-TABLE batch AS "批次", title AS "标题", file.link AS "入口"
+TABLE batch AS "专题序号", title AS "标题", file.link AS "入口"
 FROM "slime_reading"
 WHERE type = "module-moc"
 SORT number(batch) ASC

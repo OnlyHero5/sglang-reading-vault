@@ -12,7 +12,7 @@ updated: 2026-07-02
 # SGLang 模块总览
 
 ```dataview
-TABLE batch AS "批次", title AS "标题", file.link AS "入口"
+TABLE batch AS "专题序号", title AS "标题", file.link AS "入口"
 FROM "sglang_reading"
 WHERE type = "module-moc"
 SORT number(batch) ASC
@@ -64,4 +64,4 @@ SORT doc_type ASC
 |------|------|
 | [[91_dashboard/dual-library-path|双库联合路径]] | 推理 + RL 推荐阅读顺序 |
 | [[91_dashboard/cross-library-map|跨库专题对照]] | 推理 + RL 专题映射 |
-| [[91_dashboard/slime-module-board|Slime 模块总览]] | 30 批 MOC |
+| [[91_dashboard/slime-module-board|Slime 模块总览]] | 模块 MOC |

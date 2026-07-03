@@ -172,6 +172,7 @@ Mermaid 标签内将 `\n` 改为 `<br/>`。不要改动 Python 源码块中的 `
 - **禁止**在 H1、正文、Mermaid、双链 alias 中使用「批次 NN」——这是维护者进度编号，不是读者语言。
 - 用**模块名 / 专题名**（如「启动链路与 CLI」「HTTP Server 入口」）替代。
 - frontmatter 保留 `batch:` 与 `tags: sglang/batch/NN` 供图谱过滤；读者界面不展示。
+- 正文以中文为主；若内嵌 README、docstring、help text 等长英文源码摘录，须在代码块后补一段 `中文释义` 或等价中文说明。标识符、函数名、CLI flag、协议名可保留英文。
 
 ### 4.2 禁止误链
 

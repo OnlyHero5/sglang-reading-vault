@@ -46,7 +46,7 @@ updated: 2026-07-03
 | 跨库专题对照 | [[91_dashboard/cross-library-map]] |
 | 可视化入口 | [[91_dashboard/home]] |
 | 关系图谱 | [[90_meta/obsidian-graph-presets]] · [[91_dashboard/graph-hub]] |
-| 批次统计 | [[91_dashboard/batch-stats]] |
+| 专题统计 | [[91_dashboard/batch-stats|专题统计]] |
 | 文档类型分布 | [[91_dashboard/doc-type-map]] |
 
 ### SGLang（推理）
