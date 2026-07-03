@@ -1,6 +1,8 @@
 # AI Infra Reading Vault
 
-> 中文自包含源码阅读知识库 · **推理 serving + RL 后训练**  
+**中文 LLM 系统 / AI infra 源码阅读知识库** — 推理 serving（SGLang）+ RL 后训练（Slime），Obsidian 自包含笔记。
+
+> 中文自包含源码阅读 · **推理 serving + RL 后训练**  
 > [SGLang](https://github.com/sgl-project/sglang) · [Slime](https://github.com/THUDM/slime) · Obsidian
 
 [![AI Infra](https://img.shields.io/badge/AI_Infra-Reading_Vault-2563eb)](#这是什么)
