@@ -14,12 +14,12 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能画出 GrammarManager 异步编译 → apply_mask → sample 完整链路
-- [x] 能对比 xgrammar/outlines/llguidance 三后端差异
-- [x] 能说明 penalty 与 grammar mask 的施加顺序
-- [x] 能解释 `--grammar-backend none` 与 thinking_budget 行为
-- [x] 能说出 json_schema 与 regex 的 cache key 区别
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能画出 GrammarManager 异步编译 → apply_mask → sample 完整链路
+- [ ] 能对比 xgrammar/outlines/llguidance 三后端差异
+- [ ] 能说明 penalty 与 grammar mask 的施加顺序
+- [ ] 能解释 `--grammar-backend none` 与 thinking_budget 行为
+- [ ] 能说出 json_schema 与 regex 的 cache key 区别
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论（3 句话）
 

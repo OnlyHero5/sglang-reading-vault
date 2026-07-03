@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 ModelRegistry 如何通过 EntryClass 注册 architecture
-- [x] 能画出 ModelLoader → Registry → ModelRunner → model.forward → RadixAttention 的位置
-- [x] 能说出 3 个核心组件：`resolve_model_cls`、`LlamaAttention`、`Qwen3Attention`（文档中均有内嵌代码）
-- [x] 能追踪一条权重加载路径：HF `q_proj` → `qkv_proj` stacked mapping → GPU param
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明 ModelRegistry 如何通过 EntryClass 注册 architecture
+- [ ] 能画出 ModelLoader → Registry → ModelRunner → model.forward → RadixAttention 的位置
+- [ ] 能说出 3 个核心组件：`resolve_model_cls`、`LlamaAttention`、`Qwen3Attention`（文档中均有内嵌代码）
+- [ ] 能追踪一条权重加载路径：HF `q_proj` → `qkv_proj` stacked mapping → GPU param
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

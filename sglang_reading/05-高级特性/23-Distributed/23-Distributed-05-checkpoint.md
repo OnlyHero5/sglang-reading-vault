@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能说明 TP/PP/EP/DP/CP 各维度的用途
-- [x] 能画出 initialize_model_parallel 在启动链中的位置
-- [x] 能说出 GroupCoordinator、communication_op、DataParallelController 的职责
-- [x] 能解释为何层代码应调用 tensor_model_parallel_all_reduce 而非裸 dist
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能说明 TP/PP/EP/DP/CP 各维度的用途
+- [ ] 能画出 initialize_model_parallel 在启动链中的位置
+- [ ] 能说出 GroupCoordinator、communication_op、DataParallelController 的职责
+- [ ] 能解释为何层代码应调用 tensor_model_parallel_all_reduce 而非裸 dist
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论
 

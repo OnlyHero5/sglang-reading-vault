@@ -14,14 +14,14 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 gRPC 模块职责：Proto 契约 + Rust Tonic 服务 + Python RuntimeHandle 桥接
-- [x] 能画出 gRPC 客户端 → Tonic → PyBridge → TokenizerManager → Scheduler 的位置图
-- [x] 能说出 3 个核心组件及其职责：
+- [ ] 仅读本模块 sglang_reading，能口头说明 gRPC 模块职责：Proto 契约 + Rust Tonic 服务 + Python RuntimeHandle 桥接
+- [ ] 能画出 gRPC 客户端 → Tonic → PyBridge → TokenizerManager → Scheduler 的位置图
+- [ ] 能说出 3 个核心组件及其职责：
  - `SglangServiceImpl`（Rust Tonic handler）
  - `PyBridge` / `ChunkCallback`（跨语言 channel 与背压）
  - `RuntimeHandle`（Python 侧 submit_request / generate_request）
-- [x] 能追踪一条 `TextGenerate(stream=true)` 从 RPC 到 token chunk 再回 gRPC stream 的路径
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 能追踪一条 `TextGenerate(stream=true)` 从 RPC 到 token chunk 再回 gRPC stream 的路径
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

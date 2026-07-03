@@ -149,6 +149,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
 **Comment：**
 
+- 英文 docstring 的核心意思：Engine 由 TokenizerManager、Scheduler、DetokenizerManager 三部分组成；HTTP、Engine、TokenizerManager 在主进程，Scheduler/Detokenizer 走子进程，进程间用 ZMQ IPC。
 - `dp_size > 1` 时还会启动 **DataParallelController** 子进程，由它再 fork 多个 Scheduler（见 `02-源码走读` §2.3）。
 - `detokenizer_worker_num > 1` 时 Detokenizer 前有 **MultiDetokenizerRouter** 做 fan-out。
 

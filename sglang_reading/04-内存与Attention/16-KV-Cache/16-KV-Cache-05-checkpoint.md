@@ -14,12 +14,12 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能解释 Token 级与 Page 级 KV 索引分配器的区别与选型
-- [x] 能画出 prefill extend / decode 两条 alloc 路径
-- [x] 能说出 BaseTokenToKVPoolAllocator、PagedTokenToKVPoolAllocator、HostKVCache 职责
-- [x] 能说明 alloc 返回 None 时 Scheduler 如何处理
-- [x] 能解释 HiCache L2/L3 分层与 Storage 工厂角色
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能解释 Token 级与 Page 级 KV 索引分配器的区别与选型
+- [ ] 能画出 prefill extend / decode 两条 alloc 路径
+- [ ] 能说出 BaseTokenToKVPoolAllocator、PagedTokenToKVPoolAllocator、HostKVCache 职责
+- [ ] 能说明 alloc 返回 None 时 Scheduler 如何处理
+- [ ] 能解释 HiCache L2/L3 分层与 Storage 工厂角色
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论（3 句话）
 
@@ -33,7 +33,7 @@ updated: 2026-07-02
 - `HybridCacheController` prefetch 状态机 → HiCache 专批
 - Mooncake/NIXL storage 后端部署细节 → 运维文档
 
-## 建议补充 KG 节点
+## 后续可补充主题
 
 - `BaseTokenToKVPoolAllocator` / `TokenToKVPoolAllocator` / `PagedTokenToKVPoolAllocator`
 - `alloc_extend` / `alloc_decode` / `alloc_extend_kernel`

@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能说明 LoRAManager、LoRAMemoryPool、BaseLayerWithLoRA 的分工
-- [x] 能追踪请求 lora_id 从 API 到 CSGMV kernel 的路径
-- [x] 能解释 max_loras_per_batch 与 LRU eviction 的关系
-- [x] 能说出 embedding LoRA 与 linear LoRA 计算路径差异
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能说明 LoRAManager、LoRAMemoryPool、BaseLayerWithLoRA 的分工
+- [ ] 能追踪请求 lora_id 从 API 到 CSGMV kernel 的路径
+- [ ] 能解释 max_loras_per_batch 与 LRU eviction 的关系
+- [ ] 能说出 embedding LoRA 与 linear LoRA 计算路径差异
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论
 

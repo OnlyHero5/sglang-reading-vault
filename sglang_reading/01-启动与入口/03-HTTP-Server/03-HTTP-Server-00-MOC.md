@@ -100,6 +100,8 @@ def launch_server(
     )
 ```
 
+**中文释义：** `launch_server` 先启动 SRT 运行时服务：主进程承载 HTTP Server、Engine 与 TokenizerManager；Scheduler 和 DetokenizerManager 是子进程，三者之间通过 ZMQ IPC 通信。
+
 **Code（FastAPI 实例创建 — `_setup_and_run_http_server` 内，见 [[03-HTTP-Server-02-源码走读|源码走读 §2.2]]）：**
 
 ```python

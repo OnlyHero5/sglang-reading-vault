@@ -16,24 +16,24 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明：HTTP 层是 FastAPI 薄路由，引擎逻辑在 `Engine._launch_subprocesses` + `TokenizerManager`
-- [x] 能画出本模块在全局架构中的位置：入口层（启动链路）→ HTTP/Engine（本模块）→ TokenizerManager（TokenizerManager）→ Scheduler（Scheduler）
-- [x] 能说出 3 个核心类/函数及其职责：
+- [ ] 仅读本模块 sglang_reading，能口头说明：HTTP 层是 FastAPI 薄路由，引擎逻辑在 `Engine._launch_subprocesses` + `TokenizerManager`
+- [ ] 能画出本模块在全局架构中的位置：入口层（启动链路）→ HTTP/Engine（本模块）→ TokenizerManager（TokenizerManager）→ Scheduler（Scheduler）
+- [ ] 能说出 3 个核心类/函数及其职责：
  - `launch_server` — 拉起子进程并启动 uvicorn/Granian
  - `Engine._launch_subprocesses` — Scheduler/Detokenizer/Tokenizer 启动总控
  - `generate_request`（HTTP）— Native API 入口，委托 `tokenizer_manager.generate_request`
-- [x] 能追踪 `POST /generate` 从 FastAPI 到 TokenizerManager 的路径（见 03-数据流与交互.md §5）
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 能追踪 `POST /generate` 从 FastAPI 到 TokenizerManager 的路径（见 03-HTTP-Server-03-数据流与交互.md §5）
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 内嵌源码统计
 
 | 文件 | 代码块数 | 约行数 |
 |------|----------|--------|
-| README.md | 1 | 35 |
-| 01-核心概念.md | 4 | 75 |
-| 02-源码走读.md | 12 | 220 |
-| 03-数据流与交互.md | 7 | 95 |
-| 04-关键问题.md | 6 | 70 |
+| 03-HTTP-Server-00-MOC.md | 1 | 35 |
+| 03-HTTP-Server-01-核心概念.md | 4 | 75 |
+| 03-HTTP-Server-02-源码走读.md | 12 | 220 |
+| 03-HTTP-Server-03-数据流与交互.md | 7 | 95 |
+| 03-HTTP-Server-04-关键问题.md | 6 | 70 |
 | **合计** | **30** | **~495** |
 
 ## 核心结论（3 句话）

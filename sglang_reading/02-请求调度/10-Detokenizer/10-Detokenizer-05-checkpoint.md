@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 Detokenizer 进程职责
-- [x] 能画出 Scheduler → Detokenizer → TokenizerManager 的 ZMQ 数据流
-- [x] 能说出 3 个核心类/函数：`DetokenizerManager`、`DecodeStatus`、`_decode_batch_token_id_output`（或 `FanOutCommunicator` 与控制面关系）
-- [x] 能追踪一条 streaming 请求在 Detokenizer 内的 offset 更新与 `�` 处理
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明 Detokenizer 进程职责
+- [ ] 能画出 Scheduler → Detokenizer → TokenizerManager 的 ZMQ 数据流
+- [ ] 能说出 3 个核心类/函数：`DetokenizerManager`、`DecodeStatus`、`_decode_batch_token_id_output`（或 `FanOutCommunicator` 与控制面关系）
+- [ ] 能追踪一条 streaming 请求在 Detokenizer 内的 offset 更新与 `�` 处理
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 
@@ -35,9 +35,9 @@ updated: 2026-07-02
 
 | 文件 | 代码块数（约） |
 |------|----------------|
-| README.md | 1 |
-| 01-核心概念.md | 4 |
-| 02-源码走读.md | 11 |
-| 03-数据流与交互.md | 6 |
-| 04-关键问题.md | 6 |
+| 10-Detokenizer-00-MOC.md | 1 |
+| 10-Detokenizer-01-核心概念.md | 4 |
+| 10-Detokenizer-02-源码走读.md | 11 |
+| 10-Detokenizer-03-数据流与交互.md | 6 |
+| 10-Detokenizer-04-关键问题.md | 6 |
 | **合计** | **≥ 28 段** |

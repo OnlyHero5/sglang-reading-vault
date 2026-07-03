@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明投机解码 Draft→Verify 两阶段职责
-- [x] 能画出 Spec Worker 在 Scheduler 与 KV Cache 之间的位置
-- [x] 能说出 `SpeculativeAlgorithm`、`EAGLEWorkerV2`、`NGRAMWorker` 三者职责（文档中均有内嵌代码）
-- [x] 能追踪一条 EAGLE decode step：draft → verify → reject sampling → KV 写回
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明投机解码 Draft→Verify 两阶段职责
+- [ ] 能画出 Spec Worker 在 Scheduler 与 KV Cache 之间的位置
+- [ ] 能说出 `SpeculativeAlgorithm`、`EAGLEWorkerV2`、`NGRAMWorker` 三者职责（文档中均有内嵌代码）
+- [ ] 能追踪一条 EAGLE decode step：draft → verify → reject sampling → KV 写回
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 
@@ -33,8 +33,8 @@ updated: 2026-07-02
 
 ## Wave-3 升级（2026-07-02）
 
-- [x] `03-数据流与交互.md`：`EagleVerifyInput` / `move_accept_tokens_to_target_kvcache` / `AdaptiveController` 替换为实码（eagle_info.py、spec_utils.py、adaptive_runtime_state.py）
-- [x] `03-数据流与交互.md`：新增 §8「用户故事：一步投机的内心独白」
-- [x] `01-核心概念.md`：新增 §6 设计追问（accept rate 低 → 调步数/batch/关 spec）
-- [x] `04-关键问题.md`：新增 Q7 SGLang EAGLE vs vLLM spec decode 架构对比
+- [x] `21-Speculative-03-数据流与交互.md`：`EagleVerifyInput` / `move_accept_tokens_to_target_kvcache` / `AdaptiveController` 替换为实码（eagle_info.py、spec_utils.py、adaptive_runtime_state.py）
+- [x] `21-Speculative-03-数据流与交互.md`：新增 §8「用户故事：一步投机的内心独白」
+- [x] `21-Speculative-01-核心概念.md`：新增 §6 设计追问（accept rate 低 → 调步数/batch/关 spec）
+- [x] `21-Speculative-04-关键问题.md`：新增 Q7 SGLang EAGLE vs vLLM spec decode 架构对比
 - [x] 使用实码片段，Explain 段落完整

@@ -14,12 +14,12 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 CheckpointEngine 运行时热更新的职责
-- [x] 能画出 ParameterServer → HTTP → Scheduler → ModelRunner 的数据流
-- [x] 能说出 3 个核心类/函数及其职责（FlattenedTensorBucket、SGLangCheckpointEngineWorkerExtensionImpl、update_weights_from_ipc）
-- [x] 能解释 wait_weights_before_ready 与 initial_weights_loaded 的关系
-- [x] 能说明热更新为何必须 flush_cache
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明 CheckpointEngine 运行时热更新的职责
+- [ ] 能画出 ParameterServer → HTTP → Scheduler → ModelRunner 的数据流
+- [ ] 能说出 3 个核心类/函数及其职责（FlattenedTensorBucket、SGLangCheckpointEngineWorkerExtensionImpl、update_weights_from_ipc）
+- [ ] 能解释 wait_weights_before_ready 与 initial_weights_loaded 的关系
+- [ ] 能说明热更新为何必须 flush_cache
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

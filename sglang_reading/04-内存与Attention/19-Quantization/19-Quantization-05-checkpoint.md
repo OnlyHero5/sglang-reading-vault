@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能解释 QuantizationConfig + Method 双轨扩展模型
-- [x] 能说明 FP8 dispatch 按 SM 版本选 backend 的逻辑
-- [x] 能对比 GPTQ/AWQ/Marlin 路径差异
-- [x] 能解释 KV cache quant 与 Attention 的协作方式
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能解释 QuantizationConfig + Method 双轨扩展模型
+- [ ] 能说明 FP8 dispatch 按 SM 版本选 backend 的逻辑
+- [ ] 能对比 GPTQ/AWQ/Marlin 路径差异
+- [ ] 能解释 KV cache quant 与 Attention 的协作方式
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论（3 句话）
 

@@ -170,7 +170,7 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 **Code：**
 
 ```python
-## 来源：python/sglang/srt/distributed/parallel_state_wrapper.py L5-L24
+## 来源：python/sglang/srt/distributed/parallel_state_wrapper.py L5-L23
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ParallelState:
     tp_rank: int

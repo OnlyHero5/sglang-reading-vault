@@ -3,6 +3,7 @@ type: index
 title: "SGLang 源码阅读指南"
 tags:
  - sglang/index
+ - sglang/doc/index
 updated: 2026-07-03
 ---
 

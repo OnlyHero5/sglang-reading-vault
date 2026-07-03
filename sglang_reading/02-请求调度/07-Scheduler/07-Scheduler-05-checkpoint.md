@@ -14,14 +14,14 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 Scheduler 职责：GPU 子进程、Continuous Batching、驱动 TpWorker
-- [x] 能画出 Scheduler 在 TokenizerManager ↔ TpWorker ↔ Detokenizer 之间的位置
-- [x] 能说出 3 个核心函数/组件及其职责：
+- [ ] 仅读本模块 sglang_reading，能口头说明 Scheduler 职责：GPU 子进程、Continuous Batching、驱动 TpWorker
+- [ ] 能画出 Scheduler 在 TokenizerManager ↔ TpWorker ↔ Detokenizer 之间的位置
+- [ ] 能说出 3 个核心函数/组件及其职责：
  - `get_next_batch_to_run` — prefill 优先、merge、decode 更新
  - `event_loop_overlap` — CPU/GPU 流水线
  - `SchedulerRequestReceiver.recv_requests` — ZMQ 收包 + broadcast
-- [x] 能追踪一条 generate 请求：`handle_generate_request` → `waiting_queue` → prefill → `running_batch` → decode → `stream_output`
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 能追踪一条 generate 请求：`handle_generate_request` → `waiting_queue` → prefill → `running_batch` → decode → `stream_output`
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

@@ -30,7 +30,7 @@ updated: 2026-07-02
 **Code：**
 
 ```python
-## 来源：python/sglang/srt/managers/detokenizer_manager.py L483-L506
+## 来源：python/sglang/srt/managers/detokenizer_manager.py L483-L505
 def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,

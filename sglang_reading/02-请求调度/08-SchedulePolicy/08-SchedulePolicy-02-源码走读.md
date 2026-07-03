@@ -10,7 +10,7 @@ tags:
  - sglang/doc/walkthrough
 aliases:
  - "02-源码走读"
-updated: 2026-07-02
+updated: 2026-07-03
 ---
 # 调度策略 · 源码走读
 
@@ -20,6 +20,18 @@ updated: 2026-07-02
 2. `schedule_policy.py` — `PrefillAdder` 预算准入
 3. `prefill_delayer.py` — 跨 rank prefill 延迟协商
 4. `min_free_slots_delayer.py` — 本地 slot 延迟
+
+## 首次阅读路径（约 30 分钟）
+
+| 顺序 | 章节锚点 | 读完应能回答的问题 | 预计分钟 |
+|------|----------|-------------------|----------|
+| 1 | [[#1.2 `calc_priority` — 调度主入口]] | `waiting_queue` 如何排序、LPM 何时自动降级 FCFS？ | 7 |
+| 2 | [[#1.3 `_compute_prefix_matches` — 批内前缀]] | 批内前缀共享如何产生 deprioritize 集合？ | 5 |
+| 3 | [[#2.5 `add_one_req` — 单请求准入（核心）]] | 单条 prefill 何时被接受、拒绝或 chunked？ | 8 |
+| 4 | [[#2.3 `budget_state` — 能否继续加请求]] | token/page 预算如何判定 batch 已满？ | 5 |
+| 5 | [[#2.6 `preempt_to_schedule` — 优先级抢占]] | 高优先级请求如何抢占 running batch 中的 slot？ | 5 |
+
+**跳过策略：** §1.4 LPM/DFS 排序细节、§3 `prefill_delayer` 跨 rank 协商、§4 `min_free_slots_delayer` 留到二遍；与 [[07-Scheduler-02-源码走读#5. 组 Batch：`get_next_batch_to_run`]] 对照时重点看 Scheduler 侧调用。
 
 ---
 

@@ -25,16 +25,23 @@ updated: 2026-07-02
 
 ### 有基础读者
 
-- [x] 仅读 `sglang_reading/` 可复述 HTTP 与 gRPC 双链路
-- [x] 能解释 metrics：`cache_hit_rate`、`num_grammar_queue_reqs`
-- [x] 能回答架构决策：何时 PD / 何时 spec / 何时依赖 RadixCache（见 [[08-设计追问与框架对比|08-设计追问与框架对比]]）
+- [ ] 仅读 `sglang_reading/` 可复述 HTTP 与 gRPC 双链路
+- [ ] 能解释 metrics：`cache_hit_rate`、`num_grammar_queue_reqs`
+- [ ] 能回答架构决策：何时 PD / 何时 spec / 何时依赖 RadixCache（见 [[08-设计追问与框架对比|08-设计追问与框架对比]]）
+
+---
+
+## 未独立成专题的主题
+
+PP、HiCache、remote KV connector 等见 [[11-未独立成专题导读]]，按 30 分钟补课表阅读即可，无需等待新专题。
 
 ---
 
 ## 已知局限
 
 1. **行号漂移** — 基线 commit `70df09b`；以函数名为锚在 upstream 检索。
-2. **torch.compile / connector 远程 KV** — 未单独立批，仅在 Attention/PD 中提及。
+2. **torch.compile / connector 远程 KV** — 未单独成专题；见 [[11-未独立成专题导读]] 与 Attention/PD 交叉章节。
+3. **平台后端（TPU/Ascend 等）** — 本 vault 以 CUDA serving 为主；移植需读 upstream `docs/platforms/`。
 
 ---
 

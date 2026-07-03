@@ -14,13 +14,13 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 ScheduleBatch 与 ForwardBatch 的分工
-- [x] 能画出 TokenizerManager → Scheduler → DetokenizerManager 的 IPC 消息类型
-- [x] 能说出 Req、ScheduleBatch、TokenizedGenerateReqInput、BatchTokenIDOutput 四个核心类型的职责
-- [x] 能追踪一条生成请求从 GenerateReqInput 到 BatchStrOutput 的完整路径
-- [x] 能解释 PickleWrapper 存在的理由及 wrap/unwrap 时机
-- [x] 能说明 prepare_for_extend 与 prepare_for_decode 分别在何时调用、设置什么 forward_mode
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明 ScheduleBatch 与 ForwardBatch 的分工
+- [ ] 能画出 TokenizerManager → Scheduler → DetokenizerManager 的 IPC 消息类型
+- [ ] 能说出 Req、ScheduleBatch、TokenizedGenerateReqInput、BatchTokenIDOutput 四个核心类型的职责
+- [ ] 能追踪一条生成请求从 GenerateReqInput 到 BatchStrOutput 的完整路径
+- [ ] 能解释 PickleWrapper 存在的理由及 wrap/unwrap 时机
+- [ ] 能说明 prepare_for_extend 与 prepare_for_decode 分别在何时调用、设置什么 forward_mode
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 
@@ -38,9 +38,9 @@ updated: 2026-07-02
 
 | 文件 | 代码块数 |
 |------|---------|
-| README.md | 1 |
-| 01-核心概念.md | 4 |
-| 02-源码走读.md | 14 |
-| 03-数据流与交互.md | 4 |
-| 04-关键问题.md | 8 |
+| 09-ScheduleBatch-IO-00-MOC.md | 1 |
+| 09-ScheduleBatch-IO-01-核心概念.md | 4 |
+| 09-ScheduleBatch-IO-02-源码走读.md | 14 |
+| 09-ScheduleBatch-IO-03-数据流与交互.md | 4 |
+| 09-ScheduleBatch-IO-04-关键问题.md | 8 |
 | **合计** | **31**（≥ 15 ✅） |

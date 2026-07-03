@@ -10,11 +10,23 @@ tags:
  - sglang/doc/walkthrough
 aliases:
  - "02-源码走读"
-updated: 2026-07-02
+updated: 2026-07-03
 ---
 # Scheduler · 源码走读
 
 > 走读顺序：`run_scheduler_process` → `Scheduler.__init__` → IPC/收请求 → 事件循环 → 组 batch → `run_batch` → 结果处理 → PP mixin
+
+## 首次阅读路径（约 30 分钟）
+
+| 顺序 | 章节锚点 | 读完应能回答的问题 | 预计分钟 |
+|------|----------|-------------------|----------|
+| 1 | [[#1. 进程入口与初始化链]] | Scheduler 进程如何启动、`__init__` 为何必须按固定顺序？ | 5 |
+| 2 | [[#2. 请求分发（TypeBasedDispatcher）]] | Generate/Embedding 等消息如何按类型路由到 handler？ | 5 |
+| 3 | [[#4. 事件循环]] | `event_loop_normal` 与 `event_loop_overlap` 各做什么、默认走哪条？ | 7 |
+| 4 | [[#5. 组 Batch：`get_next_batch_to_run`]] | prefill merge、PrefillAdder 组 batch、decode update 如何衔接？ | 8 |
+| 5 | [[#6. GPU 前向：`run_batch`]] | 组好的 batch 如何进入 ModelRunner、结果如何返回？ | 5 |
+
+**跳过策略：** 二遍再读 §3 收请求细节、§7 PP mixin、§8 Overlap 基础设施；若已读过 [[08-SchedulePolicy-02-源码走读]]，§5.2 中 PrefillAdder 调用可略扫。
 
 ---
 

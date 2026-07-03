@@ -21,11 +21,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 AttentionBackend 三方法 metadata 契约
-- [x] 能画出 RadixAttention.forward → get_attn_backend().forward → forward_extend/decode 路径
-- [x] 能说出 FlashInfer 与 Triton 的选型差异（文档中均有内嵌代码）
-- [x] 能追踪 extend 阶段 KV 写回与 paged prefill wrapper 的调用关系
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明 AttentionBackend 三方法 metadata 契约
+- [ ] 能画出 RadixAttention.forward → get_attn_backend().forward → forward_extend/decode 路径
+- [ ] 能说出 FlashInfer 与 Triton 的选型差异（文档中均有内嵌代码）
+- [ ] 能追踪 extend 阶段 KV 写回与 paged prefill wrapper 的调用关系
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

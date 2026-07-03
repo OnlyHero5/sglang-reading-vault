@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能用 prose 描述 MoE 五阶段（Router→TopK→Dispatch→GEMM→Combine）资源特征
-- [x] 能画出 dispatch → GEMM → combine 数据流
-- [x] 能说出 Router kernel、FusedMoE.forward_impl、EPLBManager 职责
-- [x] 能解释 EP 下 A2A 通信瓶颈与 DeepEP 作用
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能用 prose 描述 MoE 五阶段（Router→TopK→Dispatch→GEMM→Combine）资源特征
+- [ ] 能画出 dispatch → GEMM → combine 数据流
+- [ ] 能说出 Router kernel、FusedMoE.forward_impl、EPLBManager 职责
+- [ ] 能解释 EP 下 A2A 通信瓶颈与 DeepEP 作用
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论（3 句话）
 

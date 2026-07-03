@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测
 
-- [x] 能说明 BaseModelLoader 与 DefaultModelLoader 职责
-- [x] 能列举 3 种 LoadFormat 及场景
-- [x] 能描述 safetensors iterator → load_weights 数据流
-- [x] 能解释 FlattenedTensorBucket 在热更新中的作用
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能说明 BaseModelLoader 与 DefaultModelLoader 职责
+- [ ] 能列举 3 种 LoadFormat 及场景
+- [ ] 能描述 safetensors iterator → load_weights 数据流
+- [ ] 能解释 FlattenedTensorBucket 在热更新中的作用
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论
 

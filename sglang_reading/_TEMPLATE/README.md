@@ -73,6 +73,8 @@ updated: 2026-07-02
 - 下一批（03）将展开 `launch_server` 内部如何挂载路由与 Engine
 ```
 
+若 `Code` 摘录为长英文 README/docstring/help text，必须在代码块后补 `**中文释义：** ...`，再进入 `Comment`。源码原文不改写，读者说明保持中文。
+
 ---
 
 ## 源码走读结构模板

@@ -16,24 +16,24 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明本模块职责：CLI 解析 argv → 加载插件 → 构造 ServerArgs → run_server 四路分发
-- [x] 能画出本模块在全局架构中的位置：用户 shell → cli/ → server_args → launch_server → Runtime 入口
-- [x] 能说出 3 个核心类/函数及其职责（文档中均有内嵌代码）：
+- [ ] 仅读本模块 sglang_reading，能口头说明本模块职责：CLI 解析 argv → 加载插件 → 构造 ServerArgs → run_server 四路分发
+- [ ] 能画出本模块在全局架构中的位置：用户 shell → cli/ → server_args → launch_server → Runtime 入口
+- [ ] 能说出 3 个核心类/函数及其职责（文档中均有内嵌代码）：
  - `prepare_server_args` — argv → ServerArgs 工厂
  - `run_server` — HTTP/gRPC/Ray/Encoder 四路分发
  - `load_plugins` — entry_points 发现 + HookRegistry.apply_hooks
-- [x] 能追踪 `sglang serve --model-path M --tp-size 2` 的完整启动路径（见 03-数据流与交互.md §4）
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 能追踪 `sglang serve --model-path M --tp-size 2` 的完整启动路径（见 02-启动链路-03-数据流与交互.md §4）
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 内嵌源码统计
 
 | 文件 | 代码块数 | 约行数 |
 |------|----------|--------|
-| README.md | 1 | 37 |
-| 01-核心概念.md | 4 | 95 |
-| 02-源码走读.md | 12 | 285 |
-| 03-数据流与交互.md | 6 | 95 |
-| 04-关键问题.md | 5 | 75 |
+| 02-启动链路-00-MOC.md | 1 | 37 |
+| 02-启动链路-01-核心概念.md | 4 | 95 |
+| 02-启动链路-02-源码走读.md | 12 | 285 |
+| 02-启动链路-03-数据流与交互.md | 6 | 95 |
+| 02-启动链路-04-关键问题.md | 5 | 75 |
 | **合计** | **28** | **~587** |
 
 ## 核心结论（3 句话）

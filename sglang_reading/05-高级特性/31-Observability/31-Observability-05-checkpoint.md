@@ -14,12 +14,12 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 Observability 的职责
-- [x] 能画出 Scheduler → MetricsReporter → /metrics 的完整链路
-- [x] 能说出 3 个核心类/函数及其职责（SchedulerMetricsCollector、MetricsReporter.log_stats、add_prometheus_middleware）
-- [x] 能追踪 metrics 从 record 到 `/metrics` 暴露的完整链路
-- [x] 能说明 weight_load metrics 与 32-CheckpointEngine 的关系
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 仅读本模块 sglang_reading，能口头说明 Observability 的职责
+- [ ] 能画出 Scheduler → MetricsReporter → /metrics 的完整链路
+- [ ] 能说出 3 个核心类/函数及其职责（SchedulerMetricsCollector、MetricsReporter.log_stats、add_prometheus_middleware）
+- [ ] 能追踪 metrics 从 record 到 `/metrics` 暴露的完整链路
+- [ ] 能说明 weight_load metrics 与 32-CheckpointEngine 的关系
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

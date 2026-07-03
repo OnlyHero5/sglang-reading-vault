@@ -14,12 +14,12 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能解释 RadixCache（树）与 RadixAttention（算子）的分工
-- [x] 能画出 prefill：match_prefix → extend forward → cache_unfinished/finished
-- [x] 能说出 3 个核心 API：`match_prefix`、`insert`、`RadixAttention.forward`
-- [x] 能说明 extra_key、page_size、lock_ref 的作用
-- [x] 能对比 RadixCache 与 UnifiedRadixCache 扩展点
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能解释 RadixCache（树）与 RadixAttention（算子）的分工
+- [ ] 能画出 prefill：match_prefix → extend forward → cache_unfinished/finished
+- [ ] 能说出 3 个核心 API：`match_prefix`、`insert`、`RadixAttention.forward`
+- [ ] 能说明 extra_key、page_size、lock_ref 的作用
+- [ ] 能对比 RadixCache 与 UnifiedRadixCache 扩展点
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论（3 句话）
 
@@ -33,7 +33,7 @@ updated: 2026-07-02
 - `HybridCacheController` prefetch 状态机 → HiCache 专批
 - Attention backend 注册表 → `attention/` 目录
 
-## 建议补充 KG 节点
+## 后续可补充主题
 
 - `RadixKey` / `TreeNode` / `RadixCache`
 - `UnifiedTreeNode` / `UnifiedRadixCache` / `ComponentType`

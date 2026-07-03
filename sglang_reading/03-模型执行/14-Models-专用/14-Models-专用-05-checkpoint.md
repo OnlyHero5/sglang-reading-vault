@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能说明 DeepSeek 相对 Llama 的三大差异：MLA、MoE 稀疏层、DSA/CP
-- [x] 能画出 DecoderLayer：communicator → AttentionMLA → MoE/MLP
-- [x] 能说出 3 个核心组件：`dispatch_attn_forward_method`、`DeepseekV2MoE`、`determine_num_fused_shared_experts`
-- [x] 能解释 EntryClass 三版本共存的注册方式
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能说明 DeepSeek 相对 Llama 的三大差异：MLA、MoE 稀疏层、DSA/CP
+- [ ] 能画出 DecoderLayer：communicator → AttentionMLA → MoE/MLP
+- [ ] 能说出 3 个核心组件：`dispatch_attn_forward_method`、`DeepseekV2MoE`、`determine_num_fused_shared_experts`
+- [ ] 能解释 EntryClass 三版本共存的注册方式
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论（3 句话）
 
@@ -32,7 +32,7 @@ updated: 2026-07-02
 - DSA Indexer 算法 → `layers/attention/dsa/`
 - EPLB expert 迁移 → `eplb/` 模块
 
-## 建议补充 KG 节点
+## 后续可补充主题
 
 - `DeepseekV2AttentionMLA`（file: deepseek_v2.py，layer:model）
 - `DeepseekV2MoE` / `MoEGate` / `HashTopK`

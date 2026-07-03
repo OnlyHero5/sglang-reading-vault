@@ -14,11 +14,11 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 能说明 Processor 注册与 get_mm_processor 选型流程
-- [x] 能追踪 image 从 Client 到 ViT forward 的数据流
-- [x] 能说出 BaseMultimodalProcessor、MultimodalSpecialTokens、PROCESSOR_MAPPING 的作用
-- [x] 能解释 placeholder 展开与 grid_thw 对齐的重要性
-- [x] 五篇正文 ≥ 15 段内嵌源码
+- [ ] 能说明 Processor 注册与 get_mm_processor 选型流程
+- [ ] 能追踪 image 从 Client 到 ViT forward 的数据流
+- [ ] 能说出 BaseMultimodalProcessor、MultimodalSpecialTokens、PROCESSOR_MAPPING 的作用
+- [ ] 能解释 placeholder 展开与 grid_thw 对齐的重要性
+- [ ] 五篇正文 ≥ 15 段内嵌源码
 
 ## 核心结论
 
@@ -32,7 +32,7 @@ updated: 2026-07-02
 
 ## Wave-3 升级（2026-07-02）
 
-- [x] `01-核心概念.md` §1 扩展用户故事「用户上传一张图问这是什么」
+- [x] `24-Multimodal-01-核心概念.md` §1 扩展用户故事「用户上传一张图问这是什么」
 - [x] 新增 §5 设计追问：`keep_mm_feature_on_device` 取舍、ZMQ vs CUDA IPC 通道对比
 - [x] 各节 Explain 扩至 ≥2 句；§6 CUDA IPC 自原 §5 顺延
 - [x] 实码引用 server_args.py、base_processor.py L473-L482

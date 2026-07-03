@@ -49,7 +49,7 @@ ScheduleBatch -> ForwardBatch
 """
 ```
 
-**Comment：** 不要试图在 ModelRunner 中访问 `batch.reqs[i].origin_input_ids`——那是 Scheduler 的职责。ForwardBatch 只携带 forward 所需的最小张量集合。
+**Comment：** 英文 docstring 的核心意思：`ScheduleBatch` 管高层调度状态，`ForwardBatch` 管 GPU forward 所需张量。不要试图在 ModelRunner 中访问 `batch.reqs[i].origin_input_ids`——那是 Scheduler 的职责。ForwardBatch 只携带 forward 所需的最小张量集合。
 
 ---
 

@@ -14,14 +14,14 @@ updated: 2026-07-02
 
 ## 读者自测（不打开 sglang/）
 
-- [x] 仅读本模块 sglang_reading，能口头说明 TokenizerManager 职责（分词、ZMQ 转发、流式聚合、控制面 Mixin）
-- [x] 能画出 TokenizerManager 在 HTTP → Scheduler → Detokenizer 闭环中的位置
-- [x] 能说出 3 个核心类/函数及其职责：
+- [ ] 仅读本模块 sglang_reading，能口头说明 TokenizerManager 职责（分词、ZMQ 转发、流式聚合、控制面 Mixin）
+- [ ] 能画出 TokenizerManager 在 HTTP → Scheduler → Detokenizer 闭环中的位置
+- [ ] 能说出 3 个核心类/函数及其职责：
  - `TokenizerManager.generate_request` — 数据面入口
  - `ReqState` + `handle_loop` — 异步收发包
  - `TokenizerControlMixin` — 控制面 FanOut
-- [x] 能追踪一条流式生成请求：API → 分词 → ZMQ → Detokenizer 回传 → `_wait_one_response` yield
-- [x] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
+- [ ] 能追踪一条流式生成请求：API → 分词 → ZMQ → Detokenizer 回传 → `_wait_one_response` yield
+- [ ] 五篇正文 ≥ 15 段内嵌源码，每段后有中文讲解
 
 ## 核心结论（3 句话）
 

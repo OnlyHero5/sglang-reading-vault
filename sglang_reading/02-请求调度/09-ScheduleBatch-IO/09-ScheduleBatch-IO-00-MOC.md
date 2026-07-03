@@ -88,6 +88,7 @@ ScheduleBatch -> ForwardBatch
 
 **Comment：**
 
+- 英文 docstring 的核心意思：`ScheduleBatch` 是 Scheduler 管理的高层调度数据，多数在 CPU；`ForwardBatch` 是 ModelRunner 管理的低层张量数据，多数在 GPU，由 `ForwardBatch.init_new` 从 `ScheduleBatch` 构造。
 - **ScheduleBatch** 持有 `reqs: List[Req]` 及 CPU 侧调度元数据（prefix_lens、extend_lens、chunked_req 等）。
 - **ForwardBatch** 在 `ModelRunner.forward` 前由 `ForwardBatch.init_new(batch)` 抽取 GPU 张量（input_ids、seq_lens、out_cache_loc 等）。
 - **io_struct.py** 定义**进程间**传输结构——TokenizerManager ↔ Scheduler ↔ DetokenizerManager 走 ZMQ + msgpack。
