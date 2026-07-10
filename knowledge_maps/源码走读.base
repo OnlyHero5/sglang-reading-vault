@@ -1,0 +1,27 @@
+filters:
+  and:
+    - 'type == "walkthrough"'
+properties:
+  file.name:
+    displayName: 源码走读
+  framework:
+    displayName: 框架
+  topic:
+    displayName: 主题
+  learning_role:
+    displayName: 学习角色
+  source_baseline:
+    displayName: 源码基线
+views:
+  - type: table
+    name: 全部走读
+    groupBy:
+      property: framework
+      direction: ASC
+    order:
+      - file.name
+      - framework
+      - topic
+      - learning_role
+      - source_baseline
+

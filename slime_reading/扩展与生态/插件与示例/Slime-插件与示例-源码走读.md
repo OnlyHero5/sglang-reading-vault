@@ -1,0 +1,329 @@
+---
+title: "插件与示例 · 源码走读"
+type: walkthrough
+framework: slime
+topic: "插件与示例"
+learning_role: core
+source_baseline: "22cdc6e1"
+tags:
+  - framework/slime
+  - content/walkthrough
+  - source-reading
+updated: 2026-07-10
+---
+# 插件与示例 · 源码走读
+
+本篇按四个可迁移样板走读：examples 入口、Search-R1、multi_agent、rollout_buffer、GLM5。主线是“示例代码如何通过 [[Slime-自定义扩展]] 的扩展槽位接回 Slime 核心闭环”。
+
+```mermaid
+flowchart LR
+    IDX["examples README"]
+    SR1["Search-R1<br/>custom_generate + custom_rm"]
+    MA["multi_agent<br/>custom_generate fan-out"]
+    BUF["rollout_buffer<br/>external queue + rollout_function"]
+    GLM["GLM5<br/>model plugin"]
+    SL["Slime train loop"]
+
+    IDX --> SR1 --> SL
+    IDX --> MA --> SL
+    IDX --> BUF --> SL
+    IDX --> GLM --> SL
+```
+
+## 长文读法
+
+这篇按“示例改的是哪一层扩展槽位”读：examples README 先给 workflow 索引，Search-R1 展示 sample-level `custom_generate` 与 reward，multi_agent 展示一个样本 fan-out，rollout_buffer 展示外部队列和 rollout function，GLM5 展示模型插件边界。不要把这些样板混成同一种插件机制。
+
+| 你的任务 | 先读 | 抓住什么 |
+|----------|------|----------|
+| 第一次选示例 | 1 | README 是 workflow 索引，不是运行时入口 |
+| 接搜索或工具生成 | 2 | Search-R1 改的是生成和 reward，不重写训练闭环 |
+| 接多 agent fan-out | 3 | 一个输入样本可能生成多个 agent sample，最后仍要回到 Sample 契约 |
+| 接外部 rollout 服务 | 4 | rollout_buffer 改的是外部队列与 wrapper，不是单样本 generate |
+| 接新模型族 | 5 | GLM5 属于模型插件边界，不走 rollout path |
+| 排障示例选择 | 6 | 先判断样板层级，再看对应 hook 和字段契约 |
+
+## 1. examples README 是 workflow 索引
+
+examples 的 README 不是运行时代码，但它定义了读者应该从 workflow 选择入口，而不是从源码文件名选择入口。
+
+来源：examples/README.md L3-L20
+
+```markdown
+These examples provide concrete examples to leverage slime in your own RL workflow. Some examples are just demonstrative, but most of them are verifiable with a concrete performance score.
+
+## Directory Structure
+
+- **[fully_async](./fully_async)**: Demonstrates fully asynchronous rollout generation for higher efficiency.
+- **[multi_agent](./multi_agent)**: Example of running multi-agent RL with `slime`.
+- **[search-r1](./search-r1)**: A minimal reproduction of Search-R1, featuring multi-turn conversation and tool-calling.
+- **[tau-bench](./tau-bench)**: Training in an agentic multi-turn tool use environment (Tau-bench).
+```
+
+读法要点：
+
+- `examples/` 是可复制 workflow，不是核心库。
+- 同一个 customization 槽位可以承载不同 workflow。
+- 可验证 example 通常会附带脚本、README 和任务依赖。
+
+## 2. Search-R1：把多轮 search 放进 custom_generate
+
+启动脚本只注册两个函数：generate 和 reward。
+
+来源：examples/search-r1/run_qwen2.5_3B.sh L115-L120
+
+```bash
+CUSTOM_ARGS=(
+   --custom-generate-function-path generate_with_search.generate
+   --custom-rm-path generate_with_search.reward_func
+
+   # TIS-related args, recommended to enable when using TIS
+)
+```
+
+这说明 Search-R1 没有替换完整 rollout 外循环。它仍然让 RolloutManager 处理 batch、filter、buffer、RM 调度，只把单个样本内部的多轮工具交互交给 `generate`。
+
+Search 配置集中在模块顶部。
+
+来源：examples/search-r1/generate_with_search.py L14-L41
+
+```python
+SEARCH_R1_CONFIGS = {
+    "max_turns": 2,
+    "topk": 3,
+    "search_concurrency": 256,
+    "search_backend": "local",
+    "local": {
+        "search_url": "http://127.0.0.1:8000/retrieve",
+        "proxy": None,
+    },
+    "google": {
+        "api_key": "your_api_key_here",
+        "snippet_only": True,
+        "proxy": None,
+    },
+    "return_logprob": True,
+    "format_score": 0.2,
+}
+```
+
+关键不变量是 token/logprob 对齐。源码注释明确：采集 logprob 时不能对 engine 返回字符串做 postprocess 后再 tokenize。来源：examples/search-r1/generate_with_search.py L93-L98
+
+为了解决工具 tag 后继续生成的问题，Search-R1 把 `</search>` 和 `</answer>` 加进 sampling stop，而不是事后修字符串。来源：examples/search-r1/generate_with_search.py L145-L177
+
+主循环按轮次交替追加两类 token。来源：examples/search-r1/generate_with_search.py L179-L244
+
+```python
+response += cur_response
+response_token_ids += cur_response_token_ids
+loss_mask += [1] * len(cur_response_token_ids)
+sample.append_response_tokens(
+    args,
+    tokens=cur_response_token_ids,
+    log_probs=cur_response_log_probs if SEARCH_R1_CONFIGS["return_logprob"] else None,
+    trainable=True,
+    meta_info=output["meta_info"] if "output_token_logprobs" in output["meta_info"] else None,
+)
+```
+
+模型输出是可训练 token，`trainable=True`。检索 observation 随后以 `trainable=False` 追加，参与上下文但不参与 policy loss。
+
+循环结束后，示例把统一字段写回 `Sample`，并按 finish reason 设置状态。来源：examples/search-r1/generate_with_search.py L255-L274
+
+reward 函数也保持在 custom RM 边界上。来源：examples/search-r1/generate_with_search.py L277-L293
+
+```python
+async def reward_func(args, sample, **kwargs):
+    if not isinstance(sample, Sample):
+        raise TypeError("Sample must be an instance of Sample class.")
+
+    score = compute_score_em(
+        solution_str=sample.prompt + sample.response,
+        ground_truth=sample.label["ground_truth"],
+        format_score=SEARCH_R1_CONFIGS["format_score"],
+    )
+
+    return score
+```
+
+迁移时最重要的是保留两条边界：生成逻辑只管 `Sample`，reward 逻辑只管打分。
+
+## 3. multi_agent：一个样本 fan-out 成多个 agent sample
+
+multi_agent README 和脚本都指向 `--custom-generate-function-path`。来源：examples/multi_agent/run-qwen3-30B-A3B-multi-agent.sh L38-L45
+
+```bash
+ROLLOUT_ARGS=(
+   --custom-generate-function-path examples.multi_agent.rollout_with_multi_agents.generate_with_multi_agents
+   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --input-key prompt
+   --label-key label
+   --apply-chat-template
+)
+```
+
+生成函数内部再加载真正的 agent system。
+
+来源：examples/multi_agent/rollout_with_multi_agents.py L8-L33
+
+```python
+MULTI_AGENT_CONFIGS = {
+    "custom_multi_agent_function_path": "examples.multi_agent.agent_system.run_agent_system",
+    "num_parallel": 5,
+    "incorrect_reward_weight": 0.8,
+    "correct_reward_weight": 1.2,
+}
+
+async def generate_with_multi_agents(args, sample: Sample, sampling_params, evaluation=False) -> list[Sample]:
+    tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+    max_context_length = args.rollout_max_context_len if not evaluation else args.eval_max_context_len
+    args.sampling_params = sampling_params
+    args.rollout_max_context_len = max_context_length
+    args.tokenizer = tokenizer
+```
+
+后半段把配置写入 `args`，load 用户函数，await 后 shuffle 返回：
+
+```python
+for key, value in MULTI_AGENT_CONFIGS.items():
+    setattr(args, key, value)
+
+custom_multi_agent_func = load_function(args.custom_multi_agent_function_path)
+samples = await custom_multi_agent_func(args, sample)
+
+random.shuffle(samples)
+
+return samples
+```
+
+读法要点：
+
+- 这仍是 `custom_generate`，不是完整 rollout 替换。
+- 返回 `list[Sample]` 表示 fan-out。
+- `args` 被原地写入 tokenizer、sampling params 和 multi-agent 配置，迁移时要避免与其他 hook 的字段名冲突。
+- 如果 reward 或训练逻辑依赖同 prompt group，兄弟样本应保持清晰的 `rollout_id` 语义。
+
+## 4. rollout_buffer：外部服务与训练侧包装器
+
+rollout_buffer 的 README 把它定义为独立组件：训练进程通过 HTTP API 与 buffer 交互，buffer 再驱动 agent framework 生成轨迹。来源：slime_plugins/rollout_buffer/README.md L3-L18
+
+示例脚本把 Slime 的 rollout 函数替换为 `rollout_buffer_example.generate_rollout`。来源：slime_plugins/rollout_buffer/rollout_buffer_example.sh L51-L55
+
+```bash
+ROLLOUT_ARGS=(
+   --rollout-function-path slime_plugins.rollout_buffer.rollout_buffer_example.generate_rollout
+   --rm-type deepscaler
+   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+)
+```
+
+### 4.1 服务端发现 generator
+
+buffer 服务自动扫描 `generator/*.py`，要求每个 generator 有 `TASK_TYPE` 和 `run_rollout`。
+
+来源：slime_plugins/rollout_buffer/buffer.py L54-L109
+
+```python
+def discover_generators():
+    generator_map = {}
+    generator_dir = pathlib.Path(__file__).parent / "generator"
+
+    for file_path in glob.glob(str(generator_dir / "*.py")):
+        if file_path.endswith("__init__.py"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("generator_module", file_path)
+            if spec is None or spec.loader is None:
+                print(f"Warning: Could not load spec for {file_path}")
+                continue
+```
+
+可选函数包括 group 转换、有效性判断和 meta 统计；没有提供时会走默认实现。这让新任务可以只新增一个 generator 文件，而不用改 FastAPI 主文件。
+
+### 4.2 BufferQueue 按 instance_id 攒 group
+
+`BufferQueue` 同时维护 `data` 和 `temp_data`。前者用于实际消费，后者用于 meta 统计窗口。
+
+来源：slime_plugins/rollout_buffer/buffer.py L125-L160
+
+```python
+def append(self, item):
+    instance_id = item["instance_id"]
+    current_time = time.time()
+
+    self.group_timestamps[instance_id] = current_time
+
+    if instance_id not in self.temp_data:
+        self.temp_data[instance_id] = [copy.deepcopy(item)]
+    else:
+        self.temp_data[instance_id].append(copy.deepcopy(item))
+```
+
+读取时先计算 meta，再找有效 group，转换后从 `data` 中删除。来源：slime_plugins/rollout_buffer/buffer.py L162-L206
+
+### 4.3 HTTP endpoint 是写入和读取边界
+
+`/buffer/write` 接收 generator 写入的 JSON item。来源：slime_plugins/rollout_buffer/buffer.py L259-L274
+
+`/get_rollout_data` 成功读出后清空 `temp_data` 窗口。来源：slime_plugins/rollout_buffer/buffer.py L277-L295
+
+`/start_rollout` 用 background task 启动 generator，并根据 `num_repeat_per_sample` 重建全局 buffer。来源：slime_plugins/rollout_buffer/buffer.py L298-L329
+
+脚本直接运行时，服务默认监听 8889 端口。来源：slime_plugins/rollout_buffer/buffer.py L332-L340
+
+### 4.4 训练侧 wrapper 拉取并转成 Sample
+
+`rollout_buffer_example.py` 负责从外部 buffer 拉数据。它会一直轮询 `/get_rollout_data`，直到 response success。来源：slime_plugins/rollout_buffer/rollout_buffer_example.py L138-L170
+
+启动外部 rollout 时，它把 SGLang router 地址、buffer 地址、task type、prompt 文件、repeat 数、sampling params、tokenizer path 和已完成 group 发给服务端。来源：slime_plugins/rollout_buffer/rollout_buffer_example.py L180-L205
+
+真正的 `generate_rollout_async` 会：
+
+- 首次 rollout 时调用 `/start_rollout`。
+- 根据 `rollout_batch_size * n_samples_per_prompt` 计算缺口。
+- 轮询 buffer 直到拿够样本。
+- 用 `MultiTurnLossMaskGenerator` 从 messages 生成 token 和 loss mask。
+- 构造 `Sample` group 后放回 `data_buffer`。
+
+来源：slime_plugins/rollout_buffer/rollout_buffer_example.py L215-L307
+
+这就是外部 buffer 的核心边界：外部系统负责产出 messages/reward，训练侧 wrapper 负责转成 Slime `Sample`。
+
+## 5. GLM5：模型插件不走 rollout path
+
+GLM5 示例展示另一类插件：它不是 generate/RM hook，而是 Megatron 模型结构扩展。最小入口是 cross-layer top-k sharing 的判断。
+
+来源：slime_plugins/models/glm5/glm5.py L37-L52
+
+```python
+def is_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+    """Whether the (1-indexed) Megatron ``layer_number`` reuses a previous layer's top-k."""
+    return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
+
+
+def source_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+    """The computing layer whose ``topk_indices`` a skip layer reuses."""
+    layer = layer_number
+    while is_skip_topk_layer(layer, skip_topk_offset, topk_freq):
+        layer -= 1
+    return layer
+```
+
+在 forward 中，skip layer 会从 holder 里取源计算层的 top-k；计算层则运行 indexer 并写入 holder。来源：slime_plugins/models/glm5/glm5.py L145-L198
+
+这类插件的验收点不是 custom generate contract，而是模型初始化、pipeline stage 切分、checkpoint 参数集合和导出路径。
+
+## 6. 最小验证：四类样板不要混用排障方式
+
+**操作：** 先确定你复用的是 generate hook、fan-out、外部 buffer 还是模型插件，再只检查对应边界；不要拿另一类示例的成功条件来验收。
+
+**预期：** 每个扩展都能落到下表唯一一行，并能说明它向 Slime 交付的对象或副作用。若一项改动同时跨多行，应拆开验证其契约。
+
+| 样板 | 首先排查 |
+|------|----------|
+| Search-R1 | custom generate 是否返回完整 `Sample`，token/logprob 是否对齐 |
+| multi_agent | fan-out 样本字段、`rollout_id`、`args` 原地修改 |
+| rollout_buffer | HTTP 服务是否可达、group 是否攒够、messages 是否能转 loss mask |
+| GLM5 | Megatron spec、pipeline split、checkpoint 权重和 converter |
+
+Examples 的价值在于给出可复制边界。迁移时保留边界，改内部逻辑；不要把整个 example 当黑盒搬进生产路径。

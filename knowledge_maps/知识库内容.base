@@ -1,0 +1,40 @@
+filters:
+  or:
+    - 'file.inFolder("AI-Infra课程")'
+    - 'file.inFolder("sglang_reading")'
+    - 'file.inFolder("slime_reading")'
+    - 'file.inFolder("flash-attn_reading")'
+properties:
+  file.name:
+    displayName: 文档
+  framework:
+    displayName: 框架
+  topic:
+    displayName: 主题
+  type:
+    displayName: 类型
+  learning_role:
+    displayName: 学习角色
+  updated:
+    displayName: 更新日期
+views:
+  - type: table
+    name: 全部内容
+    order:
+      - file.name
+      - framework
+      - topic
+      - type
+      - learning_role
+      - updated
+  - type: table
+    name: 核心内容
+    filters:
+      and:
+        - 'learning_role == "core"'
+    order:
+      - file.name
+      - framework
+      - topic
+      - type
+

@@ -1,0 +1,28 @@
+filters:
+  and:
+    - 'framework == "slime"'
+    - 'file.ext == "md"'
+properties:
+  file.name:
+    displayName: 文档
+  topic:
+    displayName: 主题
+  type:
+    displayName: 类型
+  learning_role:
+    displayName: 学习角色
+  source_baseline:
+    displayName: 源码基线
+views:
+  - type: table
+    name: Slime 内容
+    groupBy:
+      property: topic
+      direction: ASC
+    order:
+      - file.name
+      - topic
+      - type
+      - learning_role
+      - source_baseline
+

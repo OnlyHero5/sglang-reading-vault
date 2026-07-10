@@ -1,0 +1,24 @@
+filters:
+  and:
+    - 'type == "troubleshooting"'
+properties:
+  file.name:
+    displayName: 排障文档
+  framework:
+    displayName: 框架
+  topic:
+    displayName: 主题
+  source_baseline:
+    displayName: 源码基线
+views:
+  - type: table
+    name: 按框架查看
+    groupBy:
+      property: framework
+      direction: ASC
+    order:
+      - file.name
+      - framework
+      - topic
+      - source_baseline
+

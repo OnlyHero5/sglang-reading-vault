@@ -1,0 +1,24 @@
+filters:
+  and:
+    - 'learning_role == "practice"'
+properties:
+  file.name:
+    displayName: 实验或检查
+  framework:
+    displayName: 框架
+  topic:
+    displayName: 主题
+  difficulty:
+    displayName: 难度
+  estimated_time:
+    displayName: 预计时间
+views:
+  - type: table
+    name: 实践内容
+    order:
+      - file.name
+      - framework
+      - topic
+      - difficulty
+      - estimated_time
+

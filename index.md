@@ -1,134 +1,86 @@
 ---
+title: "AI Infra 源码学习库"
 type: index
-title: "源码阅读 Vault"
-status: done
+framework: cross-framework
+topic: "首页"
+learning_role: core
 tags:
-  - index
-  - sglang
-  - slime
-  - flash-attn
+  - framework/cross-framework
+  - content/index
   - source-reading
-updated: 2026-07-04
+updated: 2026-07-10
 ---
 
-# 源码阅读 Vault
+# AI Infra 源码学习库
 
-> **SGLang** — LLM 推理 serving 自包含中文讲解  
-> **Slime** — RL 后训练闭环自包含中文讲解  
-> **FlashAttention** — IO-aware attention kernel 原理与源码讲解
+> 从请求、训练样本和 Q/K/V tensor 出发，理解 LLM serving、RL 后训练与 GPU attention kernel。
 
----
+## 第一次进入
 
-## 联合路径（推理 + RL + Kernel）
+从 [[AI-Infra入门课程]] 开始。课程先补齐公共基础，再走三条短主线，最后用一个 prompt 到新权重的案例把三库连接起来。
 
-完整路径见 **[[91_dashboard/dual-library-path|AI Infra 联合路径]]**。
+```mermaid
+flowchart LR
+    B["基础<br/>token 并发 GPU 分布式 RL 指标"]
+    S["SGLang<br/>推理 serving"]
+    F["FlashAttention<br/>attention kernel"]
+    L["Slime<br/>RL 后训练"]
+    C["贯穿案例<br/>prompt 到新权重"]
+    B --> S --> F --> L --> C
+```
 
-| 步骤 | 目标 | 起点 |
-|:--:|------|------|
-| 0 | serving 概念 | [[00-零基础先修]] |
-| 1 | 推理全链路 | [[全链路请求追踪]] |
-| 2 | RL 全链路 | [[全链路RL训练追踪]] |
-| 3 | Attention kernel 原理 | [[FlashAttention源码阅读指南]] |
-| 4 | 跨库专题对照 | [[91_dashboard/cross-library-map|跨库专题对照]] |
-
-**从零三层：** [[00-方法论-00-MOC]] → [[全链路请求追踪]] → [[FlashAttention源码阅读指南]] → [[Slime-00-方法论-00-MOC]] → [[全链路RL训练追踪]]
-
-**补 Attention kernel：** [[FlashAttention-00-零基础先修]] → [[FA01-Attention-IO-00-MOC]] → [[FA02-Online-Softmax-00-MOC]] → [[FlashAttention-全链路Attention追踪]]
-
-**已有 SGLang：** [[Slime-01-项目总览]] → [[全链路RL训练追踪]]
-
-**已有 Slime：** [[全链路请求追踪]] → [[04-导读路径]]
-
----
-
-## 快速入口
-
-### 共用
-
-| 用途 | 链接 |
+| 目标 | 入口 |
 |------|------|
-| AI Infra 联合路径 | [[91_dashboard/dual-library-path]] |
-| 跨库专题对照 | [[91_dashboard/cross-library-map]] |
-| 可视化入口 | [[91_dashboard/home]] |
-| 关系图谱 | [[90_meta/obsidian-graph-presets]] · [[91_dashboard/graph-hub]] |
-| 专题统计 | [[91_dashboard/batch-stats|专题统计]] |
-| 文档类型分布 | [[91_dashboard/doc-type-map]] |
+| 从零入门 AI Infra | [[AI-Infra入门课程]] |
+| 查看联合路线 | [[knowledge_maps/AI-Infra联合学习路径]] |
+| 追踪一个 prompt 到新权重 | [[从Prompt到新权重]] |
+| 做实验 | [[knowledge_maps/实验与检查.base]] |
+| 按主题查资料 | [[knowledge_maps/知识地图首页]] |
 
-### SGLang（推理）
+## 三个框架
 
-| 用途 | 链接 |
-|------|------|
-| 总索引 | [[SGLang源码阅读指南]] |
-| 零基础 | [[00-零基础先修]] |
-| 导读（15 步） | [[04-导读路径]] |
-| HTTP 全链路 | [[全链路请求追踪]] |
+### SGLang · 推理 Serving
 
-### Slime（RL 后训练）
+一个 HTTP 请求如何变成 token、batch、GPU forward 和流式响应。
 
-| 用途 | 链接 |
-|------|------|
-| 总索引 | [[Slime源码阅读指南]] |
-| 零基础（Ray / Megatron） | [[Slime-00-零基础先修]] |
-| 项目总览 | [[Slime-01-项目总览]] |
-| 导读（12 步） | [[Slime-04-导读路径]] |
-| RL 全链路 | [[全链路RL训练追踪]] |
+[[推理Serving主线]] · [[SGLang学习指南]] · [[SGLang-生产排障]]
 
-### FlashAttention（Attention Kernel）
+### Slime · RL 后训练
 
-| 用途 | 链接 |
-|------|------|
-| 总索引 | [[FlashAttention源码阅读指南]] |
-| 零基础（Attention / GPU） | [[FlashAttention-00-零基础先修]] |
-| 导读（16 步） | [[FlashAttention-04-导读路径]] |
-| 全链路 Attention 追踪 | [[FlashAttention-全链路Attention追踪]] |
+一组 prompt 如何变成 Sample、训练 batch、loss、optimizer step 和新权重。
 
----
+[[RL训练闭环主线]] · [[Slime学习指南]] · [[Slime-分布式权重同步]]
 
-## 按主题浏览
+### FlashAttention · Attention Kernel
 
-### SGLang
+Q/K/V 如何从 Python API 进入 C++/CUDA/CuTe，并通过 tile 与 online softmax 减少 HBM traffic。
 
-| 主题 | 入口 |
-|------|------|
-| 导读与总览 | [[00-导读与总览-00-MOC]] |
-| 方法论 | [[00-方法论-00-MOC]] |
-| 启动与入口 | [[01-启动与入口-00-MOC]] |
-| 请求调度 | [[02-请求调度-00-MOC]] |
-| 模型执行 | [[03-模型执行-00-MOC]] |
-| 内存与 Attention | [[04-内存与Attention-00-MOC]] |
-| 高级特性 | [[05-高级特性-00-MOC]] |
-| 扩展组件 | [[06-扩展组件-00-MOC]] |
-| 总结复盘 | [[90-总结复盘-00-MOC]] |
+[[Attention算子主线]] · [[FlashAttention学习指南]] · [[FlashAttention性能实验]]
 
-### Slime
+## 按任务进入
 
-| 主题 | 入口 |
-|------|------|
-| 导读与总览 | [[Slime-00-导读与总览-00-MOC]] |
-| 方法论 | [[Slime-00-方法论-00-MOC]] |
-| 启动与入口 | [[Slime-01-启动与入口-00-MOC]] |
-| Ray 编排 | [[02-Ray编排-00-MOC]] |
-| Rollout 生成 | [[03-Rollout生成-00-MOC]] |
-| 训练后端 | [[04-训练后端-00-MOC]] |
-| 权重同步 | [[05-权重同步-00-MOC]] |
-| 高级特性 | [[06-高级特性-00-MOC]] |
-| 扩展与生态 | [[07-扩展与生态-00-MOC]] |
-| 总结复盘 | [[Slime-90-总结复盘-00-MOC]] |
+| 当前任务 | 先看 |
+|----------|------|
+| 理解整体架构 | [[knowledge_maps/三框架知识地图]] |
+| 排查推理延迟或 OOM | [[SGLang-生产排障]] |
+| 排查 rollout、loss 或旧权重 | [[Slime-RL训练全链路]] · [[knowledge_maps/排障指南.base]] |
+| 排查 attention 数值或性能 | [[FlashAttention-FA2-Forward-排障指南]] · [[FlashAttention性能实验]] |
+| 准备修改源码 | [[knowledge_maps/源码走读.base]] |
+| 检查是否学会 | [[课程完成标准]] |
 
-### FlashAttention
+## 使用 Obsidian
 
-| 主题 | 入口 |
-|------|------|
-| 导读与总览 | [[FlashAttention-00-导读与总览-00-MOC]] |
-| 方法论 | [[FlashAttention-00-方法论-00-MOC]] |
-| Attention IO 原理 | [[FA01-Attention-IO-00-MOC]] |
-| Online Softmax | [[FA02-Online-Softmax-00-MOC]] |
-| Python API 与绑定 | [[FA03-Python-API-00-MOC]] |
-| FA2 CUDA Forward | [[FA04-FA2-Forward-00-MOC]] |
-| KV Cache 与推理特性 | [[FA05-KV-Cache-00-MOC]] |
-| FA3/FA4 Hopper/CuTe | [[FA06-Hopper-CuTe-00-MOC]] |
-| 总结复盘 | [[FlashAttention-90-总结复盘-00-MOC]] |
+- 推荐把本页、[[AI-Infra入门课程]] 和当前实验加入 Bookmarks。
+- 在专题页打开 Backlinks 或 Local Graph，优先看一到两跳关系。
+- 使用 `framework`、`topic`、`type`、`learning_role` 属性和 Bases 过滤内容。
+- 文件名只表达语义，不包含维护批次号；目录负责归档，双链负责知识关系。
 
----
+## 版本
 
-*维护者与 AI 代理：见 [[AGENTS]]*
+| 框架 | 源码基线 |
+|------|----------|
+| SGLang | `70df09b` |
+| Slime | `22cdc6e1` |
+| FlashAttention | `002cce0` |
+
+维护规范：[[maintenance/Obsidian知识库规范]] · [[maintenance/源码阅读写作标准]]

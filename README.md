@@ -1,163 +1,85 @@
 ---
-type: readme
 title: "AI Infra Reading Vault"
-status: active
+type: readme
+framework: cross-framework
+topic: "项目说明"
+learning_role: reference
 tags:
-  - index
+  - framework/cross-framework
+  - content/readme
   - source-reading
-  - sglang
-  - slime
-  - flash-attn
-updated: 2026-07-04
+updated: 2026-07-10
 ---
 
 # AI Infra Reading Vault
 
-**中文 LLM 系统 / AI infra 源码阅读知识库** — 推理 serving（SGLang）+ RL 后训练（Slime）+ attention kernel（FlashAttention），Obsidian 自包含笔记。
+中文 AI Infra 源码学习知识库，覆盖：
 
-> 中文自包含源码阅读 · **推理 serving + RL 后训练 + Attention Kernel**  
-> [SGLang](https://github.com/sgl-project/sglang) · [Slime](https://github.com/THUDM/slime) · [FlashAttention](https://github.com/Dao-AILab/flash-attention) · Obsidian
+- SGLang：LLM 推理 serving runtime
+- Slime：RL 后训练闭环
+- FlashAttention：IO-aware attention kernel
 
-[![AI Infra](https://img.shields.io/badge/AI_Infra-Reading_Vault-2563eb)](#这是什么)
-[![SGLang](https://img.shields.io/badge/SGLang-serving-10b981)](#sglang--推理-serving)
-[![Slime](https://img.shields.io/badge/Slime-RL_后训练-8b5cf6)](#slime--rl-后训练)
-[![FlashAttention](https://img.shields.io/badge/FlashAttention-kernel-f97316)](#flashattention--attention-kernel)
-[![Obsidian](https://img.shields.io/badge/Obsidian-Ready-7c3aed)](#快速开始)
+## 推荐用法
 
----
+使用 Obsidian 打开仓库后，从 [index.md](index.md) 或 [AI Infra 入门课程](AI-Infra课程/AI-Infra入门课程.md) 开始。
 
-## 这是什么
+本项目分成三层：
 
-面向 **LLM 系统 / AI infra 工程师** 的 Obsidian 知识库：用中文把 upstream 源码「讲进笔记里」，读者日常**不必**打开 `sglang/`、`slime/`、`flash-attn/` 对照目录。
+| 层 | 用途 |
+|----|------|
+| 核心课程 | 公共基础、三条系统主线、贯穿案例和实验 |
+| 框架专题 | 核心概念、源码走读、数据流、排障与学习检查 |
+| 维护层 | 命名规范、写作标准和自动审计 |
 
-| 轴线 | 子库 | 框架 | 你学到什么 |
-|------|------|------|------------|
-| **推理** | [`sglang_reading/`](sglang_reading/) | SGLang | HTTP → 调度 → KV Cache → 模型执行 → 分布式 serving |
-| **训练** | [`slime_reading/`](slime_reading/) | Slime | `generate → train → update_weights` RL 闭环 |
-| **算子** | [`flash-attn_reading/`](flash-attn_reading/) | FlashAttention | Attention IO → online softmax → CUDA kernel → KV cache → FA3/FA4 |
-| **组合** | [`91_dashboard/`](91_dashboard/) | — | 联合路径、跨库专题对照、Dataview 仪表盘 |
+读者不需要按目录顺序读完全部笔记。核心课程负责形成连续学习体验，框架专题作为深入和查阅材料。
 
-每篇笔记采用 **Explain → Code → Comment**，内嵌源码片段并标注 upstream 路径与行号。
+## 入口
 
-| 框架 | 笔记基线 commit |
-|------|-----------------|
+| 目标 | 文档 |
+|------|------|
+| AI Infra 从零入门 | [AI-Infra入门课程.md](AI-Infra课程/AI-Infra入门课程.md) |
+| 三框架联合路径 | [AI-Infra联合学习路径.md](knowledge_maps/AI-Infra联合学习路径.md) |
+| SGLang | [SGLang学习指南.md](sglang_reading/SGLang学习指南.md) |
+| Slime | [Slime学习指南.md](slime_reading/Slime学习指南.md) |
+| FlashAttention | [FlashAttention学习指南.md](flash-attn_reading/FlashAttention学习指南.md) |
+| 动态知识地图 | [知识地图首页.md](knowledge_maps/知识地图首页.md) |
+
+## Obsidian 结构
+
+- Markdown 文件使用全库唯一的语义名称。
+- Properties 使用 `framework`、`topic`、`type`、`learning_role` 描述内容。
+- Bases 生成核心课程、框架内容、排障和实验视图。
+- Wikilinks、Backlinks 和 Local Graph 表达知识关系。
+- aliases 仅用于真实同义词或缩写，不保存旧编号。
+
+## 仓库布局
+
+```text
+AI-Infra课程/          核心课程、贯穿案例、实验
+sglang_reading/        SGLang 深度专题
+slime_reading/         Slime 深度专题
+flash-attn_reading/    FlashAttention 深度专题
+knowledge_maps/        知识地图与 Obsidian Bases
+maintenance/           规范、审计和迁移工具
+sglang/ slime/ flash-attn/  upstream 只读基线
+```
+
+## 源码基线
+
+| 框架 | commit |
+|------|--------|
 | SGLang | `70df09b` |
 | Slime | `22cdc6e1` |
 | FlashAttention | `002cce0` |
 
----
+源码片段标注路径与行号。框架对比和性能结论必须同时记录版本、硬件、workload 与配置。
 
-## 快速开始
-
-### 克隆
+## 维护检查
 
 ```bash
-git clone git@github.com:OnlyHero5/ai-infra-reading-vault.git
-cd ai-infra-reading-vault
+node maintenance/audit_wikilinks.mjs
+node maintenance/audit_source_evidence.mjs
+node maintenance/audit_markdown_quality.mjs
 ```
 
-HTTPS：
-
-```bash
-git clone https://github.com/OnlyHero5/ai-infra-reading-vault.git
-```
-
-### 用 Obsidian 打开
-
-1. 安装 [Obsidian](https://obsidian.md/)
-2. **打开文件夹作为仓库** → 选择克隆下来的根目录
-3. 从 [`index.md`](index.md) 进入
-
-### 推荐阅读路径
-
-| 你想… | 从这里开始 |
-|--------|------------|
-| 总览导航 | [`index.md`](index.md) |
-| **推理 + RL + Kernel 一条线读完** | [`91_dashboard/dual-library-path.md`](91_dashboard/dual-library-path.md) |
-| 跨库专题跳转 | [`91_dashboard/cross-library-map.md`](91_dashboard/cross-library-map.md) |
-| 只读 SGLang | [`sglang_reading/SGLang源码阅读指南.md`](sglang_reading/SGLang源码阅读指南.md) |
-| 零基础（serving 概念） | [`sglang_reading/00-导读与总览/00-零基础先修.md`](sglang_reading/00-导读与总览/00-零基础先修.md) |
-| HTTP 请求全链路 | [`sglang_reading/00-导读与总览/全链路请求追踪.md`](sglang_reading/00-导读与总览/全链路请求追踪.md) |
-| 只读 Slime | [`slime_reading/Slime源码阅读指南.md`](slime_reading/Slime源码阅读指南.md) |
-| Slime 零基础（Ray / Megatron） | [`slime_reading/00-导读与总览/Slime-00-零基础先修.md`](slime_reading/00-导读与总览/Slime-00-零基础先修.md) |
-| RL 训练全链路 | [`slime_reading/00-导读与总览/全链路RL训练追踪.md`](slime_reading/00-导读与总览/全链路RL训练追踪.md) |
-| 只读 FlashAttention | [`flash-attn_reading/FlashAttention源码阅读指南.md`](flash-attn_reading/FlashAttention源码阅读指南.md) |
-| Attention IO 原理 | [`flash-attn_reading/20-原理基础/FA01-Attention-IO/FA01-Attention-IO-00-MOC.md`](flash-attn_reading/20-原理基础/FA01-Attention-IO/FA01-Attention-IO-00-MOC.md) |
-| 全链路 Attention 追踪 | [`flash-attn_reading/00-导读与总览/FlashAttention-全链路Attention追踪.md`](flash-attn_reading/00-导读与总览/FlashAttention-全链路Attention追踪.md) |
-| 生产 serving 排障 | [`sglang_reading/90-总结复盘/90-总结复盘-03-生产排障速查.md`](sglang_reading/90-总结复盘/90-总结复盘-03-生产排障速查.md) |
-
----
-
-## SGLang · 推理 serving
-
-入口：[`SGLang源码阅读指南.md`](sglang_reading/SGLang源码阅读指南.md)
-
-按主题进入：导读与总览 → 启动与入口 → 请求调度 → 模型执行 → 内存与 Attention → 高级特性 → 扩展组件 → 总结复盘（见 [`index.md`](index.md) 阶段 MOC 表）。
-
----
-
-## Slime · RL 后训练
-
-入口：[`Slime源码阅读指南.md`](slime_reading/Slime源码阅读指南.md)
-
-Slime 以 SGLang 为 Rollout 引擎；读 Rollout / 权重同步专题时，可配合 [`cross-library-map`](91_dashboard/cross-library-map.md) 跳回推理栈。
-
----
-
-## FlashAttention · Attention Kernel
-
-入口：[`FlashAttention源码阅读指南.md`](flash-attn_reading/FlashAttention源码阅读指南.md)
-
-FlashAttention 以原理优先方式讲解 attention memory wall、online softmax、FA2 CUDA forward、KV cache 推理路径，以及 FA3/FA4 Hopper/CuTe 演进。
-
----
-
-## 仓库布局
-
-```
-ai-infra-reading-vault/
-├── README.md                 ← 本文件
-├── index.md                  ← Obsidian 首页
-├── AGENTS.md                 ← AI 代理 / 维护者指南
-├── sglang_reading/           ← SGLang 阅读笔记
-├── slime_reading/            ← Slime 阅读笔记
-├── flash-attn_reading/       ← FlashAttention 阅读笔记
-├── 91_dashboard/             ← 联合导航与可视化
-└── 90_meta/                  ← 规范与维护脚本
-```
-
-**可选：** 在根目录 clone upstream 用于对照（已在 `.gitignore` 中排除，不会进版本库）：
-
-```bash
-git clone https://github.com/sgl-project/sglang.git sglang
-git -C sglang checkout 70df09b
-
-git clone https://github.com/THUDM/slime.git slime
-git -C slime checkout 22cdc6e1
-
-git clone https://github.com/Dao-AILab/flash-attention.git flash-attn/flash-attention
-git -C flash-attn/flash-attention checkout 002cce0
-```
-
----
-
-## 维护者与 AI 代理
-
-| 文档 | 用途 |
-|------|------|
-| [`AGENTS.md`](AGENTS.md) | Vault 边界、启动协议 |
-| [`90_meta/obsidian-syntax-rules.md`](90_meta/obsidian-syntax-rules.md) | 命名、双链、frontmatter |
-
----
-
-## 相关链接
-
-- [SGLang](https://github.com/sgl-project/sglang) · [文档](https://docs.sglang.ai/)
-- [Slime](https://github.com/THUDM/slime)
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-
----
-
-## License
-
-阅读笔记为个人学习整理。SGLang、Slime 源码版权归各自 upstream 项目所有。
+详细规则见 [Obsidian知识库规范.md](maintenance/Obsidian知识库规范.md) 和 [源码阅读写作标准.md](maintenance/源码阅读写作标准.md)。

@@ -1,0 +1,28 @@
+filters:
+  and:
+    - 'file.inFolder("AI-Infra课程")'
+    - 'file.ext == "md"'
+properties:
+  file.name:
+    displayName: 课程
+  topic:
+    displayName: 主题
+  type:
+    displayName: 类型
+  difficulty:
+    displayName: 难度
+  estimated_time:
+    displayName: 预计时间
+  prerequisites:
+    displayName: 先修
+views:
+  - type: table
+    name: 课程内容
+    order:
+      - file.name
+      - topic
+      - type
+      - difficulty
+      - estimated_time
+      - prerequisites
+
