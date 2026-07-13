@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 外部推理引擎 · 源码走读
 
@@ -43,8 +43,8 @@ updated: 2026-07-10
 | 判断 GPU 为什么没有给 rollout 预留 | 6 到 7 | external 不能和 Slime-managed 拓扑混用，PG 只覆盖训练侧资源 |
 | 排查 router 没有外部 worker | 8 到 10 | zero GPU adapter 不是服务进程，它负责校验外部 server args 并向 router 注册 worker |
 | 排查 generate 并发或 proxy 影响 | 11 | HTTP client 并发按 rollout engine 数放大，并明确不走系统代理 |
-| 判断 recover 和权重更新边界 | 12 到 13 | 外部进程不归 Slime recover；预启动 worker 的权重同步要看部署形态，PD 测试覆盖的是 disk delta 路径 |
-| 验证 external PD 端到端形态 | 13 | 训练 GPU 与外部 SGLang GPU 分开，地址和 GPU 数由外部进程暴露的信息推导 |
+| 判断 recover 和权重更新边界 | 12 到 13 | 外部进程不归 Slime recover；disk delta 先补丁本地完整 checkpoint，再让 SGLang 普通 reload |
+| 评估 external PD 测试能否直接运行 | 13 | 测试拓扑仍有参考价值，但参数与同步注释已漂移，不能当当前执行规范 |
 
 读的时候不要把 external adapter 理解成“又启动了一套 engine”。它更像 Slime 控制面里的代理对象：占 Ray actor 名额，但不占 rollout GPU，也不拥有外部进程生命周期。
 
@@ -117,7 +117,7 @@ if args.rollout_external and not args.debug_train_only:
 设计选择：`normalize_external_engine_addr` 统一成无尾斜杠的 HTTP base URL，并要求 scheme、hostname、port 都存在。
 
 ```python
-# 来源：slime/backends/sglang_utils/external.py L32-L44
+# 定位骨架（非逐行摘录）：slime/backends/sglang_utils/external.py L32-L44
 def normalize_external_engine_addr(addr: str) -> str:
     """Normalize ``host:port`` or ``http://host:port`` to an HTTP base URL."""
     if "://" not in addr:
@@ -138,13 +138,11 @@ def normalize_external_engine_addr(addr: str) -> str:
 - IPv6 地址要写成 `http://[addr]:port`。
 - 地址规范化失败时，Slime 还没开始 Ray 编排。
 
----
-
 ## 3. `/server_info` 是 external 的拓扑来源
 
 系统压力：SGLang 版本可能暴露 `/server_info` 或 `/get_server_info`，Slime 需要兼容两种 endpoint，但不能在完全失败时继续启动。
 
-设计选择：`get_server_info` 依次尝试两个 endpoint，收集错误，全部失败后抛异常。
+设计选择：`get_server_info` 依次尝试两个 endpoint，收集错误，全部失败后抛异常。`timeout` 是每次请求的上限，不是整次 discovery 的总 deadline；两个 endpoint 都卡满时，单地址最坏约等待 `2×timeout`，还未计连接器与调度误差。
 
 ```python
 # 来源：slime/backends/sglang_utils/external.py L58-L67
@@ -168,11 +166,9 @@ def get_server_info(url: str, timeout: float = 30.0) -> dict:
 
 运行验证：external server 启动后手动请求 `http://host:port/server_info`，应能看到 `tp_size`、`pp_size`、`disaggregation_mode` 等字段。
 
----
-
 ## 4. discovery 把 server_info 转成 `ExternalEngineInfo`
 
-系统压力：router 需要 worker type；HTTP client 需要 engine 数；权重同步需要每个 engine 的 GPU 数；PD prefill 还需要 bootstrap port。
+系统压力：router 需要 worker type；HTTP client 需要 engine 数；权重同步需要每个 engine 的逻辑 GPU rank 数；PD prefill 还需要 bootstrap port。
 
 设计选择：`discover_external_engines` 保留原始 `server_info`，同时推导 `worker_type`、`num_gpus` 和 `disaggregation_bootstrap_port`。
 
@@ -200,54 +196,45 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
         num_gpus = int(server_info.get("num_gpus") or server_info.get("num_gpus_per_engine") or tp_size * pp_size)
         bootstrap_port = server_info.get("disaggregation_bootstrap_port")
         bootstrap_port = int(bootstrap_port) if bootstrap_port is not None else None
+
+        infos.append(
+            ExternalEngineInfo(
+                url=url,
+                host=parsed.hostname,
+                port=parsed.port,
+                worker_type=_infer_worker_type(server_info),
+                num_gpus=num_gpus,
+                disaggregation_bootstrap_port=bootstrap_port,
+                server_info=server_info,
+            )
+        )
+    return infos
 ```
 
-测试覆盖了 PD 场景：prefill 和 decode 被分别识别，GPU 数来自各自 server_info，prefill 的 bootstrap port 被保留。
+测试覆盖了 PD 场景：prefill 和 decode 被分别识别，prefill 的 bootstrap port 被保留。GPU 数的来源必须读得更精确：优先用 server 返回的 `num_gpus` 或 `num_gpus_per_engine`，否则只回退到 `tp_size * pp_size`。这个回退不会乘 `dp_size`，也不根据 EP 修正，因此它只是当前 Slime 的缺省逻辑容量，不足以单独证明外部部署的物理 GPU 总数；复杂并行拓扑应显式返回总 GPU 数。
 
 ```python
-# 来源：slime/tests/test_external_sglang_engines.py L61-L106
-def test_apply_external_engine_info_handles_pd(monkeypatch):
-    payloads = {
-        "http://prefill:10090/server_info": {
-            "tp_size": 2,
-            "pp_size": 1,
-            "dp_size": 1,
-            "ep_size": 1,
-            "disaggregation_mode": "prefill",
-            "disaggregation_bootstrap_port": 12090,
-        },
-        "http://decode:10091/server_info": {
-            "tp_size": 4,
-            "pp_size": 1,
-            "dp_size": 2,
-            "ep_size": 2,
-            "disaggregation_mode": "decode",
-        },
-    }
-
-    def fake_get(url, timeout):
-        return _Response(payloads[url])
-
-    monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
-    args = Namespace(
-        rollout_external=True,
-        rollout_external_engine_addrs=["prefill:10090", "decode:10091"],
-        rollout_num_gpus=None,
-        router_pd_disaggregation=False,
-    )
-
+# 来源：slime/tests/test_external_sglang_engines.py L96-L106
     apply_external_engine_info_to_args(args)
 
+    assert args.rollout_external is True
+    assert args.router_pd_disaggregation is False
     assert args.rollout_num_gpus == 6
     assert args.rollout_num_engines == 2
+    assert get_rollout_num_engines(args) == 2
     assert [info["worker_type"] for info in args.rollout_external_engine_infos] == ["prefill", "decode"]
     assert [info["num_gpus"] for info in args.rollout_external_engine_infos] == [2, 4]
+    assert [info["server_info"]["dp_size"] for info in args.rollout_external_engine_infos] == [1, 2]
     assert args.rollout_external_engine_infos[0]["disaggregation_bootstrap_port"] == 12090
 ```
 
-读者抓手：PD external 注册失败时，先看 prefill server 的 `server_info` 是否带 `disaggregation_bootstrap_port`。
+发现逻辑还有三个没有替读者兜底的输入契约：
 
----
+- 地址列表逐项 append，不去重；重复 URL 会重复计 engine/GPU、重复创建 adapter，并放大后续 offset 与权重 rank。
+- `_infer_worker_type` 对 `encoder_only` 使用 truthiness。JSON boolean `false` 正常，但字符串 `"false"` 仍会被识别为 encoder。
+- 启动 Router 只判断 `any(info.is_pd_worker)`；单独一侧 prefill 或 decode 也会进入 PD 模式，没有成对完整性检查。
+
+读者抓手：PD external 注册失败时，先看 prefill server 的 `server_info` 是否带 `disaggregation_bootstrap_port`，再确认 prefill/decode 两侧都存在、地址无重复、布尔字段真的是 JSON boolean。
 
 ## 5. discovery 写回 args，后续模块不再重复探测
 
@@ -284,9 +271,7 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
         logger.info(f"Detected external SGLang engines: {summary}")
 ```
 
-这段解释了为什么 external 模式下可以不传 `--rollout-num-gpus`：它来自外部 server 的发现结果。
-
----
+这段解释了为什么 external 模式下可以不传 `--rollout-num-gpus`：它来自外部 server 的发现结果。但所谓 single source of truth 只覆盖 discovery 之后的 `args`；每个 adapter 的 `_init_external` 还会再次请求 server info。两次请求不是事务快照，外部 server 若在启动窗口换配置，有限 sanity check 看到的可能是另一份状态。
 
 ## 6. 参数校验禁止 external 与 Slime-managed 拓扑混用
 
@@ -312,8 +297,6 @@ assert not (
 
 读者抓手：需要 frozen reference/reward 或多模型 serving 时，不要试图把 external 地址和 `sglang_config` 拼在一起；应先决定谁拥有 server topology。
 
----
-
 ## 7. Placement Group 不为 external rollout 预留 GPU
 
 系统压力：external server 已占用它自己的 GPU。如果 Slime 再在训练 Ray PG 里预留 rollout GPU，会浪费资源，甚至阻塞 Ray 调度。
@@ -321,7 +304,7 @@ assert not (
 设计选择：`_get_placement_group_layout` 在 external 模式下返回 `(actor_num_gpus, actor_num_gpus)`，让 rollout slice 为空。
 
 ```python
-# 来源：slime/ray/placement_group.py L100-L128
+# 来源：slime/ray/placement_group.py L100-L117
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
@@ -344,8 +327,8 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
 
 ```python
 # 来源：slime/tests/test_placement_group.py L41-L50
-pytest.param({"rollout_external": True}, (16, 16), id="external"),
-pytest.param({"rollout_external": True, "debug_rollout_only": True}, (0, 0), id="external_debug_rollout"),
+        pytest.param({"rollout_external": True}, (16, 16), id="external"),
+        pytest.param({"rollout_external": True, "debug_rollout_only": True}, (0, 0), id="external_debug_rollout"),
     ],
 )
 def test_placement_group_layout(overrides, expected):
@@ -361,8 +344,6 @@ def test_create_zero_gpu_placement_group_is_empty():
 - 普通 external：PG 只有训练 GPU，rollout offset 等于 actor GPU 数。
 - debug rollout only + external：训练也没有 GPU，PG 为空。
 - `args.rollout_num_gpus` 仍有逻辑意义，用于并发、metrics 和权重同步 GPU count，不代表 Ray PG 资源。
-
----
 
 ## 8. RolloutManager 创建 zero GPU adapter，而不是 server 进程
 
@@ -405,6 +386,13 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
         engine_gpu_counts.append(info.num_gpus)
         engine_gpu_offsets.append(gpu_offset)
         gpu_offset += info.num_gpus
+        init_handles.append(
+            rollout_engine.init.remote(
+                **external_engine_init_kwargs(info),
+                router_ip=router_ip,
+                router_port=router_port,
+            )
+        )
 ```
 
 ```python
@@ -426,12 +414,13 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
 - actor 的 `base_gpu_id=0` 不表示它会占用外部 server 的 GPU；它只是满足 `SGLangEngine` 构造参数。
 - `engine_gpu_counts` 来自 discovery，后续权重同步会使用。
 - prefill 的 bootstrap port 必须进入 `init_kwargs`，否则 router 注册无法构建 PD payload。
-
----
+- 当前是一条 external 地址创建一个 zero-GPU actor，且 `.options(...)` 没有按 external host 设置 node affinity。这个 actor 是控制代理，不天然与外部 server 同机。
+- `_compute_server_args` 仍会用 adapter 的枚举 `rank` 和发现出的 GPU 数推导 `nnodes=max(1,num_gpus//num_gpus_per_node)`、`node_rank=rank%nnodes`；而 Router 注册、URL 暴露与多数控制请求在 `node_rank != 0` 时会跳过。例如每个地址报告 16 GPU、`num_gpus_per_node=8` 时，地址 0 得到 node-rank 0，地址 1 得到 node-rank 1；第二个独立 external engine 可能因此不注册。地址序号不是某个 engine 内部的节点序号，当前复用公式缺少这一等价关系的证明。
+- `ExternalRolloutServer.update_weights` 固定为 `True`，并且只构造 `default` model；当前 external 入口不能表达一个 frozen external reference/reward model。
 
 ## 9. `SGLangEngine._init_external` 是控制面接管点
 
-系统压力：外部 server 可能不是用户以为的那个模型、并行配置或 worker 类型。Slime 必须在接入 router 前校验，而不是等 rollout 才暴露 silent mismatch。
+系统压力：外部 server 可能没有按 rollout 所需的模式启动。Slime 会在接入 router 前做一轮有限 sanity check，但这不是模型身份与完整并行拓扑证明。
 
 设计选择：`_init_external` 重新请求 server info，对 `_compute_server_args` 认为必须检查的字段做一致性断言，然后注册 router。
 
@@ -453,28 +442,29 @@ def _init_external(self, expect_server_args, external_engine_need_check_fields):
     self._register_to_router(expect_server_args)
 ```
 
-校验字段来自 `_compute_server_args`，但会跳过 host、port、rank、parallel size 等 external 特例字段。
+校验字段来自 `_compute_server_args` 的早期字段集合，但有两层收缩：第一，`model_path`、host、port、rank、TP/DP/PP/EP 等被 `_EXTERNAL_ENGINE_SKIP_CHECK_FIELDS` 明确排除；第二，`external_engine_need_check_fields` 在遍历合并一般 `args.sglang_*` 和 YAML overrides **之前**就已经生成。实际重点覆盖 `enable_memory_saver`、worker-specific 的 disaggregation/负载均衡参数，以及按条件加入的 routed-expert 返回和 dtype；它不保证外部 server 的模型路径、并行规模或所有 SGLang 参数与 Slime 期望一致。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L625-L690
-if args.use_rollout_routing_replay:
-    kwargs["enable_return_routed_experts"] = True
-if args.fp16:
-    kwargs["dtype"] = "float16"
-external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
+# 来源：slime/backends/sglang_utils/sglang_engine.py L625-L639
+    if args.use_rollout_routing_replay:
+        kwargs["enable_return_routed_experts"] = True
+    if args.fp16:
+        kwargs["dtype"] = "float16"
+    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-server_arg_fields = dataclasses.fields(ServerArgs)
-server_arg_field_names = {attr.name for attr in server_arg_fields}
-unused_keys = set(kwargs.keys())
-for attr in server_arg_fields:
-    if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
-        continue
-    if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-        kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-    unused_keys.discard(attr.name)
+    server_arg_fields = dataclasses.fields(ServerArgs)
+    server_arg_field_names = {attr.name for attr in server_arg_fields}
+    unused_keys = set(kwargs.keys())
+    for attr in server_arg_fields:
+        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+            continue
+        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
+            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
+        unused_keys.discard(attr.name)
+```
 
-return kwargs, external_engine_need_check_fields
-
+```python
+# 来源：slime/backends/sglang_utils/sglang_engine.py L670-L690
 _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS = [
     "model_path",
     "trust_remote_code",
@@ -498,7 +488,7 @@ _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS = [
 ]
 ```
 
-读者抓手：sanity check 报 `expect_value` 和 `actual_value` 不一致时，不要改 Slime 代码绕过；先确认外部 server 启动参数是否和训练任务期望一致。
+读者抓手：sanity check 报 `expect_value` 和 `actual_value` 不一致时，不要改 Slime 代码绕过；先确认外部 server 启动参数是否和训练任务期望一致。反过来，sanity check 通过也只能证明被选中的少数字段一致，不能当成模型与并行拓扑的全量验收。
 
 ---
 
@@ -541,7 +531,7 @@ def _register_to_router(self, server_args_dict):
         response.raise_for_status()
 ```
 
-运行验证：启动后查 router `/workers`，应看到 external server 的 URL 和 worker type；prefill worker 应带 bootstrap port 语义。
+运行验证：启动后查 router `/workers`，必须把“预期 URL 集合”与“实际 URL 集合”逐项比较，而不是只确认至少有一个 worker。尤其要测试第二个多节点 external 地址；若 discovery 日志有它、Router 没有它，再检查 adapter 的 `node_rank`。
 
 ---
 
@@ -577,7 +567,7 @@ def init_http_client(args):
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
             timeout=httpx.Timeout(None),
-            trust_env=False,
+            trust_env=False,  # internal SGLang comm only — never route through system proxy
         )
 ```
 
@@ -592,8 +582,7 @@ def init_http_client(args):
 设计选择：`ExternalRolloutServer` 的 recover/offload/onload 都是 warning 或空操作；`SGLangEngine.shutdown` 在 external 模式下直接返回。
 
 ```python
-# 来源：slime/backends/sglang_utils/external.py L135-L165
-@dataclasses.dataclass
+# 来源：slime/backends/sglang_utils/external.py L135-L159
 class ExternalRolloutServer:
     """Rollout server backed by pre-launched external SGLang engines."""
 
@@ -628,52 +617,154 @@ def shutdown(self):
         return
 ```
 
-排障结论：external server 掉线时，Slime 的 Ray actor 和 router 可能仍存在，但真正恢复必须由外部部署系统完成，然后重新注册或重启训练侧控制面。
+排障结论：external server 掉线时，Slime 的 Ray actor 和 router 可能仍存在，但真正恢复必须由外部部署系统完成，然后重新注册或重启训练侧控制面。`shutdown` 的 early return 不只是“不会 kill 外部进程”，还绕过了后面的 Router remove-worker 逻辑；训练侧 detach 后，旧 Router 可能继续保留 worker。当前安全做法是一起重建 Router，或由外围显式协调注销，不能把 `shutdown` 当作完整 detach。
 
 ---
 
-## 13. E2E 测试证明 external PD 的部署形态
+## 13. Disk delta 的真实边界：SGLang 读完整 checkpoint，不直接读 delta
 
-系统压力：纯 mock 只能证明 discovery；真正部署还要证明外部 prefill/decode server 先启动，Slime 只拿地址接入，并用 disk delta 同步权重。
+这一节必须把“传输格式”和“引擎加载格式”分开：
 
-测试 `test_qwen3_4B_external_pd.py` 的开头直接说明了这个场景。
+- trainer 发布的是按版本组织的稀疏 delta，目的是减少跨文件系统传输量。
+- 每个 rollout 主机先把 delta 按顺序应用到一份完整的本地 HF checkpoint。
+- SGLang 最后收到的是普通 `update_weights_from_disk(model_path=<完整本地目录>)`；当前 updater 没有传 `load_format="delta"`，也没有传 `files`。
 
-```python
-# 来源：slime/tests/test_qwen3_4B_external_pd.py L11-L15
-Weight sync uses ``--update-weight-mode delta --update-weight-transport disk``
-so the post-train sync writes sparse safetensors to a shared dir and the
-external engines load them via ``update_weights_from_disk(load_format=delta)``
-— that's the only sync path that actually works for pre-launched workers (no
-NCCL group between trainer and external engines).
-```
-
-测试还刻意在 Ray 启动前限制训练 GPU，避免 Ray 抢 external SGLang 的 GPU。
+updater 的类注释直接声明了这条边界：
 
 ```python
-# 来源：slime/tests/test_qwen3_4B_external_pd.py L223-L225
-# Restrict CUDA_VISIBLE_DEVICES to training GPUs before Ray starts so
-# ray's bundle allocator doesn't try to claim the external sglang GPUs.
-os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(train_gpus)
+# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L30-L36
+class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
+    """
+    Delta weight sync over a shared filesystem. PP-src ranks diff each gathered HF tensor against
+    a CPU snapshot of the previous sync and publish the changes as a canonical HF checkpoint dir;
+    every rollout host applies the delta into its local checkpoint and reloads via the ordinary
+    update_weights_from_disk path, so sglang needs no delta support.
+    """
 ```
 
-最后，训练参数不传 rollout GPU 数，而是让 Slime 从 external server_info 推导。
+### 一次同步实际经历五步
+
+```mermaid
+sequenceDiagram
+    participant T as Trainer ranks
+    participant Shared as update_weight_disk_dir
+    participant A as 每主机 SGLangEngine actor
+    participant Local as local full HF checkpoint
+    participant S as External SGLang server
+
+    T->>T: gather HF tensor，和 CPU snapshot 求差
+    T->>Shared: 发布 weight_vNNNNNN delta + index
+    T->>A: sync_local_checkpoint(version)
+    A->>Local: 按版本应用 delta，校验 checksum
+    T->>S: update_weights_from_disk(model_path=Local)
+    S-->>T: 普通完整 checkpoint reload 完成
+```
+
+真正决定调用形态的是 `_reload_engines`：先等待 `all_engine_actors` 完成本地补丁，再只对 `rollout_engines` 发完整目录 reload。对 Slime-managed 多节点 engine，这两个集合可分别表达“每主机 actor”和“node-0 actor”；对 external，`ExternalRolloutServer.all_engines` 只是同一份“一地址一 adapter”列表，不能自动推出每个外部主机都执行了补丁。
 
 ```python
-# 来源：slime/tests/test_qwen3_4B_external_pd.py L312-L328
-# No --rollout-num-gpus / --rollout-num-gpus-per-engine: those are
-# inferred from /server_info on each external engine (1 prefill +
-# 1 decode, all tp=1).
-all_addrs = [f"{external_host}:{port}" for port in (*PREFILL_PORTS, *DECODE_PORTS)]
-external_args = "--rollout-external-engine-addrs " + " ".join(all_addrs) + " "
-
-delta_args = (
-    "--update-weight-mode delta "
-    "--update-weight-transport disk "
-    "--update-weight-encoding deltas "
-    f"--update-weight-disk-dir {delta_dir} "
-    "--update-weight-delta-keep-files "
-)
+# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L60-L73
+    def connect_rollout_engines(
+        self,
+        rollout_engines: Sequence[ActorHandle],
+        rollout_engine_lock: ActorHandle,
+        engine_gpu_counts: Sequence[int] | None = None,
+        engine_gpu_offsets: Sequence[int] | None = None,
+        all_engine_actors: Sequence[ActorHandle] | None = None,
+    ) -> None:
+        # The local checkpoint is host-local, so every host applies its own copy:
+        # all_engine_actors is one actor per host, vs rollout_engines (node 0 only). The
+        # rollout_engine_lock the NCCL path uses isn't needed — a per-host flock serializes applies.
+        self.rollout_engines = rollout_engines
+        self.all_engine_actors = list(all_engine_actors or rollout_engines)
+        self._is_pp_src_rank = (
 ```
+
+这段注释表达的是 updater 对调用方的前提，不是 external construction 已经满足该前提的证明；external 的 `all_engines` 仍要回到上一节的一地址一 actor 构造核对。
+
+```python
+# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L169-L186
+    def _reload_engines(self) -> None:
+        """Commit the published files, have each host apply the delta, then reload the engines."""
+        if self._commit_hook is not None:
+            self._commit_hook(self.args, self._version_dir, list(self.rollout_engines))
+        dist.barrier(group=get_gloo_group())
+        if dist.get_rank() == 0:
+            ray.get([actor.sync_local_checkpoint.remote(self.weight_version) for actor in self.all_engine_actors])
+            ray.get(
+                [
+                    engine.update_weights_from_disk.remote(
+                        model_path=self.args.update_weight_local_checkpoint_dir,
+                        weight_version=str(self.weight_version),
+                    )
+                    for engine in self.rollout_engines
+                ]
+            )
+            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+```
+
+### Adapter 在主机侧维护完整 checkpoint
+
+`sync_local_checkpoint` 先幂等物化基础 checkpoint，再按版本应用共享目录里的 delta：
+
+```python
+# 来源：slime/backends/sglang_utils/sglang_engine.py L396-L413
+    def sync_local_checkpoint(self, target_version: int):
+        """Apply the published deltas into this host's local checkpoint up to target_version; the
+        engine reloads it afterwards. Assumes this actor shares the checkpoint filesystem with the
+        sglang it drives (true for slime-launched engines)."""
+        from slime.utils.disk_delta import apply_deltas, init_local_checkpoint
+
+        init_local_checkpoint(self.args.update_weight_local_checkpoint_dir, self.args.hf_checkpoint)  # idempotent
+        # non-POSIX filesystems lack cross-host read-after-write consistency, so the trainer's
+        # just-written delta isn't visible on this mount until the hook refreshes it.
+        if self.args.custom_delta_pre_read_path:
+            from slime.utils.misc import load_function
+
+            load_function(self.args.custom_delta_pre_read_path)(self.args.update_weight_disk_dir, target_version)
+        apply_deltas(
+            self.args.update_weight_local_checkpoint_dir,
+            self.args.update_weight_disk_dir,
+            target_version,
+        )
+```
+
+`apply_deltas` 还维护版本不变量：本地 checkpoint 必须从已应用版本逐个推进，跳版本或基线不匹配会直接失败，而不是带着错误权重继续 serving。
+
+```python
+# 来源：slime/utils/disk_delta.py L255-L264
+def apply_deltas(local_ckpt_dir: str, delta_root: str, target_version: int) -> None:
+    """Apply the delta chain in order to bring the local checkpoint up to target_version, in place.
+    A per-tensor checksum guards every write and any mismatch raises (fail loud, never serve bad
+    weights). Serialized per host by the lock (co-located actors collapse to one apply)."""
+    with _apply_lock(local_ckpt_dir):
+        applied = _read_applied_version(local_ckpt_dir)
+        if applied is None:
+            raise RuntimeError("local checkpoint not materialized")
+        for version in range(int(applied) + 1, target_version + 1):
+            _apply_version(local_ckpt_dir, os.path.join(delta_root, f"weight_v{version:06d}"))
+```
+
+### External 部署多了一个必须显式验证的前提
+
+Slime-managed engine 的 adapter 与它启动的 SGLang 天然共享本机文件系统；external engine 没有这个天然保证。要让 disk delta 成立，必须同时满足：
+
+1. trainer 和执行 `sync_local_checkpoint` 的 actors 都能读到 `update_weight_disk_dir` 中刚发布的版本。
+2. `update_weight_local_checkpoint_dir` 对负责补丁的 actor 和对应 external SGLang 进程表示同一份完整 checkpoint。当前 external adapter 没有 external-host node affinity，因此“同机 NVMe”不是代码自动保证的部署形态；除非外围编排能证明 actor 落在正确主机，否则应使用双方可见、同路径同内容的共享挂载或自定义同步/放置层。
+3. 非 POSIX 或弱一致性文件系统需要正确实现 `custom_delta_pre_push_path` / `custom_delta_pre_read_path`，保证版本可见性。
+
+只有 external 地址而没有这层文件系统关系，delta 目录即使写成功，SGLang 也可能从另一台机器上的同名空路径 reload。尤其是一个地址代表多节点 external engine 时，当前 construction 没有“一外部主机一补丁 actor”的证据，不能宣称 host-local checkpoint 已在所有节点推进到同一版本。
+
+### 当前 external PD E2E 文件已经漂移
+
+`tests/test_qwen3_4B_external_pd.py` 仍有两个值得保留的拓扑提示：训练 GPU 与 external prefill/decode GPU 分开，engine 数和 GPU 数从 `/server_info` 推导。但它不能作为当前 disk-delta 的可执行规范：
+
+- 文件注释仍声称 external engine 直接调用 `update_weights_from_disk(load_format=delta)`，与上面的 updater 实现冲突。
+- 它没有传当前参数校验要求的 `--update-weight-local-checkpoint-dir`。
+- 它还传入源码参数定义中不存在的 `--update-weight-encoding deltas` 和 `--update-weight-delta-keep-files`。
+
+因此，读者可以借它理解 external PD 的进程拓扑，不能直接复制其中的 delta 参数。判断同步语义时以 `UpdateWeightFromDiskDelta._reload_engines` 为准。
 
 ---
 
@@ -683,8 +774,10 @@ delta_args = (
 2. 启动 Slime 后搜索日志 `Detected external SGLang engines`，确认 `rollout_num_engines` 和 `rollout_num_gpus`。
 3. 查看 Placement Group 日志，external 普通训练只应创建训练 GPU 数量的 PG。
 4. 请求 router `/workers`，确认 external URL 已注册。
-5. 若使用 disk/delta，确认 trainer 和 external server 都能看到同一个 `update_weight_disk_dir`。
+5. 若使用 disk delta，同时确认共享发布目录 `update_weight_disk_dir` 和完整本地目录 `update_weight_local_checkpoint_dir` 的可见性；后者必须是 external SGLang 实际能够 reload 的路径。
 6. 若请求受 proxy 影响，设置 `no_proxy/NO_PROXY` 覆盖 external host，E2E 测试也这样做。
+7. 静态核对当前同步调用：`rg -n "sync_local_checkpoint|model_path=self.args.update_weight_local_checkpoint_dir" slime/slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py`，预期不出现 `load_format="delta"`。
+8. 运行 `python -m pytest -q slime/tests/test_external_sglang_engines.py slime/tests/test_placement_group.py`。完整 Slime 环境应通过；只做文档审计的轻量环境若缺少 `httpx` 或 `ray`，会在 collection 阶段失败，此时运行 `python -m py_compile slime/slime/backends/sglang_utils/external.py slime/slime/backends/sglang_utils/arguments.py slime/slime/ray/placement_group.py slime/slime/backends/sglang_utils/sglang_engine.py slime/slime/utils/http_utils.py slime/slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py slime/slime/utils/disk_delta.py slime/tests/test_external_sglang_engines.py slime/tests/test_placement_group.py` 作为静态替代，并把缺失依赖与代码失败分开记录。
 
 ---
 
@@ -694,4 +787,6 @@ delta_args = (
 2. `rollout_num_gpus` 是发现出的逻辑容量，PG 是否占 GPU要看 `placement_group.py`。
 3. zero GPU `SGLangEngine` actor 让 Slime 复用控制面接口，但不拥有外部 server 进程。
 4. router 注册是 generate 数据面生效的关键动作。
-5. 权重同步路径必须按网络和文件系统现实选择；跨集群 external 最稳的兜底是 disk 或 delta disk。
+5. Delta 只是发布和主机补丁格式；SGLang 看到的仍是完整 checkpoint。External 部署必须额外证明 adapter 与 server 共享正确的 checkpoint 语义，并证明所有需要读取该 checkpoint 的外部主机都完成了同一版本补丁。
+6. discovery 成功只证明地址被探测；重复地址、单侧 PD、错误布尔 schema 与 `rank→node_rank` 都可能让运行拓扑仍不闭合。
+7. external shutdown 保留外部进程所有权，但当前也不自动从 Router 注销 worker。

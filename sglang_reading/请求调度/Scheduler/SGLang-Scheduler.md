@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Scheduler
 
@@ -37,10 +37,10 @@ flowchart LR
     Proc --> RB["running_batch<br/>decode 状态"]
     RB --> Decode["ScheduleBatch DECODE<br/>每轮新 token"]
     Decode --> Worker
-    Proc --> Out["Batch output<br/>回 TokenizerManager/Detokenizer"]
+    Proc --> Out["SchedulerOutputStreamer<br/>正常生成到 Detokenizer<br/>skip/control 可直达 TokenizerManager"]
 ```
 
-这张图的关键是状态迁移：请求不是直接从队列到模型再结束。Prefill 完成后，未结束请求会进入 `running_batch`，后续每轮 decode 都会重新被 `update_running_batch` 检查、准备和可能 retract。
+这张图的关键是状态迁移与提交边界：请求不是直接从队列到模型再结束。Prefill 结果处理会先提交首个输出 token、finish/grammar/cache 状态；可继续生成的请求随后才作为上轮 EXTEND batch 并入 `running_batch`。后续每轮 decode 都会重新过滤、检查 KV、准备执行，并可能 retract。开启 overlap 后，live batch、结果处理快照、GPU result 和下一轮 FutureMap payload 还是四个不同对象。
 
 ## 源码范围
 
@@ -73,7 +73,7 @@ try:
 - 运行模式由 `dispatch_event_loop` 选择。普通单 PP、非 disaggregation、非 MLX、未禁用 overlap 时，进入 `event_loop_overlap`。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L4164-L4192
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L4164-L4192
 def dispatch_event_loop(scheduler: Scheduler):
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
@@ -93,7 +93,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 - 请求接收和广播在 `scheduler_components/request_receiver.py`。只有入口 rank 从 ZMQ 拉请求，之后广播或 PP 链式传递到其他 rank。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L101-L141
+# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L101-L113
 def _pull_raw_reqs(self) -> Optional[List]:
     if self.ps.pp_rank == 0:
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -113,7 +113,7 @@ def _pull_raw_reqs(self) -> Optional[List]:
 
 1. [[SGLang-Scheduler-核心概念]]：先建立 `waiting_queue/running_batch/cur_batch/last_batch` 的状态机。
 2. [[SGLang-Scheduler-源码走读]]：沿一条 generate 请求走 `recv → dispatch → Req → prefill → decode → output`。
-3. [[SGLang-Scheduler-数据流]]：看跨进程、跨 rank、跨 stream 和 PP stage 的对象流动。
+3. [[SGLang-Scheduler-数据流]]：看跨进程、跨 rank、跨 stream，以及普通 PP / PD Prefill PP / PD Decode PP 的对象流动。
 4. [[SGLang-Scheduler-排障指南]]：按症状排障 overlap、retract、pause、PP、ZMQ rank。
 5. [[SGLang-Scheduler-学习检查]]：用源码定位、日志和压测现象验收自己是否读通。
 

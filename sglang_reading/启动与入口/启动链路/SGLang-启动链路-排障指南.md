@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 启动链路 · 排障指南
 
@@ -22,7 +22,8 @@ updated: 2026-07-10
 | `sglang --help` 看不到 `--model-path` | `cli/main.py` | 根命令只显示子命令 | 改跑 `sglang serve --help` |
 | `--model-type` 进了 LLM parser | `_extract_model_type_override` | 分发 hint 没被剥离 | 查 `dispatch_argv` |
 | 不带模型路径启动失败 | `get_model_path` | `--model-path` 或 `--model` 缺失 | 静态 grep error 文本 |
-| config 没按预期覆盖 | `ConfigArgumentMerger` | YAML 转 argv 后顺序误解 | 打印合并后的 argv |
+| config 没按预期覆盖 | `ConfigArgumentMerger` | YAML 转 argv 后顺序误解，或使用了 `--config=...` | 打印合并后的 argv |
+| YAML 里有 `model_path` 仍报必填 | `get_model_path` | 模型族分发早于 config 合并 | 把 `--model-path` 留在 CLI |
 | 插件没生效 | `load_plugins`、`HookRegistry.apply_hooks` | 白名单、平台过滤、apply 时机 | 查 Loaded/Executed/Applied 日志 |
 | Ray 模式启动 ImportError | `run_server` | 未装 Ray extra | 只在 `use_ray=True` 分支触发 |
 | `python -m sglang.launch_server` 行为和 `sglang serve` 不同 | 旧入口 | 缺少模型族自动检测和双 help | 优先用 `sglang serve` |
@@ -150,10 +151,20 @@ rg -n "def _extract_model_type_override|--model-type" sglang/python/sglang/cli/s
 - `--config` 后没有路径会抛 ValueError。
 - 文件不是 `.yaml` 或 `.yml` 会抛 ValueError。
 - 根节点不是 dict 会抛 ValueError。
+- 当前只支持 `--config FILE`；`--config=FILE` 不会进入 merge 分支，YAML 内容不会生效。
+- `serve()` 在 config merge 前需要命令行模型路径；只在 YAML 中写 `model_path` 仍会报 `--model-path is required`。
 
 ## 6. 插件加载失败会不会阻断启动？
 
-单个 plugin load 或 execute 失败会记录异常并继续；hook apply 失败也会按 target 记录异常。是否影响业务取决于该 hook 是否是你依赖的修改。
+单个 plugin load 或 execute 失败会记录异常并继续；hook apply 失败也会按 target 记录异常。是否影响业务取决于该 hook 是否是你依赖的修改。还要注意 `_plugins_loaded` 在真正发现插件前就被置为 True：同一进程后续再次调用不会自动重试失败项。
+
+```python
+# 来源：python/sglang/srt/plugins/__init__.py L119-L122
+    global _plugins_loaded
+    if _plugins_loaded:
+        return
+    _plugins_loaded = True
+```
 
 ```python
 # 来源：python/sglang/srt/plugins/__init__.py L79-L86
@@ -174,6 +185,8 @@ rg -n "def _extract_model_type_override|--model-type" sglang/python/sglang/cli/s
 3. 查是否被 `SGLANG_PLATFORM` 排除。
 4. 查 `Executed general plugin`。
 5. 查 `Applied hook` 或 `Failed to apply hooks`。
+
+不要用“目标模块已经 import，所以 hook 必然失效”作为结论。registry 会解析目标并传播到一部分旧 `from import` 绑定；真正应核对的是该进程是否在开始服务前执行了 `load_plugins()`，以及目标是否出现在 Applied/Failed 日志中。
 
 ## 7. 为什么 Ray 缺依赖只在 `--use-ray` 时失败？
 
@@ -208,18 +221,20 @@ rg -n "if server_args.encoder_only|elif server_args.grpc_mode" sglang/python/sgl
 
 预期：`encoder_only` 出现在 `grpc_mode` 前。
 
+同理，`grpc_mode=True` 与 `use_ray=True` 同时出现时先走 legacy SMG gRPC，Ray 分支被前一个 `elif` 遮住。组合参数不是“同时开启两套 server”。
+
 ## 9. 为什么 `ServerArgs` parse 成功后还会报配置错误？
 
-`argparse` 只把字符串变成字段；跨字段约束在 `ServerArgs.__post_init__`。例如 session radix cache 要求 priority eviction policy，PD、DCP、SSL、ASR 等也在 post-init 或其 handler 中校验。
+`argparse` 只把字符串变成字段；第一批语义处理在 `ServerArgs.__post_init__`。例如 session radix cache、PD、DCP、SSL、ASR、模型配置与 backend 默认值会在这里处理。另一批约束位于 `check_server_args()`，由后续 engine 初始化调用。
 
 排查方法：
 
 - 如果错误发生在 `prepare_server_args` 调用期间，先看 `__post_init__`。
-- 如果错误发生在 `run_server` 之后，才进入具体 runtime 分支。
+- 如果 `prepare_server_args` 已返回、engine 初始化才失败，再看 `check_server_args()` 和具体 runtime 分支。
 
 ## 10. 启动链路和 HTTP Server 怎么分工？
 
-启动链路结束于 `run_server(server_args)` 选择默认 HTTP 分支。HTTP Server 从 `server_args` 接手，才开始分配 `PortArgs`、启动 Scheduler/Detokenizer/TokenizerManager、设置 `_GlobalState`、启动 FastAPI。
+启动链路结束于 `run_server(server_args)` 选择 runtime 分支。普通 `grpc_mode=True` 进入的是 legacy SMG wrapper；默认 HTTP 分支从 `server_args` 接手，才开始分配 `PortArgs`、启动 Scheduler/Detokenizer/TokenizerManager、设置 `_GlobalState`、启动 FastAPI。native Rust gRPC 能力不能从 `grpc_mode` 这条分支推导出来。
 
 读者路径：
 
@@ -231,4 +246,4 @@ TokenizerManager：GenerateReqInput 到 Scheduler IPC
 
 ## 复盘
 
-启动问题要先定位阶段：根命令、serve 分发、config 合并、`ServerArgs` post-init、插件 hook、runtime branch。定位错阶段，搜索再多函数名也会绕远。
+启动问题要先定位阶段：根命令、serve 分发、config 合并、`ServerArgs` post-init、engine 的 `check_server_args`、插件 hook、runtime branch。定位错阶段，搜索再多函数名也会绕远。

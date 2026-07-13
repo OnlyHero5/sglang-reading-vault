@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 可观测性 · 数据流
 
@@ -41,10 +41,11 @@ updated: 2026-07-10
 
 ```mermaid
 flowchart TB
-  subgraph HTTP["HTTP worker / TokenizerManager"]
+  subgraph FRONT["HTTP-facing process / TokenizerManager"]
     MOUNT["lifespan<br/>add_prometheus_middleware"]
     HTTPMW["response middleware<br/>status / active / routing key"]
     TOK["TokenizerMetricsCollector<br/>TTFT / ITL / E2E"]
+    TRACE["ReqTimeStats / TraceReqContext<br/>stage slices"]
     LOG["RequestLogger<br/>received / finished"]
     EXP["RequestMetricsExporter<br/>request record"]
   end
@@ -59,15 +60,16 @@ flowchart TB
     SINK["stdout / log file"]
     FILE["request metrics file"]
   end
-  PROM["Prometheus<br/>GET /metrics"] --> MOUNT
-  MOUNT --> MP
+  PROM["Prometheus<br/>GET /metrics"] -- "scrape request" --> MOUNT
+  MP -- "collect" --> MOUNT
+  MOUNT -- "text response" --> PROM
   HTTPMW --> MP
   TOK --> MP
   MR --> SMC --> MP
   WL --> SMC
   LOG --> SINK
   EXP --> FILE
-  TOK -. stage facts .-> OTLP
+  TRACE --> OTLP
 ```
 
 这张图的关键不是节点数量，而是方向：`/metrics` 是读取面，Scheduler 和 TokenizerManager 才是主要写入者。日志、trace、exporter 是旁路，能补单请求细节，但不会解释某个 Prometheus series 为什么不存在。
@@ -79,12 +81,12 @@ scrape 路径的主线是：
 ```text
 ServerArgs.enable_metrics
   -> set_prometheus_multiproc_dir
-  -> HTTP lifespan mounts /metrics
+  -> HTTP lifespan mounts /metrics OR gRPC starts sidecar route
   -> MultiProcessCollector reads multiprocess files
   -> Prometheus receives text format metrics
 ```
 
-源码里有两个不变量。第一，multiprocess 目录必须在 import `prometheus_client` 前设置；第二，`/metrics` 的 ASGI app 只在 `enable_metrics` 为真时挂载。
+源码里有两个不变量。第一，multiprocess 目录必须在 import `prometheus_client` 前设置；第二，HTTP 模式的 `/metrics` ASGI app 只在 `enable_metrics` 为真时挂载。gRPC 模式不是这条 FastAPI 路径，而是独立 aiohttp sidecar。
 
 ```python
 # 来源：python/sglang/srt/utils/common.py L1571-L1586
@@ -121,7 +123,7 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 ```
 
-所以 `/metrics` 404 和 `cache_hit_rate` 不存在不是同一类问题。前者先查 HTTP lifespan 和 multiprocess 目录；后者要查 Scheduler lane 是否写入。
+所以 `/metrics` 404 和 `cache_hit_rate` 不存在不是同一类问题。前者先查服务模式、暴露端口、HTTP lifespan 或 gRPC sidecar，再查 multiprocess 目录；后者要查 Scheduler lane 是否写入。当前仓库没有显式 `mark_process_dead` 调用，重启后若出现可疑残留 series，还应检查目录内的实际文件，而不是只看 endpoint 是否返回 200。
 
 ## Scheduler 状态账按窗口写入
 
@@ -134,7 +136,7 @@ Scheduler.init_metrics_collector
   -> SchedulerMetricsCollector.log_stats writes gauges
 ```
 
-默认只有 `attn_tp_rank == 0` 负责写 Scheduler aggregate metrics。`enable_metrics_for_all_schedulers` 会放开这个限制，但 label cardinality 会随 scheduler 副本增长。
+默认只有 `attn_tp_rank == 0` 负责写 Scheduler aggregate metrics。`enable_metrics_for_all_schedulers` 会放开这个限制，并让各 scheduler 以 rank labels 形成独立 series。代价不只是 cardinality：普通 TP 状态可能是副本视角，查询时盲目求和会放大；DP-Attention 下又可能需要按 rank 保留不同 scheduler 的状态。
 
 ```python
 # 来源：python/sglang/srt/observability/metrics_collector.py L1040-L1051
@@ -266,7 +268,7 @@ custom labels 先在 OpenAI serving 层从 header 里解析，并按允许名单
                 labels["priority"] = str(priority)
 ```
 
-同一个请求的输出生命周期被拆成三类事件：首 token 写 TTFT，后续 chunk 写 ITL，finished 写 E2E 和 token counters。
+同一个请求的输出生命周期被拆成三类事件：第一次可观测输出写 TTFT；后续输出用累计 `completion_tokens` 的增量写 ITL；finished 写 E2E 和 token counters。一次更新可能携带多个新增 token，不能把这里的调用次数当成 token 数或网络 chunk 数。
 
 ```python
 # 来源：python/sglang/srt/managers/tokenizer_manager.py L2411-L2457
@@ -319,7 +321,7 @@ custom labels 先在 OpenAI serving 层从 header 里解析，并按允许名单
             )
 ```
 
-如果你只看到 TTFT，没有 E2E，通常说明请求还没有进入 finished 分支，或者流式请求在观察窗口内尚未结束。它不是 Scheduler stats tick 的问题。
+如果你只看到 TTFT，没有 E2E，通常说明请求还没有进入 finished 分支，或者流式请求在观察窗口内尚未结束。若 ITL 分布看起来过于平滑，还要记住 collector 会把一个事件间隔除以新增 token 数，并把这个平均值记为多个样本；它不是逐 token 精确时间线。以上都不是 Scheduler stats tick 的问题。
 
 ## HTTP middleware 是入口层，不是引擎内部
 
@@ -533,13 +535,13 @@ IPC 权重更新路径用 context manager 包住真正的 update 调用，这就
                 success, message = self.draft_worker.update_weights_from_ipc(recv_req)
 ```
 
-排查热更新时要同时看 `weight_load_duration_seconds`、`num_paused_reqs` 和 cache hit 变化。单看 stats tick 可能错过更新完成瞬间。
+排查热更新时要同时看 `weight_load_duration_seconds`、HTTP/控制面结果和 cache hit 变化。当前基线的 `num_paused_reqs` 只有字段发布与归零，静态搜索未找到递增写入，不能把它当成 IPC 热更新影响计数。单看 stats tick 也可能错过更新完成瞬间。
 
 ## 交互矩阵
 
 | 现象 | 先看哪条 lane | 关键源码入口 | 验证动作 |
 |------|---------------|--------------|----------|
-| `/metrics` 404 | scrape | `http_server.lifespan`、`add_prometheus_middleware` | 确认 `--enable-metrics` 和启动日志里的 multiprocess 目录 |
+| `/metrics` 404 | scrape | `http_server.lifespan`、`add_prometheus_middleware`、gRPC sidecar | 先分 HTTP 主端口与 gRPC sidecar 端口，再查开关和 multiprocess 目录 |
 | `cache_hit_rate` 没有 series | Scheduler | `SchedulerMetricsCollector.init_new`、`log_stats` | 查当前 rank 是否允许写 metrics |
 | TTFT 有、E2E 没有 | Tokenizer | `TokenizerManager.collect_metrics` | 确认请求是否进入 `state.finished` |
 | HTTP 5xx 面板有数据但 KV 指标没有 | HTTP middleware 和 Scheduler 分开看 | `track_http_status_code`、`SchedulerMetricsReporter` | 分别查询 HTTP counter 与 `sglang:*token_usage*` |

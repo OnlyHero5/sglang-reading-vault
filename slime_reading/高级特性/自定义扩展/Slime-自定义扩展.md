@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 自定义扩展
 
@@ -28,7 +28,7 @@ updated: 2026-07-10
 
 ## 先建立的模型
 
-Customization 不是“在任意位置插函数”，而是一组 import-path 槽位。每个槽位固定在一个稳定边界上：启动期加载、rollout 外层、单样本生成、reward、过滤、样本转训练数据、训练侧后处理、Megatron 内部 hook、agent harness。
+Customization 不是“在任意位置插函数”，而是一组 import-path 槽位。每个槽位固定在一个调用边界上：启动期加载、rollout 外层、单样本生成、reward、过滤、样本转训练数据、训练侧后处理、Megatron 内部 hook、agent harness。这里的“固定”只指当前基线的调用位置，不等于框架会替你验证签名、返回类型和长度。
 
 ```mermaid
 flowchart LR
@@ -45,7 +45,7 @@ flowchart LR
     LF --> A
 ```
 
-源码依据：`docs/en/get_started/customization.md` L58-L59 明确外层 rollout 函数签名；L131-L136 区分单样本 RM 与 batch RM；L476-L481 给出插件契约测试入口。
+源码依据：`docs/en/get_started/customization.md` L58-L59 明确外层 rollout 函数签名；L131-L136 区分单样本 RM 与 batch RM；L476-L481 给出插件契约测试入口。实际调用点还显示：外层 rollout 是同步 callable，`custom_generate` 才会被无条件 `await`；两者不能混用同一套 async 心智模型。
 
 ## 阅读顺序
 
@@ -68,6 +68,9 @@ flowchart LR
 | 根据 logprob、advantage 或 mask 调整训练 batch | `--rollout-data-postprocess-path` | 这个 hook 位于 Megatron actor 内、训练前 |
 | 改 loss 或 loss reducer | `--custom-loss-function-path` 或 `--custom-pg-loss-reducer-function-path` | 只影响训练目标或 policy loss 归约 |
 | 接外部 coding-agent CLI | agent harness + `custom_generate` | harness 管 CLI 生命周期，generate 管样本产出 |
+
+> [!warning] fan-out 不是默认闭环的一等公民
+> 当前基线允许 `custom_generate` 返回 `list[Sample]`，但默认训练路径随后会形成 `list[list[Sample]]` 的嵌套 group。普通 RM 能处理单次 fan-out，group RM、partial abort、dynamic/sample filter 等路径却仍按扁平 `Sample` 访问元素。若要 fan-out，先把它视为需要端到端契约测试的高级扩展，而不是只补一个共同 `rollout_id` 就安全。
 
 ## 与相邻专题的关系
 

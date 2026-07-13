@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Reward与过滤 · 学习检查
 
@@ -17,61 +17,47 @@ updated: 2026-07-10
 
 - [ ] 能画出 `generate_and_rm_group -> generate_and_rm -> async_rm/batched_async_rm -> call_dynamic_filter -> RolloutFnTrainOutput` 主线。
 - [ ] 能解释 RM Hub 与 Filter Hub 的分工：一个写 `sample.reward`，一个决定整组 keep/drop。
-- [ ] 能说出 `sample.custom_rm_path`、`args.custom_rm_path`、`metadata["rm_type"]`、`args.rm_type` 的优先级。
+- [ ] 能说出单条 `async_rm` 中 `sample.custom_rm_path`、`args.custom_rm_path`、`metadata["rm_type"]`、`args.rm_type` 的优先级，并解释为什么全局 batch custom RM 会绕过 per-sample path。
 - [ ] 能解释 `group_rm=True` 为什么要求 custom RM 可能使用 `(args, samples)` 签名。
 - [ ] 能对比 `math`、`dapo`、`deepscaler` 的返回形状和答案提取边界。
+- [ ] 能说明 `compute_score_dapo` 的 strict-box 是函数级能力，默认 `rm_type=dapo` 分发没有暴露该开关。
 - [ ] 能说明 `dapo` 或 remote RM 返回 dict 时为什么需要 `--reward-key`。
 - [ ] 能解释 `check_reward_nonzero_std` drop 的是一整组 prompt 样本，以及 drop 后为什么会继续补样。
 - [ ] 能根据 `rollout/dynamic_filter/drop_*` metrics 判断 dynamic filter 是否过严。
+- [ ] 能解释 `boxed_math`、`boxed_deepscaler`、`boxed_remote_rm` 为什么不能按“通用预处理前缀”理解。
+- [ ] 能发现 batch RM 输出与输入不等长时 `zip(strict=False)` 的静默截断。
+- [ ] 能说明单样本 group 的 `std=nan` 与永久 drop 时无终止门禁这两个运行风险。
 
 ## 可执行检查
 
-**操作：** 在具备对应依赖的环境中执行下面的单测和审计命令；若本机缺少训练依赖，至少完成源码证据与双链检查。
+**操作：** 从知识库根目录进入 `slime/` upstream，再执行 CPU scorer 与插件契约测试。若依赖不完整，保留 collection error，并完成下面的静态入口定位。
 
-**预期：** pytest 命令通过，源码审计没有缺失文件或越界行号，双链审计没有断链。任何一项失败都应先保留原始输出，再按本页“排障演练”定位契约边界。
+**预期：** pytest 通过时证明 scorer 或 hook 契约成立；缺 `httpx`、Torch ABI 或其他依赖时，结论只能是“环境未满足”，不能写成 reward 实现失败。
 
 CPU scorer 单测：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/test_rm_math_dapo.py -q
+Push-Location slime
+python -m pytest tests/test_rm_math_dapo.py -q
+Pop-Location
 ```
 
 插件契约：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q
+Push-Location slime
+python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q
+Pop-Location
 ```
 
-源码证据：
+静态入口：
 
 ```powershell
-node maintenance/audit_source_evidence.mjs --note slime_reading/Rollout生成/Reward与过滤/Slime-Reward与过滤-源码走读.md
+rg -n 'generate_and_rm_group|async_rm|batched_async_rm|call_dynamic_filter|get_reward_value' slime/slime/rollout
+rg -n 'reward_key|eval_reward_key|group_rm|dynamic_filter' slime/slime/utils/arguments.py
 ```
 
-双链检查：
-
-```powershell
-node maintenance/audit_wikilinks.mjs
-```
-
-旧结构残留检查：
-
-```powershell
-$terms = @(
-  ('Ex' + 'plain'),
-  ('Co' + 'de'),
-  ('Com' + 'ment'),
-  ('^## ' + 'Hop'),
-  ('七 ' + 'Hop'),
-  ('论文' + '库'),
-  ('内部' + '编号'),
-  ('派' + '工'),
-  ('来源' + '：.*' + '\|')
-)
-rg -n ($terms -join '|') slime_reading/Rollout生成/Reward与过滤
-```
+预期：能把 RM 赋值、整组过滤、补样和 metrics 四个边界串起来，而不是只找到 scorer 文件名。
 
 ## 排障演练
 
@@ -80,6 +66,9 @@ rg -n ($terms -join '|') slime_reading/Rollout生成/Reward与过滤
 - [ ] 看到 `drop_zero_std_1.0` metrics 很高，能解释这是全对组被 drop。
 - [ ] 看到 `drop_zero_std_-1.0` metrics 很高，能解释这是 DAPO 全错组被 drop。
 - [ ] remote RM 返回 dict 后，能指出 `reward_key` 和 `eval_reward_key` 分别影响训练与 eval 输出。
+- [ ] 给 custom batch RM 故意少返回一个 reward，能预测哪个 sample 仍为 `None`，并在插件内加入等长断言。
+- [ ] 给 `boxed_math` 输入 `\boxed{42}`，能沿“先抽成 42→math 再找 box”解释为何当前实现判 0。
+- [ ] 设置 `n_samples_per_prompt=1` 和 nonzero-std filter，能预测它会 drop 而不是 keep。
 
 ## 复盘问题
 
@@ -88,3 +77,5 @@ rg -n ($terms -join '|') slime_reading/Rollout生成/Reward与过滤
 - [ ] 为什么 dynamic filter 要用 `get_reward_value(args)` 而不是直接读 `sample.reward`？
 - [ ] 为什么 `math_utils` 和 `math_dapo_utils` 不能简单合并？
 - [ ] 如果 rollout 变慢，如何区分 SGLang 生成慢、remote RM 慢和 dynamic filter 有效样本率低？
+- [ ] 为什么内置 `remote_rm` 即使从 `batched_async_rm` 调用，也不等于一次 batch HTTP RPC？
+- [ ] 为什么默认 eval rollout 不能直接复用训练侧的 `group_rm`？

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 其他Rollout路径 · 排障指南
 
@@ -90,6 +90,7 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
 - 检查 worker 日志 `fully-async task crashed`。
 - 检查 SGLang router 是否健康，以及 custom generate 是否卡住。
 - 降低 `sglang_server_concurrency` 验证是否是并发压垮 server。
+- 同时确认 `get_rollout_num_engines(args)>0`；并发乘积为 0 时不会创建任何 task，而前台没有超时。
 
 ## 症状四：ABORTED 样本进了训练或丢了
 
@@ -112,6 +113,11 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
 - 确认使用的是 global DataSource。
 - 确认 `add_samples` 可用。
 - 区分 fully-async callback 回灌和默认 `sglang_rollout.abort` 的 partial 回灌。
+- task crash、返回类型错误、回灌异常都不是自动重试：应按 gid/sample index 建立外部审计，否则只看 batch 输出无法知道丢了哪些组。
+
+## 症状四补充：下一 step 少了已完成 group
+
+若 queue_warm 明明大于 batch target，下一 step 却没有继承余量，检查 `_generate_rollout_async`：它会一次 drain 整个 output queue，随后仅返回排序后的前 `target` 项。超出的完成 group 没有放回队列，这是当前实现的数据丢失边界。验证时预装 target+N 个 group，预期当前实现返回 target 且 queue 变为 0，而不是保留 N。
 
 ## 症状五：streaming 开了但 partial 还是没有保存
 
@@ -140,7 +146,7 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
 判断：streaming 每个 chunk 会先恢复调用前状态，再用 `append_response_tokens` 重建本次调用累计结果。如果 custom 修改绕过这个过程，就会破坏对齐。
 
 ```python
-# 来源：slime/rollout/sglang_streaming_rollout.py L136-L154
+# 定位骨架（非逐行摘录）：slime/rollout/sglang_streaming_rollout.py L136-L154
                 # Surface partial state on the sample immediately. If the
                 # outer abort path cuts us, whatever we've written so far is
                 # what survives — no /abort_request round-trip needed.
@@ -164,13 +170,14 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
 - 不要手写 `rollout_top_p_token_offsets`。
 - 不要把 cumulative chunk 当 delta 重复追加。
 - 如果 server 开启 incremental streaming，需要重新实现 delta 语义。
+- 同时检查每个 chunk 是否都有 `output_token_logprobs`；只有 text 没有 token logprob 时会产生文本/token 不一致。
 
 ## 症状七：SFT 训练 loss 全零或 user token 进入 loss
 
 判断：SFT 的核心是 `response_length` 和 response tail 的 `loss_mask`。messages 模板、tools、`loss_mask_type` 任一不对都会影响 mask。
 
 ```python
-# 来源：tests/gemma4/test_gemma4_sft_rollout.py L66-L91
+# 定位骨架（非逐行摘录）：tests/gemma4/test_gemma4_sft_rollout.py L66-L91
 def test_multi_turn_response_length_spans_from_first_assistant():
     messages = [
         {"role": "user", "content": "Q1"},
@@ -196,6 +203,7 @@ def test_multi_turn_response_length_spans_from_first_assistant():
 - 确认 `sample.prompt` 是 messages 列表，不是已拼接字符串。
 - 确认 `loss_mask_type` 与模型 chat template 匹配。
 - 用最小 messages 复现，解码 masked token 看 assistant/user 边界。
+- 增加纯 user/system 反例；若 `response_length=0`，当前 `[-0:]` 会取完整 mask，应在数据层拒绝而不是继续训练。
 
 ## 症状八：OPD reward 均值为 0，以为没学习
 
@@ -220,6 +228,7 @@ def test_multi_turn_response_length_spans_from_first_assistant():
 - 检查 `teacher_log_probs` 是否存在且长度等于 response token 数。
 - 检查 teacher server 的 `input_token_logprobs` 是否返回。
 - 如果还需要任务 reward，在 post-process 里叠加，不要覆盖 teacher logprob。
+- 对每条样本断言 `len(teacher_log_probs)==response_length`；特别测试 response_length=0 和 teacher 返回过短。
 
 ## 症状九：forge load 触发 DP schedule 或 rollout_id 断言
 

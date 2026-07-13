@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 自定义扩展 · 核心概念
 
@@ -21,11 +21,10 @@ updated: 2026-07-10
 
 ## 1. import-path 槽位
 
-所有 `--*-path` 的共同入口是 `load_function`。它只负责把字符串解析成 Python 对象，不负责验证签名。
-
-源码依据：`slime/utils/misc.py` L37-L45
+所有 `--*-path` 的共同入口是 `load_function`。它只负责把字符串解析成 Python 对象，不负责验证对象是否 callable、同步还是异步、签名和返回类型。
 
 ```python
+# 来源：slime/utils/misc.py L37-L45
 def load_function(path):
     """
     Load a function from a module.
@@ -37,7 +36,7 @@ def load_function(path):
     return getattr(module, attr)
 ```
 
-这意味着 path typo、模块不可 import、属性不存在会直接抛错；但“函数是不是 async”“参数是不是对齐”“返回值是不是 `Sample`”要靠调用点和 contract tests 约束。
+这意味着空 module path、模块不可 import、属性不存在会直接抛错；模块 import 的顶层副作用也会发生在各个 Python/Ray 进程中。但“属性是不是函数”“函数是不是 async”“参数是不是对齐”“返回值是不是 `Sample`”只能靠调用点、你自己的测试和有限的 contract tests 约束。部分 hook 在启动期缓存，`custom_generate`、RM、filter 和日志 hook 中又有按调用重新加载的路径，不能一概当成一次性插件注册。
 
 ## 2. 外层 rollout 家族
 
@@ -45,34 +44,35 @@ def load_function(path):
 
 | 参数 | 看见什么 | 必须维持什么 |
 |------|----------|--------------|
-| `--rollout-function-path` | `args, rollout_id, data_source, evaluation` | train/eval 返回结构、样本组形状、metrics |
+| `--rollout-function-path` | `args, rollout_id, data_source, evaluation` | 同步返回 train/eval wrapper、样本组形状、metrics |
 | `--eval-function-path` | eval 版同签名输入 | eval dataset 的 `rewards/truncated/samples` 对齐 |
 | `--data-source-path` | 构造时拿 `args` | `get_samples/add_samples/save/load/__len__` |
 
 源码依据：`docs/en/get_started/customization.md` L58-L59 给出 `generate_rollout(args, rollout_id, data_source, evaluation=False)`；L387-L401 要求 DataSource 支持取样、回填、保存、加载和长度统计。
 
-只有当默认 rollout 外循环无法表达你的调度方式时，才应替换 `--rollout-function-path`。如果只是每个 sample 怎么生成，应该用下一层。
+`call_rollout_fn` 会兼容旧式裸 list/dict，但只做 wrapper 包装，不会递归验证字段。只有当默认 rollout 外循环无法表达你的调度方式时，才应替换 `--rollout-function-path`。如果只是每个 sample 怎么生成，应该用下一层。
 
 ## 3. 单样本 generate 家族
 
 `custom_generate` 是 agentic workflow 最常用的入口。它替换的是“一个 `Sample` 如何生成响应”，而不是整个 rollout 调度器。
 
-源码依据：`docs/en/get_started/customization.md` L79-L79
-
 ```python
+# 来源：docs/en/get_started/customization.md L79
 async def custom_generate(args, sample: Sample, sampling_params: dict) -> Sample | list[Sample]
 ```
 
-返回 `list[Sample]` 时是在做 fan-out：一个 prompt 产生多个训练片段。兄弟样本必须共享同一个 `rollout_id`，否则 group reward、advantage、train step 分组和日志都会把它们当成独立 rollout。
+调用点每个 sample 都重新 `load_function`，用 `inspect.signature` 检查是否存在**精确名为** `evaluation` 的参数，然后无条件 `await`。因此只写 `**kwargs` 收不到 eval 标志，同步函数不受支持，某些无法被 `inspect.signature` 检查的 wrapper 也会在生成前失败。
+
+返回 `list[Sample]` 时是在做 fan-out：一个 rollout 产生多个训练片段。兄弟样本必须显式填写并共享同一个非空 `rollout_id`，因为 `RolloutManager` 会在拍平前检查深层 sibling；但这只是训练归约契约。当前默认 group RM、partial abort 和若干 filter 仍把外层元素当作 `Sample`，与嵌套 fan-out 形状并不完全兼容。
 
 ## 4. reward 与过滤家族
 
 reward hook 有两种形态：
 
 - 单样本：`async def custom_rm(args, sample: Sample) -> float`
-- batch：`async def batched_custom_rm(args, samples: list[Sample]) -> list[float]`
+- group/batch：`async def batched_custom_rm(args, samples: list[Sample]) -> list[float]`
 
-源码依据：`docs/en/get_started/customization.md` L131-L136
+规范要求返回 reward 数与输入样本等长，但源码并非处处强制：普通 fan-out 和 group RM 都用 `zip(..., strict=False)` 回填，少 reward 会留下 `None`，多 reward 会被忽略。单样本 RM 的 path 优先级是 `sample.custom_rm_path`、全局 `args.custom_rm_path`、内置 RM；group RM 只看全局 path，不读取 sample 级 path。
 
 过滤 hook 不都一样：
 
@@ -84,6 +84,8 @@ reward hook 有两种形态：
 | `--rollout-all-samples-process-path` | 全量 groups 与 data_source | 原地处理或写 metrics |
 
 源码依据：`docs/en/get_started/customization.md` L168-L172 说明 `DynamicFilterOutput`；L209-L211 说明 sample filter 通过副作用标记样本。
+
+这些表格描述的是默认扁平 group。fan-out 后，dynamic filter、sample filter 和 all-samples process 可能收到嵌套的 `list[list[Sample]]` 元素；插件若不主动递归处理，就会在访问 `sample.reward`、`remove_sample` 等字段时失败。
 
 ## 5. 训练数据与训练侧家族
 
@@ -97,19 +99,24 @@ reward hook 有两种形态：
 | `--custom-pg-loss-reducer-function-path` | policy loss reduce | Dr.GRPO、固定分母、per-token/per-sample 归约 |
 | `--custom-loss-function-path` | loss 计算 | 新训练目标，需配合 `--loss-type custom_loss` |
 
-源码依据：`docs/en/get_started/customization.md` L288-L294 给出 pg loss reducer 输入；`slime/backends/megatron_utils/actor.py` L511-L512 显示 `rollout_data_postprocess` 在训练前调用。
+源码依据：`docs/en/get_started/customization.md` L288-L294 给出 pg loss reducer 输入；`slime/backends/megatron_utils/actor.py` L511-L512 显示 `rollout_data_postprocess` 在训练前调用。注意官方 customization 文档把后者示例写成二参数，而实际调用点和 contract test 都要求 `(args, rollout_id, rollout_data)`；维护插件时以执行代码为准。
 
 ## 6. Megatron hooks
 
 Megatron hook 不是用来改 rollout 数据形状的，它们是在训练栈内部插入动作。
 
-源码依据：`docs/en/get_started/customization.md` L421-L443
+```python
+# 来源：docs/en/get_started/customization.md L423
+def custom_init(args) -> None
+```
 
 ```python
-def custom_init(args) -> None
-
+# 来源：docs/en/get_started/customization.md L432
 def custom_hook(args, model, store_prefix) -> None
+```
 
+```python
+# 来源：docs/en/get_started/customization.md L441
 def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None
 ```
 

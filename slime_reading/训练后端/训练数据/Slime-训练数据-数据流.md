@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练数据 · 数据流
 
@@ -53,6 +53,8 @@ flowchart TD
 | `micro_batch_indices` | schedule 输出 | rank-local mbs 表 | 原样保留 | DataIterator offset 消费 |
 | `rollout_mask_sums` | 按 rollout 聚合 | 按 partition 切片 | GPU tensor | 传给 loss |
 | `global_batch_sizes` | schedule 输出 | 每 step rollout 数 | 原样保留 | loss 缩放和日志 |
+| `raw_reward` | 全局 list | 仍是全局 list | 仍是全局 list | passrate/correct-only 日志；不能直接与 rank-local 列同下标遍历 |
+| `metadata` | 可由 rollout 转换生成 | **未进入当前分片白名单** | 不可见 | 自定义 hook 若依赖它会缺字段 |
 
 源码入口：来源：slime/ray/rollout.py L853-L895
 
@@ -71,7 +73,7 @@ packed token offset
 源码入口：来源：slime/utils/dp_schedule.py L200-L209
 
 ```python
-# 来源：slime/utils/dp_schedule.py L200-L209
+# 定位骨架（基于 `slime/utils/dp_schedule.py` L200-L209；省略外层上下文）
 # 4. Build per-rank partitions (global sample indices) and micro_batch_indices
 # (local indices into partitions[r]).
 for r in range(dp_size):
@@ -104,7 +106,7 @@ return partitions, micro_batch_indices, num_microbatches, global_batch_sizes
 源码入口：来源：slime/ray/rollout.py L845-L887
 
 ```python
-# 来源：slime/ray/rollout.py L845-L887
+# 定位骨架（基于 `slime/ray/rollout.py` L845-L887；省略注释与收尾分支）
 partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
     self.args,
     self.train_parallel_config,
@@ -140,7 +142,7 @@ for r in range(dp_size):
         rollout_data[key] = [data[key][j] for j in partition]
 ```
 
-注意 `raw_reward/total_lengths` 是例外，它们先保留全局列，再由 actor 侧或日志侧按需要解释。
+注意 `raw_reward/total_lengths` 是例外：它们在 Ray 对象里先保留全局列，但 actor 侧只有 `total_lengths` 会按 `partition` 收缩；`raw_reward` 继续是全局列。二者不能合并成一句“随后都变 rank-local”。另外，这段复制是字段白名单，不是 `data.items()` 透明传输；未列出的 `metadata` 和插件字段会在这里消失。
 
 ## Actor 侧恢复 rank-local 视图
 
@@ -172,7 +174,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 源码入口：来源：slime/backends/megatron_utils/data.py L201-L245
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L201-L245
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L201-L245；省略 docstring 与方法）
 class DataIterator:
     """Iterator over a rollout dict following an explicit micro-batch index schedule."""
 
@@ -263,6 +265,11 @@ batch["packed_seq_params"] = packed_seq_params
 
 `tokens` 是一个 `[1, T]` 的 packed stream；样本边界不再体现在 batch 维，而体现在 `cu_seqlens`。
 
+这句话只可作为总体模型，不能忽略 CP 分支差异：
+
+- 默认 CP：每条样本经过首尾对称的 `slice_with_cp`，局部片段拼接后，`cu_seqlens` 再乘 `cp_size` 回到原始长度坐标。
+- allgather-CP：`cu_seqlens` 在切 chunk 前由全局拼接流构造，`tokens` 随后才取当前 CP rank 的连续 chunk。因此 `cu_seqlens` 是全局边界元数据，不要求末值等于本 rank 的 `T`。
+
 ## 日志数据流
 
 Train Data 还负责把 rollout 字段聚合成日志。它不改变训练主线，但解释了为什么 `rollout_mask_sums` 要保留到训练侧。
@@ -270,7 +277,7 @@ Train Data 还负责把 rollout 字段聚合成日志。它不改变训练主线
 源码入口：来源：slime/backends/megatron_utils/data.py L248-L330
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L262-L328
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L262-L328；省略注释与非目标分支）
 if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
     cp_size = mpu.get_context_parallel_world_size()
     log_dict = {}
@@ -312,6 +319,8 @@ if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
 
 日志和 loss 使用同一类 per-rollout mean 语义，避免“日志看起来正常，但梯度分母是另一套口径”。
 
+这里必须限定到上面列出的 token-level 指标主路径。`log_correct_samples` 是另一条过滤后日志路径：它枚举仍为全局长度的 `raw_reward`，却索引 rank-local 的 `response_lengths/total_lengths/loss_masks`。DP>1 时这两种下标空间并未对齐，可能越界或错配；不能用主路径的 per-rollout reducer 正确性替它背书。
+
 ## 数据流检查
 
 - `partition` 是全局 sample 下标，`micro_batch_indices` 是 rank-local 下标。
@@ -319,7 +328,9 @@ if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
 - 每个 rank 的 `micro_batch_indices` 展平后覆盖 `range(len(partition))`。
 - `len(num_microbatches) == len(global_batch_sizes)`。
 - `full_loss_masks.shape == tokens.shape`。
-- `PackedSeqParams.cu_seqlens_q` 表示 packed stream 的样本边界。
+- 默认 CP 下，`PackedSeqParams.cu_seqlens_q` 表示还原到原始长度坐标的样本边界；allgather-CP 下表示切分前全局拼接流边界。
+- 输入 sample 集减去 partitions 并集，恰好是被尾部 trimming 丢弃的样本；差集非空时必须显式记录。
+- 进入 actor 的 per-sample 字段长度应与本 rank `tokens` 样本数一致；`raw_reward` 是当前明确的全局例外。
 - `rollout_mask_sums` 进入日志和 loss，保持 per-rollout mean 口径。
 
 ## 运行验证

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练步骤 · 核心概念
 
@@ -51,6 +51,8 @@ flowchart TD
 | `num_microbatches` | RolloutManager DP schedule | 每个 train step 的 micro-batch 数列表 |
 | `global_batch_sizes` | RolloutManager DP schedule | 每个 train step 的 rollout 数，用于 loss 缩放和 scheduler |
 
+`external_data` 还有一个未被类型签名表达的坐标契约：critic 的第 `r` 个 Ray ref 被直接交给 actor 的第 `r` 个 handler。源码只校验两个 group 的 worker 数相同，不把 critic PP-last-stage 输出重新路由到 actor PP-last-stage。若 role-specific Megatron YAML 改了 TP/PP/CP，GPU 总数仍相同也可能让 actor last stage 收到 `{}`。
+
 ## Critic 和 Actor 的分工
 
 PPO + Critic 路径像一次“先估分、再改卷”：
@@ -64,7 +66,7 @@ PPO + Critic 路径像一次“先估分、再改卷”：
 源码入口：来源：slime/backends/megatron_utils/actor.py L402-L428
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L408-L427
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L408-L427；省略上下文与空行）
 rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
 
 compute_advantages_and_returns(self.args, rollout_data)
@@ -89,6 +91,8 @@ return {}
 
 不变量：只有 PP last stage 拿到 response-aligned `values`，所以非 last stage 返回 `{}` 是正常现象。
 
+但“非 last stage 返回 `{}`”与 worker 序号直连组合后形成了更强前提：actor 与 critic 的 PP-last-stage 全局 rank 集合必须一致。与此同时，`create_training_models` 先让 actor、再让 critic 调 `set_rollout_manager`；两组 rank 0 都会写训练并行配置，critic 的 `dp_size/cp_size/vpp_size/mb_group` 最终覆盖 actor 配置。因此启用 critic 时，训练数据 schedule 与 values 传递实际上都假设两组并行拓扑兼容，当前代码没有做全量比较。
+
 ## 为什么 Actor 常常要重算 log-prob
 
 Rollout 阶段可以带 `rollout_log_probs`，但训练侧仍经常重算 actor/ref/teacher log-prob，因为训练 loss 需要的是 Megatron 当前权重、当前并行布局和可选 routing replay 下的一致口径。
@@ -96,7 +100,7 @@ Rollout 阶段可以带 `rollout_log_probs`，但训练侧仍经常重算 actor/
 源码入口：来源：slime/backends/megatron_utils/actor.py L439-L510
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L466-L493
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L466-L493；省略注释与后续分支）
 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
 can_reuse_log_probs_in_loss = (
     len(num_microbatches) == 1
@@ -159,13 +163,25 @@ for model_module in model:
 
 关键点：动态 batch 不是“一个 rollout 一个 step”的固定形态。`num_microbatches[i]` 和 `global_batch_sizes[i]` 必须一一对应。
 
-## 读代码时抓住的五个边界
+## 训练调用不是可随意重入的纯函数
+
+一次 `train()` 会修改进程级或长生命周期状态：
+
+- `forward_only` 把 model 切到 eval，结束后再切回 train，但没有 `try/finally`。
+- `train` 可 `gc.disable()`，却没有使用 `manual_gc_interval` 做条件调度；当前实现每次进入该路径都直接 `gc.collect()`，且不重新启用自动 GC。
+- `overlap_grad_reduce` 会要求 `config.no_sync_func is None`，随后写入 no-sync callback；本函数末尾没有显式清空。能否安全进入下一轮依赖 Megatron 内部是否替调用方恢复，Slime wrapper 自身没有闭环。
+- distributed optimizer 的 pre-hook、`config.param_sync_func`、进度条、梯度清零和 actor `sleep()` 都没有统一异常回滚。
+
+所以异常后的正确问题不是“能不能再调用一次”，而是先证明上述状态已恢复；无法证明时应销毁并重建 Ray actor。
+
+## 读代码时抓住的六个边界
 
 - Ray 边界：`async_train` 返回 ObjectRef 列表，主进程用 `ray.get` 等结果。
 - DP 边界：`process_rollout_data` 按 DP rank 取 `rollout_data_ref[dp_rank]`。
 - PP 边界：log-prob、values、advantage 只在 last PP stage 有完整结果。
 - Loss 边界：Train Step 只选择和传入 `loss_type`，算法细节在 loss 模块。
 - 权重边界：本专题结束于 actor/critic 训练完成；权重推送看 [[Slime-分布式权重同步]]。
+- 同步边界：同步主循环每轮推权重；async 主循环只在 `(rollout_id + 1) % update_weights_interval == 0` 时推送，而且会先等待已启动的下一轮生成，形成明确的行为策略滞后。
 
 ## 运行验证
 

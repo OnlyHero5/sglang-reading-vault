@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Quantization · 核心概念
 
@@ -44,9 +44,9 @@ flowchart TD
 
 这张图有一个容易漏掉的点：KV cache 量化也走 method 体系，但它的 `apply` 明确不该被调用。它只把 `k_scale/v_scale` 挂到 Attention layer，后续由 Attention backend 消费。
 
-## 源码证据：method 契约只有三件事
+## 源码证据：共同骨架有三阶段，消费者还有专属 ABI
 
-`QuantizeMethodBase` 规定三段生命周期：创建参数、执行、加载后处理。所有具体量化实现都要把自己的复杂性压进这三个扩展点。
+`QuantizeMethodBase` 规定创建参数、执行、加载后处理三段共同生命周期；这只是最小骨架，不是全部契约。`LinearMethodBase` 收紧为 `(layer, x, bias)`，`FusedMoEMethodBase` 还增加 `create_moe_runner`、`DispatchOutput → CombineInput` 和 `get_triton_quant_info`。KV method 则保留生命周期接口，却故意让 `apply` 抛错。
 
 ```python
 # 来源：python/sglang/srt/layers/quantization/base_config.py L20-L43
@@ -110,6 +110,8 @@ Linear 层构造时绑定 `quant_method`。没有量化配置时也会走 `Unqua
 ```
 
 这里的 mental hook 是“Linear 不知道自己是不是 FP8/GPTQ/AWQ”。它只知道自己有一个 method，method 决定权重格式和 GEMM 路径。`wrap_method_with_debug_kernel_once` 还让实际 `apply` 变成可观测的 kernel 名称，排查 fallback 时很有用。
+
+但“配置类返回什么”还不是最终事实。多数 Linear 构造器要求 method 非空；ROCm 的 QKV/RowParallel 又可在环境开关下主动丢弃 `quant_config`，改绑 unquant method。MoE 则会把 `None` 转成 `UnquantizedFusedMoEMethod`，还可能再套 KTEP wrapper。因此 `None`、fallback 与 wrapper 的语义由 consumer 决定，不能只读 `get_quant_method`。
 
 ### MoE：输入不是普通 `x`，而是 dispatch 后的 expert batch
 
@@ -185,12 +187,12 @@ Attention layer 初始化时也会问 `quant_config` 要 method，并让 method 
 | 配置来源 | HF `quantization_config` 或在线量化配置 | GPTQ config，可能含 `dynamic` per-module 规则 | AWQ config，可能走 Marlin |
 | activation | 可 static 或 dynamic 量化 | 通常 weight-only | 通常 weight-only |
 | Linear 执行 | Marlin、mxfp8、block FP8、默认 FP8 分支 | GPTQ packed weight kernel | AWQ 或 AWQ Marlin kernel |
-| MoE | 有 `Fp8MoEMethod` 和 FP4 expert 特殊分支 | 普通 GPTQ 不支持 MoE，需看 GPTQ Marlin/MoE 路径 | MoE 支持受 Marlin 条件限制，不支持时可 fallback |
+| MoE | 有 `Fp8MoEMethod` 和 FP4 expert 特殊分支 | 默认 `GPTQConfig` 拒绝 MoE；GPTQ Marlin、NPU `GPTQAscendConfig`、CPU AMX `CPUGPTQConfig` 有各自 MoE 路径 | CUDA/HIP 的普通 `AWQConfig` 只给 Linear 发 method；`AWQMarlinConfig` 才会为 MoE 检查 Marlin 并回退 Moe WNA16，NPU/CPU 又是独立实现 |
 | KV cache | FP8 KV scale method | 不由普通 GPTQ Linear method 处理 | 不由普通 AWQ Linear method 处理 |
 
-## 配置账：HF config 优先补齐 method 细节
+## 配置账：配置来源是一条有优先级的解析链
 
-`get_quant_config` 先拿用户选择的量化类，再从 HF config、text config 或 compression config 读取量化元数据，并把 `packed_modules_mapping` 注入进去。
+这里其实有两次解析。第一次在 `ModelConfig`：从 HF/ModelSlim 元数据得到候选 method，逐类尝试 `override_quantization_method`，再处理 CLI、checkpoint 与 draft model 的兼容关系；AWQ/GPTQ 转 Marlin等自动选择发生在这里。第二次才是 `get_quant_config`：拿最终方法名对应的平台相关配置类，GGUF 直接用空配置，其余路径优先读 HF `quantization_config`、`text_config.quantization_config` 或 `compression_config`。若这些字段都没有，bitsandbytes 可转向 QLoRA adapter，普通 checkpoint 会在本地目录或 Hub snapshot 中搜索 JSON；没有配置文件名的在线量化方法还可能走专用默认构造。下面的源码卡只证明第二次解析中优先级最高的 HF-config 分支，不代表完整链路。
 
 ```python
 # 来源：python/sglang/srt/model_loader/weight_utils.py L237-L263

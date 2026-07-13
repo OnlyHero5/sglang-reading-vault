@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练步骤 · 数据流
 
@@ -75,7 +75,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 源码入口：来源：slime/backends/megatron_utils/data.py L201-L245
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L219-L245
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L219-L245；省略类缩进与 docstring）
 def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
     batch = {}
     indices = self.micro_batch_indices[self.offset]
@@ -111,7 +111,7 @@ Train Step 真正喂给模型的不是 `list[tokens]`，而是 concat、CP slice
 源码入口：来源：slime/backends/megatron_utils/data.py L28-L163
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L55-L63
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L55-L63；省略 pad-token 注释）
 assert "tokens" in keys
 batch = data_iterator.get_next(keys)
 
@@ -124,7 +124,7 @@ batch["unconcat_tokens"] = tokens
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L106-L148
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L106-L148；省略 token 写回与 mask 分支）
 max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 packed_seq_params = PackedSeqParams(
     cu_seqlens_q=cu_seqlens,
@@ -199,6 +199,14 @@ if self.args.use_critic:
 
 不变量：actor 和 critic 必须消费同一份 `rollout_data_ref` 和同一套 micro-batch 顺序。否则 values 与样本会错位。
 
+这个不变量当前靠配置约定而不是显式路由保证：
+
+- `external_data` 按 Ray worker 列表位置一一配对，没有携带 DP/TP/PP 坐标。
+- actor 和 critic GPU 总数被设为相同，但 role-specific YAML 可以覆盖 TP/PP/CP 等 Megatron 参数。
+- actor、critic rank 0 依次向 RolloutManager 写 `train_parallel_config`，后写入的 critic 配置生效。
+
+因此“总 worker 数相同”不等于“数据 partition、micro-batch schedule 和 PP-last-stage 输出位置相同”。PPO + Critic 的生产验证应比较两组完整 parallel config 与每个 global rank 的 `(dp,tp,pp,cp)` 坐标。
+
 ## Aux forward 结果如何回填 rollout_data
 
 `forward_only` 的输出是一个 dict，key 由 `store_prefix` 决定：
@@ -213,7 +221,7 @@ if self.args.use_critic:
 源码入口：来源：slime/backends/megatron_utils/model.py L487-L506
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L487-L506
+# 定位骨架（基于 `slime/backends/megatron_utils/model.py` L487-L506；省略注释与外层条件）
 rollout_data = {}
 # Store the results on the last stage
 if mpu.is_pipeline_last_stage():
@@ -235,6 +243,8 @@ return rollout_data
 ```
 
 动态 batch 的重排是这里最关键的细节：forward 按 micro-batch 顺序产出，loss 和 advantage 需要回到 sample 原顺序。
+
+当前重排用 `zip(values, origin_indices, strict=False)`，没有验证长度、唯一性或范围；若 pipeline 返回项数与 schedule 不一致，可能留下 `None` 或静默忽略多余项。验收不能只看最终 list 长度，应断言所有槽位非空且 origin indices 是完整 permutation。
 
 ## advantage 与 returns 的字段闭环
 
@@ -313,13 +323,16 @@ Actor train 前会调用 `log_rollout_data`，训练 step 结束后 `model.train
 - aux forward 写入的 `log_probs/values` 与样本原顺序对齐。
 - `advantages/returns` 只要求在 last PP stage 存在。
 - `rollout_mask_sums` 进入 `loss_function`，否则 compact rollout 的分母会漂。
+- actor/critic 完整 parallel config 一致，且两组 PP-last-stage global rank 集合一致；只比较 world size 不够。
+- dynamic reorder 后不存在 `None`，且 `origin_indices` 长度、唯一性、范围均合法。
+- 训练异常后 model mode、iterator offset、DDP hooks、grad buffer、GC 与 offload 状态已恢复；否则重建 actor。
 
 ## 运行验证
 
 这篇的验证目标是确认训练 step 的字段闭环没有断：数据 helper pack batch，actor 补 log-prob / value，loss helper 写 advantage，`train_one_step` 消费最终字段。
 
 ```powershell
-rg -n 'split_data_for_dp_rank|get_micro_batch|PackedSeqParams|compute_log_prob|train_one_step|compute_advantages_and_returns|loss_function|log_rollout_data|rollout_mask_sums|rollout_log_probs|teacher_log_probs' slime/slime/utils/data.py slime/slime/backends/megatron_utils/data.py slime/slime/backends/megatron_utils/actor.py slime/slime/backends/megatron_utils/model.py slime/slime/backends/megatron_utils/loss.py
+rg -n 'process_rollout_data|micro_batch_indices|PackedSeqParams|compute_log_prob|train_one_step|compute_advantages_and_returns|loss_function|log_rollout_data|rollout_mask_sums|rollout_log_probs|teacher_log_probs|no_sync_func|manual_gc_interval' slime/slime/utils/data.py slime/slime/backends/megatron_utils/data.py slime/slime/backends/megatron_utils/actor.py slime/slime/backends/megatron_utils/model.py slime/slime/backends/megatron_utils/loss.py
 ```
 
 读输出时按字段流检查：`rollout_log_probs` 和 `teacher_log_probs` 是否仍能从 rollout 或 aux forward 进入训练 batch，`rollout_mask_sums` 是否仍被日志和 loss 使用，`compute_advantages_and_returns` 是否仍在 policy loss 前写入 `advantages/returns`。

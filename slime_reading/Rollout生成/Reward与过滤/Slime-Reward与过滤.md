@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Reward与过滤
 
@@ -72,23 +72,25 @@ RM Hub 只负责“这条 response 得多少分”；Filter Hub 负责“这组 
 
 | 边界 | 结论 |
 |------|------|
-| [[Slime-SGLang-Rollout]] | SGLang 如何生成 response 在 12；本专题从 response 已经返回后开始 |
-| [[Slime-RolloutManager]] | RolloutManager 如何汇总、后处理和交付训练数据在 08 |
-| [[Slime-Advantage计算]] | reward 如何进入 advantage/return 计算在 21 |
+| [[Slime-SGLang-Rollout]] | SGLang 如何生成 response；本专题从 response 已经返回后开始 |
+| [[Slime-RolloutManager]] | RolloutManager 如何汇总、后处理和交付训练数据 |
+| [[Slime-Advantage计算]] | reward 如何进入 advantage/return 计算 |
 | [[Slime-自定义扩展-核心概念]] | 更宽的 plugin/hook 生态在 customization；本专题只讲 RM 与 dynamic sampling filter |
 
 ## 首次阅读抓手
 
-先记住五条：
+先记住七条：
 
-- `async_rm` 是单条 reward 的入口，优先级是 `sample.custom_rm_path -> args.custom_rm_path -> rm_type`。
-- `batched_async_rm` 默认只是并发调用 `async_rm`；只有 `args.custom_rm_path` 存在时才把整个 samples list 交给用户函数。
+- `async_rm` 是单条 reward 的入口，优先级是 `sample.custom_rm_path -> args.custom_rm_path -> metadata["rm_type"] -> args.rm_type`。
+- `batched_async_rm` 在没有全局 custom RM 时并发调用 `async_rm`；一旦设置 `args.custom_rm_path`，它直接把整个 samples list 交给全局函数，此时不会再检查每个 sample 的 `custom_rm_path`。
 - `group_rm=True` 改变打分时机：先等同一 prompt 的整组 response 都生成完，再统一打分。
 - `dapo` 和很多 remote RM 会返回 dict；dynamic filter 和训练侧取标量时依赖 `--reward-key`。
 - `check_reward_nonzero_std` drop 的是一整组 prompt 样本，drop 后 `generate_rollout_async` 会继续补样。
+- 当前补样循环没有最大 drop 次数或有效率下限；filter 永远拒绝时，rollout 可以一直运行而无法凑满 batch。
+- `boxed_` 只是改写局部变量，不是可靠的通用组合器：当前 `boxed_math` 会二次找 box，`boxed_remote_rm` 仍发送原 response。
 
 ## 相关验证
 
-- `pytest slime/tests/test_rm_math_dapo.py -q`：CPU 单测，锁定 DAPO scorer 与普通 math scorer 的差异。
-- `pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q`：检查 custom RM 与 dynamic filter 插件签名。
+- 从 `slime/` repo 根目录运行 `python -m pytest tests/test_rm_math_dapo.py -q`：CPU 单测，锁定 DAPO scorer 与普通 math scorer 的差异。
+- 从 `slime/` repo 根目录运行 `python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q`：检查 custom RM 与 dynamic filter 插件签名。
 - `node maintenance/audit_source_evidence.mjs --note slime_reading/Rollout生成/Reward与过滤/Slime-Reward与过滤-源码走读.md`：检查本专题源码证据。

@@ -9,59 +9,52 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
+
 # Slime 零基础先修
 
-> 面向**不熟悉分布式训练 / RL 后训练**的读者  
-> 读完本篇，再进入 [[Slime-项目总览]]、[[Slime-RL训练全链路]] 与 [[Slime-学习路径]]  
-> 内嵌代码对应 slime Git commit `22cdc6e1`
+## 你为什么要读
 
----
+Slime 同时使用 Ray、SGLang、Megatron 和 RL 后训练。新手最容易犯的错误不是不懂某个公式，而是把四套系统的名词混在一起：把 Ray Actor 当成 policy actor，把 PlacementGroup 当成模型并行，把 `.remote()` 当成已经完成，把 optimizer step 当成 rollout engine 已换权。本篇只建立七个足够进入源码的心理模型，并明确每个类比在哪里失效。
 
-## 这篇文档解决什么问题
-
-Slime 不是单纯的“训练脚本”，而是一套把 **Rollout 生成、Reward 打分、Megatron 训练、权重同步** 串成闭环的后训练系统。新手最容易卡在两个基础层：
-
-| 基础层 | 它解决什么 | 在 Slime 里出现在哪里 |
-|--------|------------|------------------------|
-| **Ray** | 多机多 GPU 上怎么启动进程、占资源、远程调用 | `create_placement_groups`、`RayTrainGroup`、`RolloutManager` |
-| **Megatron** | 一个大模型怎么切到多张 GPU 上训练 | `MegatronTrainRayActor`、`initialize_model_parallel`、`train_one_step` |
-
-先建立这两层直觉，再看 `generate → train → update_weights` 就不会迷路：Ray 像“集群调度中心”，Megatron 像“训练车间里的并行生产线”，SGLang 像“负责生成样本的推理车间”。
+## 先看全局：四套系统各管什么
 
 ```mermaid
 flowchart LR
-  CLI["train.py<br/>主控进程"] --> PG["Ray PlacementGroup<br/>预订 GPU 工位"]
-  PG --> RM["RolloutManager<br/>生成样本"]
-  PG --> TG["RayTrainGroup<br/>训练 Actor 组"]
-  RM --> SG["SGLang<br/>rollout 推理"]
-  TG --> MT["Megatron<br/>多 GPU 训练"]
-  MT --> UW["update_weights<br/>推给 SGLang"]
-  UW --> SG
+    R["Ray<br/>进程、资源、远程引用"]
+    S["SGLang<br/>按当前 policy 生成"]
+    D["Slime data/rollout<br/>prompt、Sample、reward、分片"]
+    M["Megatron<br/>模型并行、forward/backward、optimizer"]
+    W["Slime updater<br/>把新 policy 发布回 SGLang"]
+
+    R --> S
+    R --> D
+    R --> M
+    S --> D --> M --> W --> S
 ```
 
----
+| 系统 | 核心问题 | 不负责什么 |
+|------|----------|------------|
+| Ray | 哪个进程占哪些资源，远程任务何时返回 | TP/PP/DP 的数学通信语义 |
+| SGLang | 一次生成怎样调度、执行、使用 KV cache | reward、advantage、optimizer |
+| Slime | 把生成、样本、训练与权重发布编成闭环 | 重写 Megatron/SGLang 内核 |
+| Megatron | 大模型怎样切到多卡训练并更新参数 | 下一轮 rollout 自动换权 |
 
-## 0. Slime 的最小心智模型
+## 问题一：一轮 Slime 到底发生什么
 
-### 读法
-把一次 Slime 训练想成一个循环车间：
+同步 baseline 的最小闭环是：
 
-1. **Ray 先排工位**：哪些 GPU 给训练，哪些 GPU 给 rollout。
-2. **RolloutManager 去出题**：从数据源拿 prompt，用 SGLang 生成回答并打 reward。
-3. **Megatron Actor 去改卷和补课**：把 rollout 样本转成训练 batch，算 advantage / loss，更新模型。
-4. **update_weights 把新模型发回推理侧**：下一轮 rollout 用更新后的权重。
+1. 根据最终 args 预订 GPU 并创建运行主体。
+2. 创建 RolloutManager，它启动/连接 SGLang 并持有 DataSource。
+3. 创建 Megatron actor/可选 critic，并把训练并行配置回传给 RolloutManager。
+4. 第一轮前先把 actor 已加载的参数发布给 rollout engine。
+5. 生成 samples，转换并按 DP rank 封装。
+6. critic/actor 训练，更新训练侧参数。
+7. 显式发布新权重，下一轮生成才可能观察到新 policy。
 
-这个循环就是 Slime 文档里反复出现的：
-
-```text
-generate -> train -> update_weights
-```
-
-### 源码锚点
 ```python
-## 来源：train.py L9-L20
+# 来源：train.py L9-L20
 def train(args):
     configure_logger()
     # allocate the GPUs
@@ -69,86 +62,41 @@ def train(args):
     init_tracking(args)
 
     # create the rollout manager, with sglang engines inside.
+    # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 ```
 
-### 要点
-- `pgs` 是 Ray 资源布局，不是训练数据。
-- `rollout_manager` 负责生成样本；`actor_model` / `critic_model` 是训练侧 Ray Actor 组。
-- 之后的主循环见 [[Slime-RL训练全链路]]，入口专题见 [[Slime-训练主循环]]。
+这段代码只证明启动顺序；真实拓扑还受 debug、external、colocate、PPO、PD/EPD、多模型等参数影响。
 
----
+## 问题二：Ray 的 `.remote()` 和 ObjectRef 是什么
 
-## 1. Ray 是什么：把多机多卡变成可调用对象
+可以先把 Ray 理解成“跨进程 Python 调用 + 资源调度”：
 
-### 读法
-Ray 可以先理解成“分布式 Python 运行时”：
+| 本地 Python | Ray | 准确含义 |
+|-------------|-----|----------|
+| `Class()` | `Class.remote()` | 在被调度的 Ray worker 进程中创建 actor |
+| `obj.method()` | `obj.method.remote()` | 提交远程调用 |
+| 返回值 | `ObjectRef` | 远程结果的引用/未来值 |
+| 直接继续 | `ray.get(ref)` | 等待并解析远程结果 |
 
-| 普通 Python | Ray 版本 | 含义 |
-|-------------|----------|------|
-| `obj = Class()` | `obj = Class.remote()` | 在集群某个进程里创建对象 |
-| `obj.method()` | `obj.method.remote()` | 远程调用方法 |
-| 返回值 | `ObjectRef` | 结果还在远端，先拿到引用 |
-| 直接使用结果 | `ray.get(ref)` | 等远端算完，把结果取回来 |
+两个边界：
 
-Slime 不希望你手写 SSH 到每台机器起进程；它让 Ray 按资源声明创建 Actor，再用 `.remote()` 调用训练或 rollout 方法。
+- `.remote()` 只表示提交，不表示任务完成。
+- `ray.get` 是同步点，但数据是否复制到当前进程还取决于 object store/NIXL 与对象内容。
 
-### 源码锚点
-```python
-## 来源：slime/ray/actor_group.py L131-L142
-def async_train(self, rollout_id, rollout_data_ref, external_data=None):
-    """Do one rollout training. Returns a list of Ray refs (one per worker).
+`RayTrainGroup.async_train()` 返回每个 training worker 一份 ref；同步主循环随后 `ray.get`，所以函数名里的 async 不等于整轮 generate 与 train 已经重叠。真正的相邻轮次重叠要看 `train_async.py` 的 future 启动和等待位置。
 
-    For critics, each ref resolves to ``{"values": [cpu tensors...]}`` (or ``{}``
-    for non-last-PP-stage workers). Actor refs resolve to ``None``.
+## 问题三：PlacementGroup 与模型并行有什么区别
 
-    ``external_data`` may be a list (one item per worker) or a single dict
-    broadcast to all workers.
-    """
-    if isinstance(external_data, list):
-        assert len(external_data) == len(self._actor_handlers)
-```
+### PlacementGroup：先占座
 
-### 要点
-- `async_train` 名字里的 async 指 **Ray ObjectRef 异步**，不是 Megatron 内部异步训练。
-- `ray.get(actor_model.async_train(...))` 才会等待所有远程训练 Actor 完成。
-- 深读：[[Slime-RayTrainGroup-核心概念]]。
-
----
-
-## 2. PlacementGroup：先预订 GPU 工位
-
-### 读法
-Ray PlacementGroup（PG）是一组资源 bundle。Slime 里最常见的 bundle 是：
-
-```text
-1 个 GPU + 1 个 CPU
-```
-
-你可以把它看成训练车间里的一个“工位”。Slime 会根据配置决定：
-
-- actor 训练要多少工位；
-- rollout 推理要多少工位；
-- actor 与 rollout 是否 colocate 共用工位；
-- rollout 是否外部部署，不由本 Ray 集群管理。
-
-### 源码锚点
-```python
-## 来源：slime/ray/placement_group.py L42-L48
-def _create_placement_group(num_gpus):
-    """Create a placement group with the specified number of GPUs."""
-    if num_gpus == 0:
-        return None, [], []
-
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
-    pg = placement_group(bundles, strategy="PACK")
-```
+每个 bundle 通常声明 1 GPU + 1 CPU。Slime 创建一个 PG，并把有序 bundle 视图交给 actor 与 rollout；colocate 时二者视图重叠，分离部署时 rollout 视图从 actor GPU 之后开始。
 
 ```python
-## 来源：slime/ray/placement_group.py L100-L117
+# 来源：slime/ray/placement_group.py L100-L117
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
@@ -169,34 +117,30 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
     return actor_num_gpus + args.rollout_num_gpus, actor_num_gpus
 ```
 
-### 要点
-| 模式 | GPU 布局直觉 |
-|------|--------------|
-| 分离部署 | 前半段给训练，后半段给 rollout |
-| colocate | 训练和 rollout 共用同一批 GPU，通过 offload/sleep 错峰 |
-| rollout_external | 训练侧只管 Megatron，SGLang 在外部 |
-| debug_train_only | 只跑训练链路，不创建 rollout GPU |
+### Megatron 并行：入座后建通信拓扑
 
-深读：[[Slime-PlacementGroup-核心概念]]、[[Slime-引擎拓扑-核心概念]]。
+| 并行 | 切什么 | 主要目的 |
+|------|--------|----------|
+| DP | 不同数据/rollout partitions | 扩大吞吐并同步梯度 |
+| TP | 一层内的矩阵/张量 | 单层跨卡 |
+| PP | 不同网络层 | 模型按 stage 切分 |
+| CP | 序列/context 维 | 长上下文训练 |
+| EP | MoE experts | 专家跨 rank 分布 |
+| VPP | 一个 PP stage 的多个 model chunks | 交错流水、减少空泡 |
 
----
+Ray 只决定 worker 被调度到哪里；Megatron 才调用 `initialize_model_parallel` 建立 TP/CP/EP/DP/PP 等 group。PG 不会自动做模型切分。
 
-## 3. Ray Actor：每张 GPU 一个训练工人
+## 问题四：为什么有这么多 rank
 
-### 读法
-在 Slime 训练侧，Ray Actor 不是“模型里的 actor 网络”那个概念，而是 **Ray 远程进程**。为了避免混淆：
+一个训练 worker 至少同时拥有：
 
-| 名称 | 所在层 | 含义 |
-|------|--------|------|
-| Ray Actor | Ray 运行时 | 一个远程 Python 对象 / 进程 |
-| Actor model | RL 算法 | 被训练的 policy 模型 |
-| MegatronTrainRayActor | Slime 类 | 一个 GPU 上的训练 worker |
+- Ray actor/world rank：创建进程时分配；
+- `LOCAL_RANK`：选择当前进程可见的本地 GPU；
+- torch distributed global rank；
+- Megatron 的 TP、PP、DP、CP、EP rank。
 
-每个 `MegatronTrainRayActor` 进程都要知道自己在分布式训练里的 rank、world size、master 地址和本地 GPU。Slime 在 Ray Actor 构造时写入这些环境变量。
-
-### 源码锚点
 ```python
-## 来源：slime/ray/train_actor.py L28-L48
+# 来源：slime/ray/train_actor.py L28-L48
 class TrainRayActor(RayActor):
     def __init__(self, world_size, rank, master_addr, master_port):
         configure_logger()
@@ -214,276 +158,100 @@ class TrainRayActor(RayActor):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
+        # TODO: currently this doesn't work as ray has already set torch.cuda.device_count().
+        # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
 ```
 
-### 要点
-- Ray 负责“进程在哪里起”；PyTorch Distributed / Megatron 负责“这些进程怎么通信”。
-- `MASTER_ADDR` / `MASTER_PORT` 是 PyTorch 分布式组的会合点。
-- `LOCAL_RANK` 决定该进程绑定本机哪张 GPU。
-- 深读：[[Slime-RayTrainGroup-核心概念]]、[[Slime-Megatron-Actor初始化-核心概念]]。
+示例：8 张 GPU、TP=2、PP=2、DP=2 时，可粗略理解为两个 DP 副本；每个副本有两个 PP stage，每个 stage 用两张 TP 卡。但 CP/EP、VPP、不同 group order 与模型特殊拓扑会让简单乘法不足以描述全部通信关系。
 
----
+## 问题五：Sample、rollout、batch、micro-batch 怎么区分
 
-## 4. Megatron 是什么：把一个大模型切到多张 GPU
+| 词 | 当前语义 |
+|----|----------|
+| outer rollout id | 主循环第几轮编排 |
+| `Sample.rollout_id` | 一次 rollout 执行的样本分组身份，compact siblings 共享 |
+| prompt group | 一个 prompt 复制出 `n_samples_per_prompt` 条生成种子 |
+| `Sample` | tokens、response、reward、mask、logprob、weight version 等语义护照 |
+| train data / `RolloutBatch` | Sample 转成的字段字典 |
+| DP partition | 某个 DP rank 应消费的样本集合 |
+| micro-batch | 一次 forward/backward 可承载的执行切片 |
+| training step global batch size | 当前 step 中 rollout 执行的全局数量；默认一 rollout 一 sample 时等于样本数 |
 
-### 读法
-Megatron-LM 是大模型训练框架。它最重要的能力是：**把一个单卡放不下、算不动的模型，切给很多 GPU 一起训练**。
+最后一行是当前实现最容易被旧文档讲错的地方：compact/subagent 路径可能让一次 rollout 执行产生多条训练 sample，因此 `global_batch_size` 的调度/归一化语义不能永远解释成“裸 sample 行数”。
 
-先记住这几种并行：
+一个 outer rollout 可以包含多个 training steps，每个 step 又包含多个 micro-batches。micro-batch 是执行粒度，不能改变 `Sample.rollout_id` 分组和 `rollout_mask_sums` 定义的 loss 分母。
 
-| 并行方式 | 简写 | 小白解释 | 常见影响 |
-|----------|------|----------|----------|
-| Data Parallel | DP | 多组 GPU 各训练一份 batch，最后同步梯度 | 提高吞吐 |
-| Tensor Parallel | TP | 把一层里的矩阵切到多卡 | 单层太大时必需 |
-| Pipeline Parallel | PP | 把不同层切到不同卡，像流水线 | 模型层数多时省显存 |
-| Context Parallel | CP | 把长序列维度切开 | 长上下文训练 |
-| Expert Parallel | EP | MoE 专家分到不同卡 | MoE 模型 |
-| Virtual Pipeline | VPP | 把 PP stage 再切小块交错执行 | 减少流水线空泡 |
+## 问题六：RL 训练至少要认清哪些信号
 
-Slime 自己不重写这些并行机制，而是在 Megatron 初始化时把参数交给 `mpu.initialize_model_parallel`。
+| 信号 | 直觉 | 产生位置 |
+|------|------|----------|
+| reward | 结果得分 | rule/RM/custom reward |
+| rollout logprob | 生成时 policy 对已采 token 的概率 | SGLang rollout |
+| current/train logprob | 训练模型重新看同一 token 的概率 | Megatron forward |
+| ref logprob | reference policy 的概率 | ref 参数快照 forward |
+| value | critic 对未来回报的估计 | critic forward |
+| advantage | 相对基线后应强化/抑制多少 | estimator + KL/value/reward/mask |
+| policy/value/SFT/custom loss | 真正参与反向传播的目标 | Megatron loss dispatch |
 
-### 源码锚点
-```python
-## 来源：slime/backends/megatron_utils/initialize.py L37-L45
-mpu.initialize_model_parallel(
-    args.tensor_model_parallel_size,
-    args.pipeline_model_parallel_size,
-    args.virtual_pipeline_model_parallel_size,
-    pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
-    context_parallel_size=args.context_parallel_size,
-    hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-    expert_model_parallel_size=args.expert_model_parallel_size,
-    num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
-)
-```
+“生成答案、打分、按分数调模型”只能作为第一层直觉。源码中 reward 不会直接等于每个 token 的梯度；advantage estimator、mask、KL、loss reducer 和并行归一化都会改变优化信号。
 
-### 要点
-- `mpu` 是 Megatron 的 parallel state 工具，后续代码通过它查询 TP/PP/DP/CP rank。
-- Ray rank 是“进程编号”；Megatron rank 是在这些进程上划出的并行拓扑。
-- 参数专题：[[Slime-Ray参数]]、[[Slime-训练与Rollout参数]]。
+## 问题七：为什么 optimizer step 后还要 `update_weights`
 
----
-
-## 5. DP / TP / PP 的入门例子
-
-### 读法
-假设有 8 张 GPU，设置：
+Megatron actor 与 SGLang engine 是不同运行主体：
 
 ```text
-tensor_model_parallel_size = 2
-pipeline_model_parallel_size = 2
-data_parallel_size = 2
+optimizer.step()
+  只改变训练侧参数
+      ↓
+转换命名/layout + 选择 tensor/NCCL/full-disk/delta-disk updater
+      ↓
+SGLang engine 完成 reload
+      ↓
+后续 rollout 才可能使用新 policy
 ```
 
-可以粗略理解成：
+colocate 只是 GPU bundle 重叠，通常仍是不同进程；tensor/CUDA IPC updater 也不是同一个 Python 参数对象。weight version 是发布序号，不是 checksum。critic-only 阶段甚至可能发布未变化的 actor 参数并推进版本，因此还要结合 optimizer 日志或数值 equality check 判断参数是否真的改变。
 
-```text
-8 GPUs = DP 2 组 × PP 2 段 × TP 2 卡
-```
+## offload 的准确直觉
 
-每个 DP 组里有一个完整模型副本；每个副本再被拆成 2 个 pipeline stage；每个 stage 内的矩阵再由 2 张 TP 卡共同计算。
+offload 不是“把所有东西统一搬到 CPU”一个动作：
 
-```mermaid
-flowchart TB
-  subgraph DP0["DP 组 0"]
-    A0["PP0<br/>TP0+TP1"] --> A1["PP1<br/>TP0+TP1"]
-  end
-  subgraph DP1["DP 组 1"]
-    B0["PP0<br/>TP0+TP1"] --> B1["PP1<br/>TP0+TP1"]
-  end
-  DP0 -.梯度同步.-> DP1
-```
+- training actor 的 sleep/wake 还会销毁/重建 process groups，并由 `torch_memory_saver` 管理显存状态；
+- rollout server group 只有与 Megatron GPU 范围重叠且 `needs_offload=True` 时才实际 release/resume；
+- rollout weights 与 KV/CUDA graph 分开恢复；
+- PPO critic 强制打开 train offload，连接时序比普通 actor-only 更复杂。
 
-### 源码锚点
-```python
-## 来源：slime/backends/megatron_utils/actor.py L87-L98
-vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
-if vpp_size > 1:
-    from megatron.core.utils import get_model_config
+因此 OOM 排障必须问“哪个主体、哪类 GPU memory、哪个时刻”，不能只看一个 `offload=True`。
 
-    microbatch_group_size_per_vp_stage = get_model_config(self.model[0]).microbatch_group_size_per_vp_stage
-else:
-    microbatch_group_size_per_vp_stage = 1
-self.train_parallel_config = {
-    "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
-    "cp_size": mpu.get_context_parallel_world_size(),
-    "vpp_size": vpp_size,
-```
+## 常见混淆
 
-### 要点
-- Slime 会把 `train_parallel_config` 推给 RolloutManager，帮助 rollout 数据按训练侧 DP/CP/VPP 对齐。
-- 新手先掌握 DP/TP/PP 即可；CP/EP/VPP 可以等读 [[Slime-上下文并行与路由重放]]、[[Slime-模型初始化]] 时再深入。
+| 错误理解 | 准确说法 |
+|----------|----------|
+| Ray Actor 就是 RL actor | Ray Actor 是进程抽象；RL actor 是 policy 模型 |
+| `.remote()` 后任务已完成 | 只提交；是否等待看 `ray.get`/依赖链 |
+| PG 会自动建立 TP/PP/DP | PG 只预订资源；Megatron 建并行 group |
+| rollout id 就是一条 batch id | outer id 与 Sample grouping id 是两层身份 |
+| global batch 永远等于 sample 行数 | compact rollout 下按 rollout 执行计数 |
+| optimizer step 自动影响 SGLang | 必须显式发布权重 |
+| colocate 表示同进程共享参数 | 表示 GPU 资源重叠与跨进程更新协议 |
+| async_train 表示 generation 与 train 重叠 | 只是 Ray 远程接口；重叠由 future 时间线决定 |
 
----
+## 学习路线与验收
 
-## 6. Microbatch / Global batch：为什么训练一步会被切碎
+1. [[Slime-项目总览]]：建立四类运行时责任。
+2. [[Slime-关键概念]]：区分身份、对象、概率、资源和版本。
+3. [[Slime-业务流程]]：用六道门理解同步/流水异步。
+4. [[Slime-RL训练全链路]]：沿一个同步 rollout 深入。
+5. [[Slime-PlacementGroup]]、[[Slime-训练数据]]、[[Slime-训练步骤]]、[[Slime-分布式权重同步]]：按问题下钻。
 
-### 读法
-大模型训练不能把一个巨大 batch 一次塞进 GPU，通常要切成很多 **microbatch**：
+读完本篇应能独立回答：
 
-| 术语 | 直觉 |
-|------|------|
-| microbatch | 一小份可以放进 GPU 的训练数据 |
-| global batch | 所有 DP 组加起来的一次训练总样本数 |
-| gradient accumulation | 多个 microbatch 累积梯度后再 optimizer step |
-| rollout_id | Slime 中一次 generate/train/update 闭环的编号 |
+- Ray rank、DP rank 与 `Sample.rollout_id` 为什么不能互换？
+- 8 GPU、TP=2、PP=2、DP=2 的粗略拓扑是什么，类比在哪些条件下失效？
+- 一个 outer rollout、training step、micro-batch 的包含关系是什么？
+- rollout/current/ref logprob 和 critic value 分别由谁产生？
+- 为什么版本号递增不能单独证明 actor 参数已训练改变？
 
-Megatron 的 PP 流水线尤其依赖 microbatch：不同 pipeline stage 像生产线上的不同工序，microbatch 越多，流水线越容易填满。
-
-### 源码锚点
-```python
-## 来源：slime/backends/megatron_utils/model.py L704-L731
-def train(
-    rollout_id: int,
-    model: Sequence[DDP],
-    optimizer: MegatronOptimizer,
-    opt_param_scheduler: OptimizerParamScheduler,
-    data_iterator: Sequence[DataIterator],
-    num_microbatches: Sequence[int],
-    global_batch_sizes: Sequence[int],
-) -> None:
-    """Run training over a rollout consisting of multiple steps.
-
-    The model is switched to train mode, training hooks are configured, and
-    ``train_one_step`` is invoked for each step in the rollout.
-```
-
-### 要点
-- Slime 的一个 `rollout_id` 里可能有多个 train step。
-- `num_microbatches` 和 `global_batch_sizes` 长度对齐：每个 step 对应自己的 microbatch 数和全局样本数。
-- 深读：[[Slime-训练步骤-核心概念]]、[[Slime-训练数据-核心概念]]。
-
----
-
-## 7. RL 后训练最小术语
-
-### 读法
-读 Slime 不需要一开始就推 PPO 公式，但要认清数据怎么流：
-
-| 术语 | 小白解释 | Slime 里的位置 |
-|------|----------|----------------|
-| prompt | 题目 / 用户输入 | DataSource 产出 |
-| rollout | 模型对 prompt 的一次或多次回答 | SGLang Rollout 生成 |
-| reward | 回答得分 | RM / rule / custom function |
-| logprob | 模型认为某个 token 有多可能 | SGLang 或 Megatron 计算 |
-| advantage | 这次回答比基线好多少 | loss.py 计算 |
-| policy loss | 让好回答更可能、坏回答更不可能 | Megatron 训练 |
-| critic | 估计 value 的辅助模型 | PPO 场景可选 |
-
-可以先把 RL 后训练理解成“生成答案、打分、按分数调模型”。Slime 的复杂度在于：生成在 SGLang 侧，训练在 Megatron 侧，中间要靠 Ray 编排和权重同步串起来。
-
-### 源码锚点
-```python
-## 来源：slime/backends/megatron_utils/actor.py L380-L394
-def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
-    if self.args.debug_rollout_only:
-        return None
-
-    if self.args.offload_train:
-        self.wake_up()
-
-    with timer("data_preprocess"):
-        rollout_data = self._get_rollout_data(rollout_data_ref)
-
-    if self.role == "critic":
-        result = self.train_critic(rollout_id, rollout_data)
-    else:
-        self.train_actor(rollout_id, rollout_data, external_data=external_data)
-```
-
-### 要点
-- `rollout_data_ref` 是 Ray ObjectRef，真正数据从远端取回后才进入 Megatron 训练。
-- `critic` 和 `actor` 共用 Ray/Megatron 基础设施，但训练目标不同。
-- 深读：[[Slime-Advantage计算-核心概念]]、[[Slime-Policy-Loss-核心概念]]。
-
----
-
-## 8. update_weights：为什么训练完还要推权重
-
-### 读法
-Slime 的 rollout 由 SGLang 执行，训练由 Megatron 执行。训练完以后，如果不把新权重推给 SGLang，下一轮 rollout 仍然用旧模型生成样本，RL 闭环就断了。
-
-所以每轮训练后都要：
-
-```text
-Megatron 新权重 -> 转成 SGLang 可加载/接收的格式 -> SGLang engine reload
-```
-
-这就是 `update_weights` 专题覆盖的内容。
-
-### 源码锚点
-```python
-## 来源：slime/backends/megatron_utils/actor.py L583-L590
-def update_weights(self) -> None:
-    if self.args.debug_train_only or self.args.debug_rollout_only:
-        return
-
-    if self.args.use_fault_tolerance:
-        if dist.get_rank() == 0:
-            ray.get(self.rollout_manager.recover_updatable_engines.remote())
-        dist.barrier(group=get_gloo_group())
-```
-
-### 要点
-- NCCL 路径见 [[Slime-分布式权重同步]]。
-- 磁盘路径见 [[Slime-磁盘权重同步]]。
-- Megatron checkpoint 转 HF 见 [[Slime-Megatron到HF转换]]。
-
----
-
-## 9. 常见混淆
-
-| 混淆点 | 正确理解 |
-|--------|----------|
-| Ray Actor = RL Actor | 不是。Ray Actor 是远程进程；RL Actor 是被训练的 policy 模型。 |
-| `.remote()` 之后训练已经完成 | 不一定。`.remote()` 返回 ObjectRef，`ray.get` 才等待结果。 |
-| PlacementGroup 会自动做模型并行 | 不会。PG 只预订资源；Megatron 初始化并行组。 |
-| DP/TP/PP 都是 Ray 的功能 | 不是。它们是 Megatron/PyTorch Distributed 的训练拓扑。 |
-| update_weights 是 optimizer step | 不是。optimizer step 改 Megatron 权重；update_weights 把权重同步到 SGLang。 |
-| rollout_id 是 batch id | 不准确。它是一轮 RL 闭环编号，一轮里可能包含多个 train step 和 microbatch。 |
-
----
-
-## 10. 读 Slime 的建议顺序
-
-### 读法
-如果你是零基础读者，建议按下面的顺序读，不要一开始就钻进 loss 公式：
-
-```text
-Slime 零基础先修（本篇）
-  ↓
-Slime 项目总览
-  ↓
-RL 训练全链路
-  ↓
-Slime 学习路径：启动、参数、Ray 与 Rollout
-  ↓
-PlacementGroup / RayTrainGroup
-  ↓
-Megatron Actor 初始化 / 训练步骤
-  ↓
-Advantage / Policy Loss / 分布式权重同步
-```
-
-| 学习任务 | 目标 | 文档 |
-|----------|------|------|
-| 基础先修 | 建立 Ray/Megatron 直觉 | 本篇 |
-| 1 | 看懂 Slime 三角架构 | [[Slime-项目总览]] |
-| 2 | 串起 RL 闭环 | [[Slime-RL训练全链路]] |
-| 3 | 看 Ray 如何排 GPU | [[Slime-PlacementGroup]]、[[Slime-RayTrainGroup]] |
-| 4 | 看 Megatron 如何训练 | [[Slime-Megatron-Actor初始化]]、[[Slime-训练步骤]] |
-| 5 | 看 loss 与权重同步 | [[Slime-Advantage计算]]、[[Slime-分布式权重同步]] |
-
-### 要点
-- 如果你还不熟悉 SGLang 推理侧，先读 [[SGLang-零基础先修]] 与 [[SGLang-HTTP请求全链路]]。
-- 如果只想跑通 Slime 主流程，本篇 + [[Slime-RL训练全链路]] + [[Slime-学习路径]] 足够建立全局地图。
-
----
-
-## 下一步
-
-→ 从零读 Slime：[[Slime-项目总览]]  
-→ 想看一轮训练怎么跑：[[Slime-RL训练全链路]]  
-→ 想先补 Ray：[[Slime-PlacementGroup]]、[[Slime-RayTrainGroup]]  
-→ 想先补 Megatron：[[Slime-Megatron-Actor初始化]]、[[Slime-训练步骤]]
+如果答案仍含糊，先回到对应表格和源码卡，再进入专题；不要用背诵缩写代替对象与所有权推理。

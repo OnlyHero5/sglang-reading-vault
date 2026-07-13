@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # SchedulePolicy · 源码走读
 
@@ -33,8 +33,8 @@ updated: 2026-07-10
 | 首次建立 prefill 调度主线 | 贯穿场景、步骤 1 到 2 | delayer 和 slot 门发生在排序前，请求可能还没进入 policy 就被延后 |
 | 排查共享前缀为什么没优先 | 步骤 3 到 4 | cache-aware policy 会写 prefix match 元数据，批内 prefix caching 可能临时后移相似请求 |
 | 排查本轮只放少量请求 | 步骤 5 到 7 | `PrefillAdder` 同时管 token、chunk、request 数、LoRA、HiCache、Mamba/SWA 等预算 |
-| 区分 `NO_TOKEN` 和 `OTHER` | 步骤 6 到 7 | `NO_TOKEN` 表示硬 token/KV 预算不足，`OTHER` 多半是软约束或本轮不再继续 |
-| 排查长 prompt 分块卡住 | 步骤 2、6、8 | `chunked_req` 会绕过部分 slot 门，并在 `new_chunked_req` / `inflight_middle_chunks` 中延续状态 |
+| 区分 `NO_TOKEN` 和 `OTHER` | 步骤 6 到 7 | 它们是两种“停止扫描”协议；必须回到具体返回点判断容量不足还是本轮边界 |
+| 排查长 prompt 分块卡住 | 步骤 2、6、8 | `chunked_req` 会绕过部分 slot 门，并经 `new_chunked_req → Scheduler.chunked_req` 专用槽位延续状态 |
 | 确认请求真正进 batch | 步骤 8、运行验证 | 只有从 `waiting_queue` 移入 `can_run_list` 后，才会构造 `ScheduleBatch.init_new` 并 `prepare_for_extend` |
 
 读的时候保持三层分开：policy 只决定等待队列顺序，`PrefillAdder` 决定本轮准入，`ScheduleBatch` 才是模型执行前的批对象。
@@ -199,7 +199,7 @@ sequenceDiagram
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 ```
 
-一个细节：`lpm` 队列超过 128 时，`policy` 会临时变成 `FCFS`，但 `self.policy` 仍是 `LPM`。因此这条路径不会走 `self.policy == CacheAgnosticPolicy.FCFS` 的 priority+FCFS 早返回，而是在 `else` 分支里 `pass`，保持当前队列顺序。
+一个细节：`lpm` 队列超过 128 时，active `policy` 会临时变成 `FCFS`，但 `self.policy` 仍是 `LPM`。因此这条路径不会走 `self.policy == CacheAgnosticPolicy.FCFS` 的 priority+FCFS 早返回，而是在 `else` 分支里 `pass`，保持当前队列顺序。被关闭的是 LPM 专属的 `_compute_prefix_matches` 临时树与最长命中排序；如果 tree cache 支持 fast match 且不是 PD decode，前面的通用 metadata 填充仍可能逐请求调用 `match_prefix_for_req`，所以不能笼统说“完全不做 prefix match”。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/schedule_policy.py L229-L251
@@ -395,7 +395,7 @@ class PrefillAdder:
 
 这里不要把 `PrefillAdder` 理解成全局调度器。它是一个临时账本：`can_run_list`、`preempt_list`、`new_chunked_req` 都只服务本轮。
 
-## 步骤 6：逐个请求准入，先过软门再过硬预算
+## 步骤 6：逐个请求准入，沿返回点定位第一道停止门
 
 Scheduler 遍历排序后的等待队列，先处理 LoRA、slot、HiCache staging，再调用 `req.init_next_round_input` 和 `adder.add_one_req`。
 
@@ -440,7 +440,7 @@ Scheduler 遍历排序后的等待队列，先处理 LoRA、slot、HiCache stagi
             )
 ```
 
-`add_one_req` 开头先问 prefill delayer、本轮最大请求数、上下文并行限制这些软门。如果 delayer 不放行，返回 `OTHER`，本轮不会被标记为硬 token 空间耗尽。
+`add_one_req` 开头先问 prefill delayer、本轮最大请求数、上下文并行限制。如果任一条件不满足就返回 `OTHER`；这只说明 Scheduler 不应把它当作容量耗尽来设置 `batch_is_full`，不代表原因一定“很软”或下一轮必然成功。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/schedule_policy.py L968-L1006
@@ -485,7 +485,7 @@ Scheduler 遍历排序后的等待队列，先处理 LoRA、slot、HiCache stagi
         total_tokens += self._mamba_gap_budget_for_req(req)
 ```
 
-接着才是硬预算和 host load back。注意它在 lock 前后都检查预算，因为持锁和 load back 期间 allocator 事实可能变化。
+接着检查总 KV 与 SWA 容量，并在临时锁住 prefix 节点后复查。`rem_total_tokens` 等属性由 allocator 可用量、cache 可驱逐量减 offset 动态计算，不是构造 `PrefillAdder` 时冻结的常数；host load back 还会增长 `prefix_indices`，所以输入长度也必须重算。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/schedule_policy.py L1008-L1059
@@ -648,13 +648,15 @@ Scheduler 不会无限遍历等待队列。只要 `add_one_req` 不再返回 `CO
                 break
 ```
 
-所以排障时不要只看“停了”。要分辨：
+所以排障时不要只看“停了”，也不要把枚举机械翻译成“硬/软”。应记录命中的具体 return site：
 
 | 返回值 | 含义 | 下一步看 |
 |--------|------|----------|
-| `NO_TOKEN` | 硬预算不足 | KV pool、SWA pool、Mamba slot、`max_new_tokens` 估算 |
-| `OTHER` | 本轮软限制 | `max_prefill_tokens`、chunk size、delayer、`prefill_max_requests`、上下文并行限制 |
+| `NO_TOKEN` | 容量口径不能安全继续 | 总/即时 KV、SWA、Mamba slot、ignore-eos 生存期估算 |
+| `OTHER` | 本轮边界不允许继续扫描 | 输入/chunk/DLLM 配额、对齐后零长度、delayer、`prefill_max_requests`、上下文并行限制 |
 | 空 `can_run_list` | 没有请求真正准入 | delayer、grammar、LoRA、HiCache prefetch、slot 门 |
+
+还有一个容易漏掉的分支：`add_chunked_req` 不是 `AddReqResult` 协议。它直接返回“仍未完成的 `req`”或 `None`；hybrid SWA 暂时没有安全空间时，也会返回原请求但不把它加入本轮 `can_run_list`。因此排查长 prompt 必须同时看返回对象与本轮列表，不能套用 `NO_TOKEN`/`OTHER` 表格。
 
 ## 步骤 8：can_run_list 才进入 ScheduleBatch
 
@@ -717,8 +719,8 @@ Scheduler 不会无限遍历等待队列。只要 `add_one_req` 不再返回 `CO
 
 | 验证 | 做法 | 预期现象 |
 |------|------|----------|
-| LPM 是否生效 | 固定长 system prompt，对比 `--schedule-policy lpm` 与 `--schedule-policy fcfs` | 共享前缀场景下 LPM 的 prefix hit 和 TTFT 更好 |
-| prefix cache 收益是否真实 | 设置 `SGLANG_RADIX_FORCE_MISS=1` 后复测同一 workload | prefix hit 下降，prefill token 增加，TTFT 变差 |
+| LPM 是否改变顺序 | 固定模型、并发、输入与输出长度，对比 `--schedule-policy lpm` 与 `--schedule-policy fcfs` | 先确认 waiting 顺序与 prefix-hit 口径变化；TTFT 是否改善取决于 workload，不预设必胜 |
+| prefix cache 收益是否真实 | 设置 `SGLANG_RADIX_FORCE_MISS=1` 后复测同一 workload | 应先看到命中归零或下降；prefill 成本与 TTFT 的变化再结合硬件和并发解释 |
 | delayer 是否过强 | 开启 prefill delayer debug 日志或 metrics，观察 `output_reason` | 如果大量 `delay` 且 `actual_execution=false`，说明 prefill 被持续推迟 |
 
 如果只能加断点，优先放在这四处：

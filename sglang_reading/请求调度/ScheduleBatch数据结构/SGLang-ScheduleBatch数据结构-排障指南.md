@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ScheduleBatch数据结构 · 排障指南
 
@@ -208,7 +208,7 @@ def _maybe_wrap_pickle(obj: Any) -> Any:
 
 **症状：** 在 TokenizerManager 侧拿到 token ids 但没有字符串；或者在 Detokenizer 侧误以为已经是最终 API JSON。
 
-**判断：** `BatchTokenIDOutput` 是 Scheduler token 级输出，给 Detokenizer 用；`BatchStrOutput` 是 Detokenizer 返回 TokenizerManager 的字符串级输出。
+**判断：** 普通生成中，`BatchTokenIDOutput` 是 Scheduler 给 Detokenizer 的 token 级输出，`BatchStrOutput` 是 Detokenizer 返回 TokenizerManager 的字符串级输出；但 `skip_tokenizer_init` 会把前者直接发给 TokenizerManager，embedding 则返回 `BatchEmbeddingOutput`，不需要字符串解码。
 
 ```python
 # 来源：python/sglang/srt/managers/detokenizer_manager.py L406-L420
@@ -229,7 +229,7 @@ def _maybe_wrap_pickle(obj: Any) -> Any:
             output_ids=recv_obj.output_ids,
 ```
 
-**验证：** 正常有 tokenizer 初始化的路径应经过 Detokenizer；`--skip-tokenizer-init` 相关路径才会让 token 级输出绕过字符串 detokenize。
+**验证：** 正常有 tokenizer 初始化的生成路径应经过 Detokenizer；`--skip-tokenizer-init` 相关路径才会让 token 级输出绕过字符串 detokenize。不要用“始终出现 `BatchStrOutput`”作为 embedding 或 skip-tokenizer 的健康检查。
 
 ---
 
@@ -277,6 +277,42 @@ def _maybe_wrap_pickle(obj: Any) -> Any:
 
 ---
 
+## Q11：为什么 `decode_ids` 比本轮新生成 token 多？
+
+**症状：** 首个流式包里的 `decode_ids` 含有 prompt 尾部 token，或者 `len(decode_ids)` 大于 `len(output_ids)`，被误判为重复生成、串请求。
+
+**判断：** 两个字段服务不同消费者。`decode_ids` 是增量 detokenize 的窗口片段，首包需要 surrounding prompt context 来正确处理 tokenizer 合并和 UTF-8 边界；`output_ids` 才是按 `send_token_offset` 切出的客户端 output-token 增量。两者长度不相等本身不是错误。
+
+**操作：** 同时记录 `rid`、`read_offset`、`send_decode_id_offset`、`send_token_offset`、`decode_ids`、`output_ids`，不要只比较两个 list 的长度。
+
+**预期：** `decode_ids` 能在 Detokenizer 的 per-rid `DecodeStatus` 中连续拼接；`output_ids` 不重复客户端已收到的 token；最终 `output_strs` 不重发已提交文本。
+
+---
+
+## Q12：为什么 hidden-state capture 只生效一轮，或意外多生效一轮？
+
+**症状：** `capture_hidden_mode`、`seq_lens_cpu_cache` 或 `return_hidden_states_before_norm` 在第一轮有效、下一轮消失；或者自定义 fork 中旧值泄漏到后续 decode。
+
+**判断：** 这些字段是 `ScheduleBatch` 上的 one-shot per-forward override。`ForwardBatch.init_new` 会读取它们并立即把原 batch 复位。每轮都需要的行为必须由调用方每轮重设；如果自定义路径绕过 `init_new` 或复制了错误对象，就可能产生泄漏或缺失。
+
+**操作：** 在 `ForwardBatch.init_new` 调用前后打印原 batch 三个字段，并确认每个 forward 只构造一次执行视图。overlap 结果处理使用的 `batch.copy()` 也不要当成下一轮调度 batch。
+
+**预期：** 本轮 `ForwardBatch` 保存消费到的值；原 `ScheduleBatch` 恢复默认值；下一轮只有显式重设时才继续生效。
+
+---
+
+## Q13：为什么 overlap 下上一轮结果对错了请求？
+
+**症状：** 开启 overlap 后，finish reason、logprob 或 token 似乎落到下一轮 filter/merge 后的请求索引上；关闭 overlap 后消失。
+
+**判断：** live `running_batch` 会继续为下一轮演化，而延迟结果必须对应提交 forward 时的请求顺序。Scheduler 因此把 `batch.copy()` 放入 `result_queue`；该 copy 只保留结果处理字段并浅拷贝 `reqs` 列表外壳。若自定义代码把 live batch 直接入队，或在快照里遗漏 per-request lens，就会发生跨轮错位。
+
+**操作：** 对比入队时 snapshot 的 `rids`、`prefix_lens`、`extend_lens` 与 live batch 在 filter/merge 后的值；检查结果处理是否只读取 snapshot 承诺保存的字段。
+
+**预期：** 上一轮 result 始终按提交时的 rid 顺序处理，live running batch 可独立进入下一轮；两者共享的 `Req` 生命周期状态仍需遵守源码约定，不能把浅拷贝误当深拷贝隔离。
+
+---
+
 ## 排障速查表
 
 | 症状 | 先查对象 | 源码入口 |
@@ -288,5 +324,8 @@ def _maybe_wrap_pickle(obj: Any) -> Any:
 | decode 写错 KV 位置 | `out_cache_loc` | `prepare_for_decode` / `alloc_for_decode` |
 | batch 串请求 | `reqs` 与 per-request 张量 | `filter_batch` / `merge_batch` |
 | token 有但字符串没有 | `BatchTokenIDOutput` 到 `BatchStrOutput` | `DetokenizerManager.handle_batch_token_id_out` |
+| `decode_ids` 比新 token 多 | detokenize 窗口与 output-token delta | `SchedulerOutputStreamer.accept` |
+| override 跨轮失效或泄漏 | one-shot 字段 | `ForwardBatch.init_new` |
+| overlap 结果错位 | live batch 与结果快照 | `Scheduler.event_loop_overlap` / `ScheduleBatch.copy` |
 
 结论：绝大多数问题不是“某个字段不知道含义”，而是边界对象用错，或者 per-request 对齐关系被破坏。

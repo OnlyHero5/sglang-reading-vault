@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # OpenAI-API
 
@@ -116,6 +116,6 @@ async def openai_v1_chat_completions(
 | `OpenAIServingBase.handle_request` | OpenAI endpoint 的模板方法 |
 | `OpenAIServingChat._convert_to_internal_request` | 把 `messages/tools/reasoning` 压成 `GenerateReqInput` |
 | `TokenizerManager.generate_request` | 真正进入 tokenization、scheduler、响应等待的边界 |
-| `stream_offsets` | 把内部累积 text 切成外部 delta 的状态 |
+| `stream_offsets` + `incremental_streaming_output` | 区分内部累积快照与分段 chunk，并决定外部 delta 是否还需要切片 |
 
 如果你在排查业务接入问题，优先读 Chat stream；如果你在排查采样参数、结构化输出或 logprobs，先读 Completion；如果你在排查客户端兼容性，单独对照 Ollama。

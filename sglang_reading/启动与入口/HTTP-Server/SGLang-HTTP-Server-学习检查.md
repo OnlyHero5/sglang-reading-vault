@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # HTTP-Server · 学习检查
 
@@ -22,7 +22,8 @@ updated: 2026-07-10
 - [ ] 能区分 `_GlobalState`、`app.state`、`ServerStatus` 三类状态分别解决什么问题。
 - [ ] 能解释 single tokenizer 与 multi tokenizer worker 在对象传递上的差异。
 - [ ] 能说出 `/health` 与 `/health_generate` 的区别，以及什么时候该用哪个。
-- [ ] 能解释 warmup 失败为什么会结束进程，而不是让服务继续监听。
+- [ ] 能解释轻量 `/health` 为什么可能在 `UnHealthy` 时仍返回 200，以及深度 health 为什么不是 request-specific 完成证明。
+- [ ] 能区分 custom warmup、general warmup、PD 非 200、checkpoint wait timeout 和 skip warmup 的不同失败强度。
 - [ ] 能指出 OpenAI route 与 native route 的汇合点和分叉点。
 - [ ] 能根据一个症状找到对应源码入口，而不是全文搜索路由名后停住。
 
@@ -34,6 +35,8 @@ updated: 2026-07-10
 4. multi-tokenizer worker 为什么要 shared memory？为什么每个 worker 都要自己的 tokenizer IPC name？
 5. `/v1/chat/completions` route 为什么不能直接说明 OpenAI 协议转换逻辑？
 6. 如果 `/health` 是 200，但 `/health_generate` 是 503，你会怎么缩小问题范围？
+7. 为什么日志出现 `ready to roll` 仍不能排除 PD warmup 已把状态设成 `UnHealthy`？
+8. multi-tokenizer 模式为什么可能出现多组 warmup 日志？
 
 ## 可执行检查
 
@@ -72,17 +75,21 @@ rg -n "generate_request\\(|openai_serving_chat.handle_request|openai_serving_com
 运行中检查 health：
 
 ```powershell
-curl -s -o NUL -w "%{http_code}" http://127.0.0.1:30000/health
+curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:30000/health
 ```
 
-预期：服务非 Starting 且未 graceful exit 时，轻量 health 返回 `200`。如果要确认后端链路，再访问 `/health_generate`。
+预期：服务非 Starting 且未 graceful exit 时，轻量 health 返回 `200`，包括状态已是 `UnHealthy` 的情况。如果要确认探测开始后后端仍有回包，再访问 `/health_generate`；它仍不是该探测请求完整成功的证明。
+
+## 环境边界
+
+真实 HTTP/health 验收需要 Linux/WSL、可导入的 SGLang runtime、模型与对应设备。当前 Windows 环境在包初始化阶段缺少标准库 `resource`，因此只能执行 `rg` 静态检查；不能把 import 失败误判为 FastAPI route 缺失。
 
 ## 改代码前的不变量
 
 - HTTP route 不应绕过 `TokenizerManager` 直接访问 Scheduler。
 - multi-tokenizer worker 不能假设主进程 Python 对象可共享。
 - OpenAI-compatible route 的协议转换应放在 serving handler，不应塞回 route 函数。
-- readiness 不应只看端口监听；warmup、`ServerStatus`、health generate 都是独立信号。
+- readiness 不应只看端口监听或 ready 日志；warmup 分支、`ServerStatus`、轻量/深度 health 都是强度不同的信号。
 - stream 请求断开时要能触发 abort，避免后端继续占用请求状态和 KV 资源。
 
 ## 下一步阅读

@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Detokenizer · 排障指南
 
@@ -99,6 +99,8 @@ updated: 2026-07-10
 | 出现 replacement char 就该立刻发出 | Detokenizer 只发安全可打印前缀 |
 | `output_strs[i]` 是完整文本 | streaming 时它是本轮增量 |
 
+还要区分下一层：`output_strs` 在 Detokenizer 内始终是 delta，但 TokenizerManager 可以按 `incremental_streaming_output` 对客户端暴露 delta 或累积语义。客户端“重复全文”未必是 Detokenizer 重复 decode，也可能只是非 incremental streaming 的预期接口。
+
 ## Q3：`Decode status not found` 怎么处理？
 
 这通常说明 `decode_status` 状态表容量不足，旧 rid 被驱逐后又来了后续 chunk。
@@ -125,7 +127,7 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 
 ## Q4：`disable_tokenizer_batch_decode` 应该什么时候打开？
 
-默认批量 decode 是为了吞吐。但某些 tokenizer 或模型配置下，`batch_decode` 和逐行 `decode` 结果可能不一致。源码注释提到 gpt-oss 这类 edge case。
+默认批量 decode 是为了吞吐。但某些 tokenizer 或模型配置下，`batch_decode` 和逐行 `decode` 结果可能不一致。源码注释提到 gpt-oss 这类 edge case。fast tokenizer 的正常批路径还会按 `(skip_special_tokens, spaces_between_special_tokens)` 分组；因此只要 batch 内配置不同，并不意味着配置会串用。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/detokenizer_manager.py L311-L332
@@ -191,7 +193,7 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 
 ## Q7：多 detokenizer worker 会不会破坏 DecodeStatus？
 
-设计目标就是不破坏。Router 会按 `http_worker_ipc` 稳定选择 worker，且 batch 会被拆成单请求输出。
+设计目标就是不破坏。Router 会按 `http_worker_ipc` 稳定选择 worker，且 batch 会被拆成 one-item batch 输出。
 
 风险来自两类破坏：
 
@@ -200,7 +202,7 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 | `http_worker_ipcs` 缺失或长度不等于 `rids` | router assert |
 | 同一请求被路由到不同 worker | 后续 worker 找不到 `DecodeStatus` |
 
-正常路径中，`MultiDetokenizerRouter` 的 `_pick` 是确定性的，能保持同一 key 回同一 worker。
+正常路径中，`MultiDetokenizerRouter` 的 `_pick` 是确定性的，能保持同一 key 回同一 worker。但 key 是 HTTP worker IPC，不是 rid：同一 HTTP worker 的所有请求共享 Detokenizer 亲和。如果只有某个 Detokenizer CPU 饱和而其他 worker 空闲，要检查上游 HTTP worker 流量倾斜，不能只看 detokenizer worker 数量。
 
 ## Q8：stop string 和 stop token 在哪里裁剪？
 
@@ -254,6 +256,7 @@ Detokenizer 同时处理两种 stop：
 | skip 回程 | `--skip-tokenizer-init` 并直传 ids | 响应主要返回 `output_ids`，不是文本 |
 | UTF-8 边界 | 发送包含中文和 emoji 的 streaming prompt | 不应永久输出 replacement char 或重复可打印前缀 |
 | 多 worker | 开启多个 tokenizer/detokenizer worker | 输出按 `http_worker_ipcs` 回到对应 HTTP worker |
+| 多 worker 倾斜 | 按 `http_worker_ipc` 汇总请求数和 Detokenizer CPU | 同 key 固定落点；负载均衡质量取决于 HTTP worker 流量分布 |
 | 状态容量 | 人为调小 `SGLANG_DETOKENIZER_MAX_STATES` 压测 | 可复现状态缺失错误，调大后缓解 |
 
 ## 运行验证

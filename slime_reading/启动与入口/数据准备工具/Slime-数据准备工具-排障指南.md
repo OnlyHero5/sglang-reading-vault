@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据准备工具 · 排障指南
 
@@ -23,8 +23,10 @@ updated: 2026-07-10
 | 转换时参数 shape 不匹配 | `MODEL_ARGS` 是否与 HF config 对齐 | `docs/en/get_started/quick_start.md` L118-L131 | 重新 source 正确 model script，核对 RoPE/vocab/head/layer |
 | 多卡转换失败 | world size 与 layer 数、PP size 是否合法 | `tools/convert_hf_to_torch_dist.py` L44-L84 | 减少卡数或显式设置 PP |
 | ROCm 转换断言失败 | 是否传 `--use-cpu-initialization` | `tools/convert_hf_to_torch_dist.py` L87-L120 | HIP 环境加 `--use-cpu-initialization` |
-| 导出 HF 后 embedding 行数不对 | 是否传 `--vocab-size` | `padding_remover.py` L6-L12 | 用 HF config 或 `MODEL_ARGS` 的真实 vocab size |
-| HF 导出目录已存在 | 是否需要覆盖 | `tools/convert_torch_dist_to_hf.py` L209-L210 | 加 `-f` 或换输出目录 |
+| 导出 HF 后 embedding 行数不对 | CLI vocab 与 `common.pt` 中 `args.vocab_size` 是否一致 | `save_tensors` L106-L117；`convert_to_hf` L25-L30 | 同时核对两级裁剪与 HF config |
+| HF 导出目录已存在 | 是否误以为 `--force` 会清空目录 | `tools/convert_torch_dist_to_hf.py` L209-L210 | 首选新目录；复用前人工确认并清理旧产物 |
+| 反向导出找不到 `common.pt` | `--input-dir` 是否误指 checkpoint 根目录 | `tools/convert_torch_dist_to_hf.py` L221-L230 | 指到具体 `release/iter_xxx` 目录 |
+| 开启 missing 补权重后 index 的 `total_size` 异常 | 是否把 metadata 数字当作完整性唯一依据 | `tools/convert_torch_dist_to_hf.py` L128-L145 | 对照 `weight_map`、shard、tensor key/shape；当前累计位置可能重复计数 |
 | 导出脚本不知道模型类型 | 是否传 `--model-name` 或 `--origin-hf-dir` | `tools/convert_torch_dist_to_hf.py` L212-L219 | 传原始 HF 目录或显式 model name |
 | FP8 rollout 后训练权重不对 | 是否误把 FP8 HF 当 `--ref-load` | `docs/en/get_started/quick_start.md` L392-L405 | `--hf-checkpoint` 可换 FP8，`--ref-load` 仍用 bf16 torch_dist |
 
@@ -61,13 +63,13 @@ Note:
 
 因为 Megatron 不能只靠 checkpoint 目录恢复模型结构。它需要 CLI 超参来构图，再把 HF 权重灌进去。
 
-```text
-来源：docs/en/get_started/quick_start.md L118-L131
-quick_start 要求通过 `source` 加载 `scripts/models/*.sh` 中的模型配置。
-这些配置是 Megatron 构图所需的超参。
-Megatron 不能直接从 checkpoint 读取全部模型配置。
-文档要求检查 `--rotary-base` 等值是否与当前 HF 模型版本完全匹配。
+```bash
+# 来源：docs/en/get_started/quick_start.md L121-L122
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/models/glm4-9B.sh"
 ```
+
+紧随该代码的官方说明指出：这些是 Megatron 所需超参，并提醒逐项核对 `--rotary-base` 等版本敏感配置。
 
 Qwen3-4B 的关键结构参数包括层数、hidden、attention heads、GQA groups、RoPE base、vocab size：
 
@@ -99,7 +101,7 @@ MODEL_ARGS=(
 因为转换脚本要让每个 pipeline stage 分到合法层数。用户没有显式设置 PP 时，脚本从 world size 开始找可行值。
 
 ```python
-# 来源：tools/convert_hf_to_torch_dist.py L44-L84
+# 来源：tools/convert_hf_to_torch_dist.py L44-L68
 def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
@@ -138,7 +140,7 @@ def get_args():
 HIP 环境下脚本先 patch checkpoint writer，然后断言 CPU 初始化。
 
 ```python
-# 来源：tools/convert_hf_to_torch_dist.py L87-L120
+# 来源：tools/convert_hf_to_torch_dist.py L87-L108
 def main():
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
@@ -164,17 +166,17 @@ def main():
 ```
 
 ```python
-# 来源：tools/convert_hf_to_torch_dist.py L117-L120
+# 来源：tools/convert_hf_to_torch_dist.py L117-L119
 # if using AMD gpus, we have to do the conversion in cpu
 if hasattr(torch.version, "hip") and torch.version.hip is not None:
     assert args.use_cpu_initialization, "AMD GPU requires --use_cpu_initialization=True"
 ```
 
-排障动作：HIP 环境下转换命令显式加 `--use-cpu-initialization`，并确认日志出现 ROCm patch 信息。
+排障动作：HIP 环境下转换命令显式加 `--use-cpu-initialization`，并确认日志出现 ROCm patch 信息。源码中的 process group backend 仍是 `nccl`；writer patch 与通信后端是两件事，不要把该日志解释成整条分布式栈已经切换后端。
 
 ## Q5：导出 HF 后 embedding 或 output layer 多了 padding 行怎么办？
 
-传 `--vocab-size`。去 padding 只作用在两个张量：embedding 和 output layer。
+先核对三处 vocab：HF config、CLI `--vocab-size`、checkpoint `common.pt` 中的 `args.vocab_size`。去 padding 只作用在 embedding 和 output layer，但基础脚本可能先按 CLI 值裁、再在 `convert_to_hf()` 中按 checkpoint 值裁；第二次切片不会把第一次裁掉的行恢复。
 
 ```python
 # 来源：slime/backends/megatron_utils/megatron_to_hf/processors/padding_remover.py L6-L12
@@ -197,11 +199,11 @@ python tools/convert_torch_dist_to_hf.py \
   --vocab-size 151936
 ```
 
-不要把 `padded_vocab_size` 当成 HF vocab size。这里要填 HF config 或 `MODEL_ARGS --vocab-size` 的真实词表大小。
+不要把 `padded_vocab_size` 当成 HF vocab size。这里要填真实词表大小，并检查 checkpoint 保存的 `args.vocab_size` 是否一致；若它已被错误地保存为更小值，单靠 CLI 不能扩回张量。
 
 ## Q6：导出目录已存在为什么报错？
 
-为了避免覆盖已有 HF 输出，脚本默认拒绝写入已存在目录。
+脚本默认拒绝写入已存在目录，但其 `--force` 名字比真实行为更强：它只跳过下面的存在性检查。
 
 ```python
 # 来源：tools/convert_torch_dist_to_hf.py L209-L210
@@ -211,8 +213,10 @@ if os.path.exists(args.output_dir) and not args.force:
 
 修复方法：
 
-- 想保留旧结果：换 `--output-dir`。
-- 确认要覆盖：加 `-f` 或 `--force`。
+- 最稳妥：换一个全新的 `--output-dir`。
+- 必须复用：先自行确认并清理旧权重分片和过期 assets，再加 `-f`；脚本本身不会删除它们。
+
+这也是为什么“命令成功”仍不等于目录干净：新 index 可能只引用新分片，但旧文件仍滞留在目录里。
 
 ## Q7：没有 `--origin-hf-dir` 行不行？
 
@@ -230,17 +234,19 @@ if args.model_name is None:
     args.model_name = type(hf_config).__name__.lower()
 ```
 
-实用建议：多数发布场景都传 `--origin-hf-dir`，因为它还能复制 tokenizer、config、generation config 等非权重 assets。
+实用建议：多数发布场景都传 `--origin-hf-dir`，因为它还能复制 tokenizer、config、generation config 等顶层非权重 assets。子目录不会递归复制。
 
 ## Q8：FP8 HF rollout 要不要重新转 torch_dist？
 
 通常不要。quick start 写得很明确：FP8 HF 只替换 `--hf-checkpoint`，Megatron `--ref-load` 仍然使用 bf16 HF 转出的 torch_dist。
 
-```text
-来源：docs/en/get_started/quick_start.md L392-L405
-Slime 支持 bf16 training 与 fp8 inference 组合。
-FP8 rollout 只需要把 `--hf-checkpoint` 换成 FP8 HF 目录。
-Megatron `--ref-load` 仍然使用从 bf16 HF 转出的 torch_dist。
+```bash
+# 来源：docs/en/get_started/quick_start.md L401-L405
+   # Used to load tokenizer and other information, actually won't use model weight parameters from hf path
+   --hf-checkpoint /root/Qwen3-4B-FP8
+
+   # The megatron checkpoint still needs to be the dist weights converted from bf16 huggingface at the beginning, not modified because of FP8 rollout.
+   --ref-load /root/Qwen3-4B_torch_dist
 ```
 
 判断标准：`--hf-checkpoint` 可以服务 rollout 初始化；`--ref-load` 必须服务 Megatron 训练。
@@ -250,14 +256,14 @@ Megatron `--ref-load` 仍然使用从 bf16 HF 转出的 torch_dist。
 | 方式 | 入口 | 适合场景 | 关键依赖 |
 |------|------|----------|----------|
 | 离线基础导出 | `tools/convert_torch_dist_to_hf.py` | 单机读取一个 Megatron checkpoint，生成 HF 目录 | `common.pt`、dist metadata、可用 converter |
-| bridge 导出 | `tools/convert_torch_dist_to_hf_bridge.py` | 想复用 mbridge/provider 逻辑 | custom provider、origin HF |
-| parallel 导出 | `tools/convert_torch_dist_to_hf_parallel.py` | 大 checkpoint 导出需要并行处理和合并 index | 多进程/分片规划 |
-| 训练中导出 | `--save-hf` | actor 保存模型时同步产出 HF | `Actor.save_model`、`hf_checkpoint_saver` |
+| bridge 导出 | `tools/convert_torch_dist_to_hf_bridge.py` | 让 Megatron Bridge 从 origin HF provider 恢复正确模型类并 export | `--origin-hf-dir` 必填；`--force` 同样不清目录 |
+| parallel 导出 | `tools/convert_torch_dist_to_hf_parallel.py` | 用多进程分 key、线程并发加载/转换/保存 | 转换异常会被打印后返回空结果，必须额外核对 key 数与 index 完整性 |
+| 训练中导出 | `--save-hf` | actor 保存模型后同步产出 HF | raw/bridge 两分支；实现与离线脚本不同 |
 
 训练中导出入口：
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L571-L578
+# 来源：slime/backends/megatron_utils/actor.py L571-L577
 save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
 
 if force_sync and self.args.async_save:
@@ -267,7 +273,7 @@ if self.args.save_hf is not None and self.role == "actor":
     save_hf_model_to_path(self.args, Path(self.args.save_hf.format(rollout_id=rollout_id)), self.model)
 ```
 
-选择原则：已有 checkpoint 就离线导出；希望训练保存时就带 HF 输出，用 `--save-hf`；新架构或 provider 特殊时看 bridge 路径。
+选择原则：基础离线脚本适合可由内置 naming converter 覆盖的具体 checkpoint 目录；Bridge 路径适合依赖 provider/model class 的架构；parallel 路径只在你愿意承担更强完整性校验时使用；训练中 `--save-hf` 是保存时直接从活模型导出，并非调用基础离线脚本。
 
 ## Q10：这个专题和 [[Slime-Megatron到HF转换]] 怎么分工？
 

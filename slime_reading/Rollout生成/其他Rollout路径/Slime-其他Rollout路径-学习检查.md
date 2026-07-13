@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 其他Rollout路径 · 学习检查
 
@@ -29,9 +29,11 @@ updated: 2026-07-10
 - [ ] 为什么整段 rollout 替换必须满足 `generate_rollout(args, rollout_id, data_source, evaluation=False)`。
 - [ ] 为什么 fully-async 不支持 evaluation。
 - [ ] 为什么 fully-async 的 ABORTED group 回灌 DataSource，而不是进入 output queue。
+- [ ] 能解释为什么一次 drain 超过 target 会丢弃多余完成 group，以及 task/回灌异常为何不具备 exactly-once。
 - [ ] 为什么 streaming 的 chunk 处理要先恢复 base Sample 再 append。
 - [ ] 为什么 SFT rollout 可以 `reward=0`，但不能错写 `loss_mask`。
 - [ ] 为什么 OPD 标量 reward 为 0 仍可能有学习信号。
+- [ ] 能解释 SFT 与 OPD 中 `[-0:]` 为什么返回全量，并给出零 response 的 fail-fast 策略。
 - [ ] 为什么 forge load 不是 `load_debug_rollout_data` 的同义词。
 
 ## 读者能排障
@@ -42,6 +44,7 @@ updated: 2026-07-10
 - [ ] SFT loss 全零时，能用最小 messages 解码 masked token 验证 assistant/user 边界。
 - [ ] OPD reward 均值全零时，能检查 `teacher_log_probs` 而不是只看 reward。
 - [ ] forge load 触发分组断言时，能检查 `sample.rollout_id` 与 `sample.index`。
+- [ ] streaming 排障时能同时核对 cumulative/incremental 模式以及 text/token/logprob 四者对齐。
 
 ## 读者能做最小验证
 

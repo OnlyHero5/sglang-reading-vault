@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Slime RL 训练全链路
 
@@ -217,7 +217,7 @@ flowchart LR
 **源码证据：**
 
 ```python
-# 来源：slime/ray/placement_group.py L120-L137
+# 来源：slime/ray/placement_group.py L120-L135
 def create_placement_groups(args):
     """Create placement groups for actor, critic, and rollout engines."""
 
@@ -358,7 +358,7 @@ def create_placement_groups(args):
 获取 rollout 数据的入口：
 
 ```python
-# 来源：slime/ray/rollout.py L635-L653
+# 定位骨架（非逐行摘录）：来源 slime/ray/rollout.py L635-L653
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data = torch.load(
@@ -380,7 +380,7 @@ def create_placement_groups(args):
 真实 rollout 路径还会在 flatten 前校验 compact/subagent 输出的 `rollout_id`：
 
 ```python
-# 来源：slime/ray/rollout.py L654-L665
+# 来源：slime/ray/rollout.py L654-L663
             # Enforce the rollout_id contract before flattening: any list[Sample]
             # encountered in the nested output must have rollout_id set on every
             # element. Default rollouts inherit it from the data source; compact /
@@ -396,7 +396,7 @@ def create_placement_groups(args):
 默认 SGLang rollout 函数：
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L618-L640
+# 来源：slime/rollout/sglang_rollout.py L618-L637
 def generate_rollout(
     args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
@@ -439,7 +439,7 @@ def generate_rollout(
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L97-L121
+# 来源：slime/utils/types.py L97-L120
     group_index: int | None = None
     index: int | None = None
     # Id of the rollout this sample came from. Defaults to ``None`` and the
@@ -547,7 +547,7 @@ def generate_rollout(
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L725-L745
+# 定位骨架（非逐行摘录）：来源 slime/ray/rollout.py L725-L745
         rollout_ids = [sample.rollout_id for sample in samples]
         existed_rollout_id_values = set(rid for rid in rollout_ids if rid is not None)
         tmp_id = 0
@@ -635,7 +635,7 @@ compact rollout 的契约检查：
 **源码证据：**
 
 ```python
-# 来源：slime/utils/dp_schedule.py L82-L105
+# 定位骨架（非逐行摘录）：来源 slime/utils/dp_schedule.py L82-L105
 def build_dp_schedule(
     args: Any,
     train_parallel_config: dict,
@@ -705,7 +705,7 @@ def build_dp_schedule(
 ```
 
 ```python
-# 来源：slime/utils/dp_schedule.py L187-L207
+# 定位骨架（非逐行摘录）：来源 slime/utils/dp_schedule.py L187-L207
         K = len(step_mbs)
         num_mbs_per_rank = K // dp_size
         num_microbatches.append(num_mbs_per_rank)
@@ -747,7 +747,7 @@ def build_dp_schedule(
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L841-L856
+# 定位骨架（非逐行摘录）：来源 slime/ray/rollout.py L841-L856
     def _split_train_data_by_dp(self, data):
         dp_size = self.train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
@@ -855,7 +855,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 ```
 
 ```python
-# 来源：slime/ray/actor_group.py L151-L157
+# 来源：slime/ray/actor_group.py L151-L155
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
         return ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
@@ -930,7 +930,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 取数据时移动关键 tensor 到 GPU：
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L222-L245
+# 来源：slime/backends/megatron_utils/actor.py L222-L241
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will receive the data.
@@ -977,7 +977,7 @@ class DataIterator:
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L219-L233
+# 来源：slime/backends/megatron_utils/data.py L219-L227
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch for the requested keys.
 
@@ -1090,7 +1090,7 @@ critic values 和 advantage 在真正训练前合入：
 advantage 计算入口：
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L661-L685
+# 来源：slime/backends/megatron_utils/loss.py L661-L676
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -1333,7 +1333,7 @@ SGLang engine 侧 API：
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L490-L498
+# 来源：slime/backends/sglang_utils/sglang_engine.py L490-L493
     def pause_generation(self):
         response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
         response.raise_for_status()
@@ -1438,11 +1438,11 @@ SGLang engine 侧 API：
 这条 RL baseline 链路可以压缩成以下关键结论：
 
 1. `train.py` 是同步屏障主循环：先 `generate`，再 `async_train`，最后 `update_weights`。
-2. `Sample` 承载训练语义，不只是文本；`tokens/reward/loss_mask/rollout_id/weight_version` 都会影响后续训练或排障。
+2. `Sample` 承载训练语义，不只是文本；`tokens/reward/loss_mask/rollout_id/weight_versions` 都会影响后续训练或排障。
 3. RolloutManager 的关键工作是把样本从“生成结果”变成“按 rollout 语义保组、按 DP rank 分发”的训练包。
 4. `build_dp_schedule` 的单位是 rollout，不是裸 sample；它先保组，再 pack micro-batch，再让 DP/VPP 同步可行。
 5. Megatron actor 不重新决定数据切分，只消费自己的 Ray `ObjectRef` 和预计算 `micro_batch_indices`。
-6. 权重同步是闭环成立的屏障：pause SGLang generation、flush cache、推新权重、递增版本、continue generation。
+6. 权重发布是闭环成立的屏障。本篇展开的 distributed updater 采用 pause generation、flush cache、推新权重、递增版本、continue generation；full/delta disk、tensor colocate 与 external 路径必须分别核对，不能套用同一时序。
 
 下一步阅读：
 
@@ -1450,5 +1450,5 @@ SGLang engine 侧 API：
 - SGLang rollout：[[Slime-SGLang-Rollout-源码走读]]
 - 训练执行：[[Slime-训练步骤]]
 - loss 与 advantage：[[Slime-Advantage计算-源码走读]]
-- 权重同步：[[Slime-分布式权重同步]]
+- 权重同步总览：[[Slime-权重同步]]；本篇主线对应 [[Slime-分布式权重同步]]
 - SGLang 请求链路：[[SGLang-HTTP请求全链路]]

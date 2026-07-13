@@ -26,14 +26,14 @@ updated: 2026-07-10
 
 | 概念 | 心理模型 | 源码对象 | 失效边界 |
 |------|----------|----------|----------|
-| IO-aware | 不把完整 `S/P` 长期写回 HBM | kernel 中 tile 级 `acc_s/rP/acc_o` | 不能解释 API 和 dispatch |
+| IO-aware | 主计算不物化完整 `Sq×Sk` score/probability 矩阵 | kernel 中 tile 级 `acc_s/rP/acc_o` | 测试 `S_dmask` 与 multi-split partial buffer 是例外 |
 | Online Softmax | 每行持续维护可重标定的 max 与 sum | `softmax_rescale_o`、`normalize_softmax_lse` | 不能替代 mask/dropout 语义 |
 | LSE | forward 留给 backward 的每行摘要 | `softmax_lse` | 不是完整 attention map |
 | Packed QKV | 上层预先合并 Q/K/V，减少 backward 拼接 | `flash_attn_qkvpacked_func` | 不等同于 varlen |
 | Varlen | 把有效 token 压成连续区间，用 prefix sum 表示边界 | `cu_seqlens_q/k` | `cu_seqlens` 错会导致跨样本污染 |
 | GQA/MQA | Q head 多于 KV head，KV 被多组 Q 共享 | API docstring 的 `num_heads_k` 约束 | 不是任意 head 数可混搭 |
 | KV cache | decode 中复用历史 K/V，并可原地追加新 K/V | `flash_attn_with_kvcache` | 需要 cache 容量和 offset 正确 |
-| SplitKV | 长 K/V 拆给多个 CTA，再 combine | `set_params_splitkv`、`run_mha_fwd_splitkv_dispatch` | 小问题不一定受益 |
+| SplitKV | 一套 split kernel 家族；可被 append/remap/paged 强制，也可真正多 split 后 combine | `set_params_splitkv`、`run_mha_fwd_splitkv_dispatch` | forced/aligned single-split 不等于 multi-split combine |
 | Paged KV | KV cache 按 block/page 管理 | `block_table`、paged KV 分支 | 不等同于连续 cache |
 | FA3/FA4 | 新硬件/新编译组织方式 | `hopper/`、`flash_attn/cute/` | 不能和 FA2 extension 混成一条路径 |
 
@@ -50,9 +50,9 @@ O = PV
 FlashAttention 的关键是让每行只携带三类状态穿过 K/V blocks：
 
 ```text
-m_i = 当前已处理 key block 的最大 score
-l_i = 当前已处理 key block 的 exp 累积和
-o_i = 当前已处理 key block 的 value 加权累积
+m_i = 当前已处理 key blocks 的最大 score
+l_i = sum_j exp(score_ij - m_i)
+o_i = sum_j exp(score_ij - m_i) * v_j
 ```
 
 每处理一个新的 K/V block，就用新的局部 score 修正旧的标尺。最后输出 `o_i / l_i`，并把 `log(l_i) + m_i` 保存成 LSE。这个模型可以解释两个现象：
@@ -97,7 +97,7 @@ forward 主循环先算局部 `QK`，再应用 softcap 和 mask，然后进入 o
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
 ```
 
-读者抓手：`acc_s` 是局部 score，`rP` 是局部 probability 块。它们服务当前 tile 的 `PV` 累积，不是完整 attention matrix。
+读者抓手：`acc_s` 先承载局部 score，经 online-softmax 更新后变成相对当前行最大值的未归一化指数权重；`rP` 只是把这份权重转换到 fp16/bf16 供 `PV` 使用。它不是最终 probability，最终输出归一化在 epilogue 才完成。
 
 ## 源码证据：LSE 是压缩协议字段
 
@@ -122,7 +122,7 @@ Python API 文档也把 `softmax_lse` 描述成每行 `QK^T * scaling` 的 logsu
             The output of softmax (possibly with different scaling). It also encodes the dropout
 ```
 
-读者抓手：LSE 是 `seqlen_q` 级别的摘要，`S_dmask` 才接近 `seqlen_q * seqlen_k` 级别的调试输出。生产主线应围绕 LSE，而不是试图拿完整 `P`。
+读者抓手：LSE 是 `seqlen_q` 级别的摘要。`S_dmask` 是 testing-only 调试槽位，可能带不同 scaling 和 dropout 符号编码；只有 dropout 开启时 backend 才被要求生成它，dropout 为 0 时公开三元组的第三项是空槽位。生产主线应围绕 out/LSE/RNG 协议，而不是试图拿完整 `P`。
 
 ## 源码证据：KV cache 是另一种输入契约
 
@@ -162,7 +162,7 @@ def flash_attn_with_kvcache(
     cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
 ```
 
-读者抓手：KV cache 路径的问题通常不是 softmax 原理问题，而是 cache 容量、`cache_seqlens`、`block_table`、RoPE position 或 SplitKV combine 的问题。
+读者抓手：KV cache 路径的问题通常不是 softmax 原理问题，而是 cache 容量、物理结束位置 `cache_seqlens`、leftpad 后逻辑长度、`block_table`、RoPE position 或 split 路径的问题。paged KV 当前拒绝与 `cache_batch_idx`、leftpad 同时使用；`num_splits==1` 不产生 partial buffer/combine，只有真正 multi-split 才有额外 partial O/LSE 生命周期。
 
 ## 常见误解
 
@@ -173,15 +173,25 @@ def flash_attn_with_kvcache(
 | varlen 是 ragged tensor | varlen 是连续 token + `cu_seqlens` | [[FlashAttention-Python-API-数据流]] |
 | decode 就是 batch size 为 1 的 forward | decode 关键在 KV cache load/update 和 SplitKV | `flash_attn_with_kvcache` |
 | FA4 是 FA2 的小重构 | FA4 是 CuTeDSL/JIT 后端路径 | `flash_attn/cute/` |
+| `rP` 是当前 tile 的最终概率 | `rP` 是未最终归一化的指数权重，epilogue 才归一化输出 | `softmax_rescale_o`、`normalize_softmax_lse` |
 
 ## 运行验证
 
 | 验证目标 | 操作 | 预期 |
 |----------|------|------|
 | 验证 exact attention | 用小 shape 对比 PyTorch reference | `out` 数值接近，不要求返回完整 `P` |
-| 验证 LSE 形态 | 开启 `return_attn_probs` 或读返回 tuple | LSE 是每行一个值，不是二维 attention map |
+| 验证 LSE/调试槽位 | 分别用 dropout=0 与 dropout>0 开启 `return_attn_probs` | LSE 是每行一个值；dropout=0 第三项为空，dropout>0 的 `S_dmask` 只作测试 |
 | 验证 varlen 边界 | 构造不同长度样本并检查 `cu_seqlens` | 不同样本之间不能互相 attend |
 | 验证 KV cache | 对 decode step 传入 `k/v` 和 `cache_seqlens` | cache 被追加，输出基于更新后的 cache |
+
+无可加载 GPU backend 时，执行静态替代：
+
+```powershell
+rg -n 'apply_softcap|apply_mask|softmax_rescale_o|normalize_softmax_lse' flash-attn/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h
+rg -n 'return_softmax=return_softmax and dropout_p|fwd_kvcache' flash-attn/flash-attention/flash_attn/flash_attn_interface.py
+```
+
+预期依次定位 softcap→mask→online update→epilogue，以及 `S_dmask` 的 dropout 门禁和 KV-cache 直调。静态定位不证明数值、ABI 或性能。
 
 ## 复盘
 

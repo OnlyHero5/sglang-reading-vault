@@ -17,7 +17,7 @@ updated: 2026-07-10
 
 训练主循环是 Slime RL 闭环的节拍器。它不实现 rollout、loss 或权重同步细节，而是决定这些角色什么时候启动、什么时候交接数据、什么时候释放显存、什么时候把新权重推给 SGLang、什么时候保存和评测。
 
-读完本专题，读者应该能排查五类问题：启动卡在 Ray 资源分配、首次 rollout 用了旧权重、colocate 显存交接顺序错、PPO critic-only 阶段 actor 是否训练、`train_async.py` 预取与权重更新冲突。
+读完本专题，读者应该能排查五类问题：启动卡在 Ray 资源分配、首次 rollout 用了旧权重、colocate 显存交接顺序错、PPO critic-only 阶段 actor 是否执行 optimizer step、`train_async.py` 预取与权重更新冲突。
 
 ## 主线模型
 
@@ -42,7 +42,7 @@ flowchart LR
 | 角色启动 | `create_rollout_manager`、`create_training_models` | rollout 先于训练模型，训练模型再绑定 rollout manager |
 | 冷启动同步 | `actor_model.update_weights()` | 第一次 generate 前必须把 actor 权重推到 rollout |
 | 同步训练步 | `generate -> async_train -> update_weights` | 当前 rollout 数据训练完成后才推新权重 |
-| 异步训练步 | `train_async.py` future 预取 | train N 与 generate N+1 重叠，但 update 前必须 drain |
+| 流水异步步 | `train_async.py` future 预取 | train N 与 generate N+1 重叠；N+1 天然先于 N 的新权重发布，update 前还必须 drain |
 | 周期动作 | `should_run_periodic_action` | save/eval 由 interval、epoch 边界、最后一步共同决定 |
 
 ## 阅读顺序
@@ -120,7 +120,8 @@ def train(args):
 - 首次 `generate` 前必须完成一次 `actor_model.update_weights()`。
 - sync `train.py` 中当前 `rollout_id` 的数据必须训练完，才保存、清显存、推新权重。
 - colocate 下 `offload_train` 和 `offload_rollout` 默认打开，主循环要按权重/KV 顺序 onload。
-- `train_async.py` 禁止 colocate；update weights 前必须收束正在预取的 generate。
+- critic-only 阶段不执行 actor optimizer step，但同步循环仍调用 actor 权重发布；发布序号可能前进而参数数值不变。
+- `train_async.py` 禁止 colocate；预取造成至少一拍 policy staleness，update weights 前还必须收束正在生成的 batch。
 - `save` 传入 `num_rollout`，最后一步也会触发；eval 不传 `num_rollout`，只按 interval 或 epoch 边界触发。
 
 ## 验证抓手
@@ -131,4 +132,4 @@ python -m pytest slime/tests/test_qwen2.5_0.5B_short.py -q
 python -m pytest slime/tests/test_qwen2.5_0.5B_async_short.py -q
 ```
 
-预期现象：这两个是端到端 smoke test，需要模型、数据、GPU 和外部下载环境；本地轻量环境通常无法直接跑完。读配置时，sync short 使用 `--colocate`，async short 使用 `train_script="train_async.py"` 和分离 rollout GPU。
+预期现象：这两个是端到端 smoke test，需要模型、数据、GPU 和外部下载环境；本地轻量环境通常无法直接跑完。无法运行时，静态阅读测试配置：sync short 使用 `--colocate`，async short 使用 `train_script="train_async.py"` 和分离 rollout GPU。

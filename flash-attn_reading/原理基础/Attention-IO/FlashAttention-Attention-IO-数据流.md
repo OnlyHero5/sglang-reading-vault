@@ -9,17 +9,17 @@ tags:
   - framework/flash-attn
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Attention-IO · 数据流
 
-> 本页把公式里的 `S/P/O` 放回实际存储层级。读完后，你应该能看到每个对象在哪里出生、在哪里被消费、是否写回 HBM。
+> 本页以基线 `002cce0` 的 FA2 standard 非测试 forward 为主，把公式里的 score、softmax 权重和 O 放回实际存储层级。读完后，你应该能看到每个对象在哪里出生、在哪里被消费、是否写回 HBM。
 
 ## 你为什么要读
 
 Attention IO 的关键不是变量改了几次名，而是数据在哪一层存储停留。本文沿 `Q/K/V -> score tile -> online softmax 状态 -> O/LSE` 追踪 HBM、shared memory 与 register 的交接；当性能或数值异常时，你可以先判断是哪次搬运或缩放出了问题。
 
-## 标准 attention 数据流
+## 物化式 attention 数据流
 
 ```mermaid
 flowchart LR
@@ -30,7 +30,7 @@ flowchart LR
     QKV --> S --> P --> O
 ```
 
-这个模型的危险点是 `S/P`。它们不是最终产物，却可能成为 `N x N` 的 HBM 中间状态。
+这是一种用于对照的物化式实现，不代表所有“非 FlashAttention”kernel 都必然逐步写出两张矩阵。它的危险点是 score/P 不是最终产物，却可能成为 `Sq x Sk` 的 HBM 中间状态；self-attention 且 Q/K 等长时才退化成 `N x N`。
 
 ## FlashAttention 数据流
 
@@ -39,14 +39,17 @@ flowchart TB
     HBM_IN["HBM<br/>Q K V"]
     SMEM["shared memory<br/>Q/K/V tile"]
     SCORE["register<br/>acc_s"]
+    MODIFY["register<br/>softcap + mask/ALiBi"]
     SOFTMAX["register<br/>row_max,row_sum"]
-    ACCO["register<br/>acc_o"]
+    WEIGHT["register<br/>acc_s/rP 指数分子"]
+    ACCO["register<br/>acc_o 输出分子"]
+    NORM["epilogue<br/>最终归一化"]
     HBM_OUT["HBM<br/>O + LSE"]
-    HBM_IN --> SMEM --> SCORE --> SOFTMAX --> ACCO --> HBM_OUT
+    HBM_IN --> SMEM --> SCORE --> MODIFY --> SOFTMAX --> WEIGHT --> ACCO --> NORM --> HBM_OUT
     ACCO --> SCORE
 ```
 
-循环箭头表示同一个 query block 会继续扫描下一块 K/V。`S/P` 不消失，但它们变成 register 里的短生命周期 tile。
+循环箭头表示同一个 query block 从当前可见 K 范围的右端向左继续扫描 K/V。score 和指数权重不消失，但它们变成 register 里的短生命周期 tile；`rP` 尚未除最终 `row_sum`，不能标成最终概率。
 
 ## 生命周期表
 
@@ -56,17 +59,17 @@ flowchart TB
 | `mQ/mK/mV` | HBM view | HBM 地址视图 | 当前 kernel |
 | `gQ/gK/gV` | 当前 CTA 的 HBM tile | HBM tile view | 当前 block |
 | `sQ/sK/sV` | Q/K/V tile staging | shared memory | 当前 CTA |
-| `acc_s` | 当前 Q block x K block score | register | 当前 K/V block |
+| `acc_s` | 先是 score，online softmax 后原地变成指数分子 | register | 当前 K/V block |
 | `row_max/row_sum` | softmax 行状态 | register | 当前 Q block 扫完所有 K/V |
-| `rP` | 当前概率 tile | register | 当前 K/V block |
-| `acc_o` | 输出累积 | register | 当前 Q block 扫完所有 K/V |
+| `rP` | 指数分子的低精度副本；dropout 可改写 | register | 当前 K/V block |
+| `acc_o` | 尚未除最终 `row_sum` 的输出分子 | register | 当前 Q block 扫完所有 K/V |
 | `gO/gLSE` | 输出 tile 与 LSE tile | HBM view | epilogue |
 
 表格依据：
 
 - HBM view 与 tile：来源：csrc/flash_attn/src/flash_fwd_kernel.h L138-L177
 - Q/K/V copy 与初始化：来源：csrc/flash_attn/src/flash_fwd_kernel.h L250-L288
-- score/probability/output accumulator：来源：csrc/flash_attn/src/flash_fwd_kernel.h L301-L367
+- score/指数权重/output accumulator：来源：csrc/flash_attn/src/flash_fwd_kernel.h L301-L367
 - online softmax state：来源：csrc/flash_attn/src/softmax.h L128-L189
 - O/LSE 写回：来源：csrc/flash_attn/src/flash_fwd_kernel.h L431-L494
 
@@ -79,7 +82,7 @@ flowchart TB
 | `s*` | shared memory tile。 |
 | `t*` | 某个 copy/MMA 线程视角下的 partition。 |
 | `acc_*` | register accumulator。 |
-| `rP/rO` | 从 accumulator 转成元素类型后的 register tile。 |
+| `rP/rO` | 从 accumulator 转成元素类型后的 register tile；字母 P 不保证已完成最终归一化。 |
 
 这个命名规律比单独背 CuTe 类型更重要。先判断变量在哪个存储层，再读具体 layout。
 
@@ -95,11 +98,13 @@ flowchart TB
 
 看到一个对象，先问三件事：
 
-1. 它是不是完整 `N x N` 状态？
+1. 它是不是完整 `Sq x Sk` 状态（等长 self-attention 时为 `N x N`）？
 2. 它是否跨 K/V blocks 保留？
 3. 它最终是否写回 HBM？
 
-`acc_s` 和 `rP` 的答案分别是：局部 `kBlockM x kBlockN`、不跨 block、常规不写回。`acc_o` 的答案是：局部 `kBlockM x D`、跨 block、最终写回 O。`row_max/row_sum` 的答案是：每行状态、跨 block、最终压成 LSE。
+`acc_s` 和 `rP` 的答案分别是：局部 `kBlockM x kBlockN`、不跨 block、standard 非测试路径不写回。`acc_o` 的答案是：局部 `kBlockM x D`、跨 block，epilogue 归一化后写回 O。`row_max/row_sum` 的答案是：每行状态、跨 block，共同生成 LSE。
+
+例外要单列：`Return_softmax` 会把带 dropout 符号编码、缩放不保证正确的 `S_dmask` 写到 HBM；multi-split 会写 partial O/LSE 再 combine。它们改变写回集合，但不等于常规完整最终 P。
 
 这就是 Attention IO 的数据流核心。
 
@@ -111,4 +116,4 @@ flowchart TB
 rg -n 'mQ|mK|mV|gQ|gK|gV|sQ|sK|sV|acc_s|acc_o|row_max|row_sum|gO|gLSE|GmemTiledCopyQKV|softmax_lse' flash-attn/flash-attention/csrc/flash_attn/src/flash.h flash-attn/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h flash-attn/flash-attention/csrc/flash_attn/src/kernel_traits.h flash-attn/flash-attention/csrc/flash_attn/src/softmax.h
 ```
 
-读输出时按“HBM view → shared memory tile → register accumulator → O/LSE 写回”的顺序串起来，而不是逐个背变量名。
+预期：输出能串成“HBM view → shared memory tile → score/指数分子 → 跨 tile 行状态与输出分子 → epilogue O/LSE”。若只看到变量名而不能指出 `rP` 是否归一化、是否写 HBM，说明验证尚未通过。

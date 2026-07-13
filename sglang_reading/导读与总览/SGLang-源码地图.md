@@ -9,416 +9,200 @@ tags:
   - framework/sglang
   - content/reference
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang 源码地图
 
-本页是 SGLang 源码入口地图，用来在读具体专题前快速定位“哪个文件负责哪一层”。读完后，你应该能从 CLI、HTTP/gRPC、Tokenizer、Scheduler、ModelRunner、KV cache 到扩展组件之间建立第一版文件索引。
+## 读者任务
 
-> 按架构层组织关键文件：每文件 3–5 行源码片段 + 一句话职责
+本页不是源码摘录合集，也不是要求你按目录逐个读文件。它是一张“问题到入口”的路由表：先判断异常属于协议、请求状态、调度、GPU 执行、KV/Attention 还是扩展路径，再打开最小的一组 upstream 文件和对应专题。
 
-路径均相对于 `sglang/` 仓库根。按 [[SGLang-架构分层]] 的层序排列。
+路径均相对于 `sglang/` 仓库根。具体行为、分支条件和不变量以链接的源码走读为准；本页只保存稳定职责，不用压缩伪代码冒充源码证据。
 
----
+## 一条请求先经过哪些所有者
 
-## 文档与配置层
-
-### `README.md`
-
-**职责：** 官方项目介绍、特性清单、社区链接与新闻。
-
-```markdown
-<!-- L13-22 -->
-SGLang is a fast serving framework for large language models and vision language models.
-Documentation | Roadmap | Join Slack
+```mermaid
+flowchart LR
+    CLI["CLI"]
+    PY["Python Engine API"]
+    HTTP["HTTP / 协议 handler"]
+    TM["TokenizerManager<br/>外部请求状态"]
+    SCH["Scheduler<br/>资源与 batch"]
+    TP["TpModelWorker<br/>执行门面"]
+    MR["ModelRunner<br/>单 rank GPU"]
+    RADIX["Radix cache<br/>prefix 语义索引"]
+    KV["KV pool<br/>物理 slot"]
+    ATT["Attention backend"]
+    DET["Detokenizer<br/>增量文本"]
+    CLI --> HTTP --> TM
+    PY --> TM
+    TM --> SCH --> TP --> MR
+    MR --> TP --> SCH
+    SCH --> RADIX
+    MR --> KV
+    MR --> ATT
+    SCH --> DET --> TM
 ```
 
-**中文释义：** README 开头将 SGLang 定位为大语言模型与视觉语言模型的高性能 serving 框架，并把文档、路线图和社区入口放在首屏。
-
-### `python/pyproject.toml`
-
-**职责：** Python 包元数据、依赖、CLI 入口 `sglang=sglang.cli.main:main`、Rust 扩展构建配置。
-
-```toml
-[project]
-name = "sglang"
-requires-python = ">=3.10"
-[project.scripts]
-sglang = "sglang.cli.main:main"
-```
-
-### `python/sglang/version.py`
-
-**职责：** 从 `_version.py` / importlib.metadata / setuptools_scm 多级回退解析版本号。
-
----
-
-## 入口层
-
-### `python/sglang/cli/main.py`
-
-**职责：** `sglang` 命令根，subcommand 路由到 serve/generate/version。
-
-```python
-## 来源：python/sglang/cli/main.py
-def main():
- parser = argparse.ArgumentParser()
- subparsers = parser.add_subparsers(dest="subcommand", required=True)
- subparsers.add_parser("serve", help="Launch an SGLang server.")
- # ...
- if args.subcommand == "serve":
- from sglang.cli.serve import serve
- serve(args, extra_argv)
-```
-
-### `python/sglang/cli/serve.py`
-
-**职责：** 解析 `--model-type`，在 LLM 与 diffusion 运行时之间分发。
-
-```python
-## 来源：python/sglang/cli/serve.py
- else:
- from sglang.launch_server import run_server
- from sglang.srt.server_args import prepare_server_args
- server_args = prepare_server_args(dispatch_argv)
- run_server(server_args)
-```
-
-### `python/sglang/launch_server.py`
-
-**职责：** 按 server_args 在 HTTP/gRPC/Ray/Encoder 四条路径间选择入口。
-
-```python
-## 来源：python/sglang/launch_server.py
-def run_server(server_args):
- elif server_args.grpc_mode:
- asyncio.run(serve_grpc(server_args))
- else:
- from sglang.srt.entrypoints.http_server import launch_server
- launch_server(server_args)
-```
-
-### `python/sglang/srt/entrypoints/http_server.py`
-
-**职责：** FastAPI HTTP 服务：路由 `/generate`、OpenAI 兼容 API、spawn 子进程、绑定 TokenizerManager。
-
-```python
-## 来源：python/sglang/srt/entrypoints/http_server.py
-async def generate_request(obj: GenerateReqInput, request: Request):
- async for out in _global_state.tokenizer_manager.generate_request(obj, request):
- yield b"data: " + dumps_json(out) + b"\n\n"
-```
-
----
-
-## gRPC 桥接层
-
-### `proto/sglang/runtime/v1/sglang.proto`
-
-**职责：** gRPC 契约：SGLang typed RPC + OpenAI pass-through + Admin。
-
-### `rust/sglang-grpc/src/server.rs`
-
-**职责：** Tonic `SglangServiceImpl`：流式/Unary RPC handler、abort guard。
-
-### `rust/sglang-grpc/src/bridge.rs`
-
-**职责：** Rust↔Python PyBridge：per-request mpsc、ChunkCallback 背压。
-
-### `python/sglang/srt/entrypoints/grpc_bridge.py`
-
-**职责：** Python 侧 RuntimeHandle，供 PyO3 调用 submit_request/generate_request。
-
-### `python/sglang/srt/entrypoints/grpc_server.py`
-
-**职责：** legacy gRPC 模式启动：加载 Rust 扩展、绑定 RuntimeHandle。
-
----
-
-## 公共 API 层
-
-### `python/sglang/__init__.py`
-
-**职责：** 导出 Frontend（gen/user/assistant）与 Runtime（Engine/ServerArgs）；macOS triton/mps stub。
-
-```python
-## 来源：python/sglang/__init__.py
-__all__ = ["Engine", "Runtime", "gen", "user", "assistant", "ServerArgs", ...]
-```
-
-### `python/sglang/global_config.py`
-
-**职责：** Frontend 解释器全局常量：verbosity、default_backend、tracing 开关。
-
----
-
-## 运行时核心层
-
-### `python/sglang/srt/managers/tokenizer_manager.py`
-
-**职责：** 主进程请求枢纽：tokenize、发 ZMQ 到 Scheduler、await Detokenizer 结果、流式 yield。
-
-```python
-## 来源：python/sglang/srt/managers/tokenizer_manager.py
- async def generate_request(self, obj, request=None):
- obj.normalize_batch_and_arguments()
- tokenized_obj = await self._tokenize_one_request(obj)
- self._send_one_request(tokenized_obj)
- async for response in self._wait_one_response(obj, request):
- yield response
-```
-
-### `python/sglang/srt/managers/scheduler.py`
-
-**职责：** GPU 调度子进程：连续批处理 event loop、组 batch、调 TP Worker、发 token 到 Detokenizer。
-
-```python
-## 来源：python/sglang/srt/managers/scheduler.py
- def event_loop_normal(self):
- while True:
- recv_reqs = self.request_receiver.recv_requests()
- self.process_input_requests(recv_reqs)
- batch = self.get_next_batch_to_run()
- if batch:
- result = self.run_batch(batch)
- self.process_batch_result(batch, result)
-```
-
-### `python/sglang/srt/managers/schedule_policy.py`
-
-**职责：** 调度策略：prefix match、prefill/decode 优先级、chunked prefill 切分。
-
-### `python/sglang/srt/managers/schedule_batch.py`
-
-**职责：** ScheduleBatch / Req 数据结构：请求状态、KV 索引、采样参数。
-
-### `python/sglang/srt/server_args.py`
-
-**职责：** ServerArgs dataclass：全部 CLI 参数解析与默认值。
-
----
-
-## 调度输出层
-
-### `python/sglang/srt/managers/detokenizer_manager.py`
-
-**职责：** Detokenizer 子进程：BatchTokenIDOutput → BatchStrOutput 增量解码。
-
-```python
-## 来源：python/sglang/srt/managers/detokenizer_manager.py
- def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
- output_strs = self._decode_batch_token_id_out(recv_obj) if len(recv_obj.rids) > 0 else []
- return BatchStrOutput(rids=recv_obj.rids, output_strs=output_strs, ...)
-```
-
-### `python/sglang/srt/managers/io_struct.py`
-
-**职责：** 跨进程消息类型：TokenizedGenerateReqInput、BatchTokenIDOutput、BatchStrOutput 等。
-
-### `python/sglang/srt/managers/communicator.py`
-
-**职责：** FanOutCommunicator：控制面广播（pause、weight update、logging config）。
-
----
-
-## 模型执行层
-
-### `python/sglang/srt/managers/tp_worker.py`
-
-**职责：** TP 进程 Worker 门面：ScheduleBatch→ForwardBatch、调 ModelRunner、采样。
-
-```python
-## 来源：python/sglang/srt/managers/tp_worker.py
- def forward_batch_generation(self, batch, ...):
- forward_batch = ForwardBatch.init_new(batch, self.model_runner)
- out = self.model_runner.forward(forward_batch, ...)
-```
-
-### `python/sglang/srt/model_executor/model_runner.py`
-
-**职责：** 单 rank GPU 执行：load_model、KV 池、Attention backend、forward、CUDA Graph。
-
-```python
-## 来源：python/sglang/srt/model_executor/model_runner.py
- def forward(self, forward_batch, ...):
- self.forward_pass_id += 1
- # ... model.forward → logits → sample
-```
-
-### `python/sglang/srt/model_executor/forward_batch_info.py`
-
-**职责：** ForwardMode 枚举、ForwardBatch 张量布局、init_new 物化逻辑。
-
-```python
-## 来源：python/sglang/srt/model_executor/forward_batch_info.py
-class ForwardMode(IntEnum):
- EXTEND = auto()
- DECODE = auto()
- MIXED = auto()
- TARGET_VERIFY = auto()
- PREBUILT = auto()
-```
-
-### `python/sglang/srt/model_loader/loader.py`
-
-**职责：** 权重加载策略：DefaultModelLoader、GGUF、RemoteInstance、Layered。
-
-### `python/sglang/srt/models/registry.py`
-
-**职责：** 模型类注册表：HF architecture → EntryClass 查找。
-
-### `python/sglang/srt/models/llama.py`
-
-**职责：** 通用 Llama 推理：RadixAttention、ParallelLinear、load_weights stacked 映射。
-
-### `python/sglang/srt/models/qwen3.py`
-
-**职责：** Qwen3：QK norm、继承 Qwen2 结构。
-
-### `python/sglang/srt/models/deepseek_v2.py`
-
-**职责：** DeepSeek MLA+MoE：双 RadixAttention、AttnForwardMethod 平台分发。
-
-### `python/sglang/srt/models/mllama.py`
-
-**职责：** Llama 3.2 Vision：vision encoder + text cross-attention。
-
-### `python/sglang/srt/models/gemma3_causal.py`
-
-**职责：** Gemma3：交替 sliding/full attention、scaled word embedding。
-
----
-
-## 前缀缓存层
-
-### `python/sglang/srt/mem_cache/radix_cache.py`
-
-**职责：** 标准 Radix Tree 前缀 KV：match_prefix、insert、cache_finished_req、evict。
-
-```python
-## 来源：python/sglang/srt/mem_cache/radix_cache.py
- def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
- """Find the longest cached prefix of key in the radix tree."""
- if self.disable or len(key) == 0:
- return self._empty_match_result
-```
-
-### `python/sglang/srt/mem_cache/unified_radix_cache.py`
-
-**职责：** 统一前缀缓存：FULL/SWA/Mamba 多组件、HiCache、storage tier。
-
-### `python/sglang/srt/layers/radix_attention.py`
-
-**职责：** Attention 层：读 ForwardBatch，分发 FlashInfer/Triton backend 读写 KV。
-
-```python
-## 来源：python/sglang/srt/layers/radix_attention.py
-class RadixAttention(nn.Module):
- """The attention layer implementation."""
-```
-
----
-
-## 高级特性层
-
-### `python/sglang/srt/speculative/spec_info.py`
-
-**职责：** 投机算法枚举 SpeculativeAlgorithm 与 create_worker 工厂。
-
-### `python/sglang/srt/speculative/eagle_worker_v2.py`
-
-**职责：** EAGLE 投机 Worker：draft+verify 两阶段、CUDA Graph、与 Target Worker 协作。
-
-### `python/sglang/srt/disaggregation/prefill.py`
-
-**职责：** Prefill PD 节点：Bootstrap/Waiting/Inflight 三队列与 KVSender。
-
-### `python/sglang/srt/disaggregation/decode.py`
-
-**职责：** Decode PD 节点：Prealloc/Transfer/Waiting/Running 四队列。
-
-### `python/sglang/srt/distributed/parallel_state.py`
-
-**职责：** initialize_model_parallel、GroupCoordinator、collective 路由。
-
-```python
-## 来源：python/sglang/srt/distributed/parallel_state.py
-def initialize_model_parallel(tensor_model_parallel_size=1, ...):
- """Initialize model parallel groups."""
-```
-
-### `python/sglang/srt/managers/data_parallel_controller.py`
-
-**职责：** DP 请求路由：ZMQ fan-out 到多 Scheduler。
-
----
-
-## 扩展组件层
-
-### `python/sglang/srt/multimodal/processors/base_processor.py`
-
-**职责：** 多模态预处理基类：special token 展开、图像/视频/音频加载。
-
-### `python/sglang/srt/managers/multimodal_processor.py`
-
-**职责：** Processor 注册与 get_mm_processor 调度入口。
-
-### `python/sglang/srt/lora/lora_manager.py`
-
-**职责：** 多 adapter 并发：MemoryPool、CSGMV、LRU eviction。
-
-```python
-## 来源：python/sglang/srt/lora/lora_manager.py
-class LoRAManager:
- def __init__(self, base_model, ..., max_loras_per_batch, ...):
- self.max_loras_per_batch = max_loras_per_batch
-```
-
----
-
-## 前端语言层
-
-### `python/sglang/lang/`（目录）
-
-**职责：** 结构化生成 DSL：gen、select、function、RuntimeEndpoint 等。
-
----
-
-## 查阅建议
-
-| 你想… | 先看 |
-|-------|------|
-| 改 HTTP API | `http_server.py`, `io_struct.py` |
-| 改调度策略 | `scheduler.py`, `schedule_policy.py` |
-| 加新模型 | `models/registry.py`, `models/llama.py` 模板 |
-| 查 KV 共享 | `radix_cache.py`, `radix_attention.py` |
-| 查 PD 分离 | `disaggregation/prefill.py`, `decode.py` |
-
----
-
-## 运行验证
-
-维护本文时，先确认文件地图里的核心路径仍然存在：
+| 交接边界 | 主要对象 | 第一入口 | 深入阅读 |
+|----------|----------|----------|----------|
+| 用户命令到 server 配置 | argv → `ServerArgs` | `python/sglang/cli/main.py`、`cli/serve.py`、`srt/server_args.py` | [[SGLang-启动链路-数据流]] |
+| HTTP 到内部请求 | JSON/OpenAI request → `GenerateReqInput` | `srt/entrypoints/http_server.py` | [[SGLang-HTTP-Server-源码走读]]、[[SGLang-OpenAI-API]] |
+| 请求状态到调度消息 | tokenized input、rid、async state | `srt/managers/tokenizer_manager.py`、`io_struct.py` | [[SGLang-TokenizerManager]] |
+| 请求到可执行 batch | `Req` → `ScheduleBatch` | `srt/managers/scheduler.py`、`schedule_batch.py` | [[SGLang-Scheduler]]、[[SGLang-ScheduleBatch数据结构]] |
+| batch 到 GPU tensor | `ScheduleBatch` → `ForwardBatch` | `srt/managers/tp_worker.py`、`model_executor/forward_batch_info.py` | [[SGLang-ModelRunner-数据流]] |
+| GPU 执行与 kernel | `ForwardBatch` → logits/采样结果 | `model_executor/model_runner.py`、`layers/radix_attention.py` | [[SGLang-ModelRunner]]、[[SGLang-Attention]] |
+| token id 到文本 | `BatchTokenIDOutput` → `BatchStrOutput` | `srt/managers/detokenizer_manager.py` | [[SGLang-Detokenizer]] |
+
+这张表的关键不是文件顺序，而是所有权：HTTP 不管理 KV，Scheduler 不负责文本解码，ModelRunner 不拥有客户端生命周期，attention backend 也不知道 OpenAI route 的名字。Python `Engine` 复用 TokenizerManager/Scheduler/Detokenizer runtime，但绕过 FastAPI；它不能被强行画进 HTTP 分支。
+
+## 启动与协议入口
+
+| 文件 | 稳定职责 | 不要误读成 |
+|------|----------|------------|
+| `python/pyproject.toml` | 安装产物、console script、package data、Rust extension 构建声明 | 运行时请求链 |
+| `python/sglang/cli/main.py` | `serve/generate/version` 顶层子命令路由 | 完整 server 参数解析器 |
+| `python/sglang/cli/serve.py` | diffusion 与标准 LLM serve 的早期分流 | HTTP server 本体 |
+| `python/sglang/launch_server.py` | encoder、legacy gRPC、Ray HTTP、默认 HTTP 的入口选择 | Scheduler 进程拓扑实现 |
+| `python/sglang/srt/entrypoints/http_server.py` | HTTP runtime 装配、FastAPI/ASGI、native 与兼容协议路由、health/warmup | token 调度或模型 forward |
+| `python/sglang/srt/server_args.py` | CLI 配置的结构、默认值、派生值和合法性检查 | 全局可变单例 |
+
+首次追 HTTP 请求，直接进入 [[SGLang-HTTP请求全链路]]。排查“端口已开但服务不可用”，进入 [[SGLang-HTTP-Server-排障指南]]，不要先读 Scheduler。
+
+## gRPC 必须分成两条能力边界
+
+| 路径 | 文件 | 当前基线中的含义 |
+|------|------|------------------|
+| legacy `--grpc-mode` | `python/sglang/srt/entrypoints/grpc_server.py` | thin wrapper，委托外部 `smg-grpc-servicer`；这是当前 Python 参数已接线的路径 |
+| native Rust/Tonic capability | `proto/sglang/runtime/v1/sglang.proto`、`rust/sglang-grpc/src/server.rs`、`bridge.rs`、Python `grpc_bridge.py` | 仓库内协议、server、PyBridge 与 RuntimeHandle 能力；当前默认 Python 启动路径没有把它接成一条可启动链 |
+
+不能把两行表合并成“`--grpc-mode` 启动 Rust/Tonic server”。详细证据与启动验证见 [[SGLang-gRPC请求全链路]]。
+
+## 请求状态与跨进程消息
+
+| 文件 | 拥有什么 | 遇到什么问题时打开 |
+|------|----------|--------------------|
+| `srt/managers/tokenizer_manager.py` | rid 对应的等待状态、tokenization、请求发送、回包聚合、abort 与流式 yield | 请求已到 HTTP，但没有进入调度；stream 卡住；客户端取消未释放 |
+| `srt/managers/io_struct.py` | Tokenizer、Scheduler、Detokenizer、控制面之间传递的 dataclass/message 契约 | 字段丢失、版本漂移、跨进程对象形态不一致 |
+| `srt/managers/detokenizer_manager.py` | token id 的增量解码状态与 `BatchStrOutput` | 有 token id 无文本、Unicode/stop 边界异常 |
+| `srt/managers/communicator.py` | 通用的 ZMQ fan-out/collect 原语：一次发送等待全部参与者回包，并提供 queueing 与 watching 两种并发语义 | 广播未收齐、并发控制请求互相覆盖或等待者拿错结果；具体 pause、权重更新、logging 消息仍由调用方定义 |
+
+排查时先问“对象在哪个进程被拥有”，再问“下一条消息由谁消费”。只看函数调用图容易忽略 ZMQ、队列与取消语义。
+
+## Scheduler：资源决策与 batch 生命周期
+
+| 文件 | 稳定职责 | 重点对象或判断 |
+|------|----------|----------------|
+| `srt/managers/scheduler.py` | 接收请求、维护 waiting/running 状态、选择 prefill/decode、执行 batch、处理结果与 retract | event loop、admission、KV 预算、输出发送 |
+| `srt/managers/schedule_policy.py` | waiting request 的排序与 prefix-aware policy | policy 改变不等于 KV allocator 改变 |
+| `srt/managers/schedule_batch.py` | `Req`、`ScheduleBatch` 及 batch 合并/过滤/状态变换 | 请求字段、KV 索引、采样状态、EXTEND/DECODE 形态 |
+| `srt/managers/data_parallel_controller.py` | 启动 DP Scheduler 进程，按 round-robin、bootstrap room、累计请求数或累计 token 等策略选择 DP rank；也处理外部指定 rank、批请求拆分与控制消息 fan-out | DP controller 负责“选哪个 DP 副本及向哪些副本广播”，不是副本内部的 TP worker |
+
+如果问题是 TTFT、排队、chunked prefill、retract 或 prefix-aware 排序，先读 [[SGLang-Scheduler-源码走读]]。如果字段在多次 batch 变换后错位，进入 [[SGLang-ScheduleBatch数据结构-数据流]]。
+
+## GPU 执行：门面、tensor 化与模型
+
+| 文件 | 稳定职责 | 修改时必须保护 |
+|------|----------|----------------|
+| `srt/managers/tp_worker.py` | Scheduler 与单 rank `ModelRunner` 之间的执行门面 | TP/PP rank 参与顺序、采样与输出契约 |
+| `srt/model_executor/forward_batch_info.py` | `ForwardMode` 与 `ForwardBatch` 的 tensor/metadata 形态 | EXTEND、DECODE、MIXED、verify 等模式字段一致 |
+| `srt/model_executor/model_runner.py` | 模型加载后的单 rank GPU 执行、attention backend、CUDA Graph、forward 与采样准备 | graph/eager 选路、KV pool、backend metadata、设备状态 |
+| `srt/model_loader/loader.py` | checkpoint/load format 对应的 loader 策略 | 文件格式、量化与模型参数名映射 |
+| `srt/models/registry.py` | HF architecture 到 SGLang model class 的解析 | 新模型注册不能只新增一个文件 |
+
+模型实现不要从整个 `models/` 目录开始扫。先用 registry 找到 EntryClass，再选一个结构最接近的实现：通用 decoder 可从 `models/llama.py` 入手；MLA/MoE 看 `deepseek_v2.py`；vision-text cross attention 看 `mllama.py`；混合 sliding/full attention 看 `gemma3_causal.py`。
+
+## KV、prefix cache 与 attention 是三层对象
+
+| 层 | 文件 | 回答的问题 |
+|----|------|------------|
+| KV 物理资源 | `srt/mem_cache/` 下 allocator/pool 实现；主要由 GPU 执行侧持有和写入 | token slot 在哪里分配、释放和统计 |
+| prefix 语义索引 | `srt/mem_cache/radix_cache.py`、`unified_radix_cache.py`；调度侧据此做 match/lock/commit | 哪段历史 token 可以复用，节点如何插入/匹配/淘汰 |
+| attention 消费 | `srt/layers/radix_attention.py` 与具体 backend | 当前 batch 用哪些 Q/K/V、slot、indptr、indices 调 kernel |
+
+不要把 `RadixAttention` 类名等同于 radix tree，也不要把 prefix hit 直接等同于 TTFT 必然下降。资源账读 [[SGLang-KV-Cache]]，prefix 语义读 [[SGLang-RadixAttention]]，kernel metadata 读 [[SGLang-Attention-源码走读]]。
+
+## 分布式与高级路径
+
+| 任务 | 第一入口 | 继续阅读 |
+|------|----------|----------|
+| TP/PP/CP/EP group 与 collective | `srt/distributed/parallel_state.py` | [[SGLang-分布式]] |
+| Speculative 算法选择与公共 phase 契约 | `srt/speculative/spec_info.py`、`spec_registry.py` | [[SGLang-Speculative]]；再按算法进入 `eagle_worker_v2.py`、`dflash_worker_v2.py`、`ngram_worker.py` 等具体 worker |
+| Prefill/Decode disaggregation | `srt/disaggregation/prefill.py`、`decode.py` | [[SGLang-PD分离]] |
+| 可观测性与 metrics | `srt/observability/`、scheduler metrics reporter | [[SGLang-可观测性]] |
+| checkpoint/在线权重更新 | updater、control message 与 model loader 相关入口 | [[SGLang-CheckpointEngine]] |
+
+高级路径会改变主线中的参与者和等待点，但不会取消对象所有权。比如 PD 分离新增 KV transfer 队列，不代表 HTTP route 开始管理 KV；speculative 的 `spec_info.py` 统一表达 prepare、draft、verify 等阶段输入，却不等于所有算法都走 EAGLE worker。当前基线还包括 DFLASH、FROZEN_KV_MTP、STANDALONE、NGRAM 与插件注册算法，算法特有状态必须回到对应 worker 核对。
+
+## 扩展组件
+
+| 扩展 | 第一入口 | 先确认的边界 |
+|------|----------|--------------|
+| 多模态 | `managers/multimodal_processor.py`、`srt/multimodal/processors/base_processor.py` | 前者扫描、注册并按 architecture/model backend 选择 processor；后者约束 raw、processor output、precomputed embedding 三类输入，以及 placeholder/token 展开、offset/item 切分、hash/pad 和可选 CUDA IPC |
+| LoRA | `srt/lora/lora_manager.py`、`srt/lora/mem_pool.py` | manager 负责配置/CPU adapter、模型层包装与 batch metadata；memory pool 才负责 GPU slot residency、权重装载、pinned adapter 保护和策略化 eviction |
+| 前端语言 DSL | `python/sglang/lang/api.py`、`ir.py`、`interpreter.py`、`backend/runtime_endpoint.py` | API 构造 IR，解释器维护 program/stream/variable/fork 状态，backend 才把 generate/select 等动作翻译为远端协议；这些对象不是 Scheduler 的 `Req`/`ScheduleBatch` |
+| model gateway | 独立 gateway/router 目录与协议入口 | 路由策略、session affinity 与单个 engine 内调度分开 |
+| sgl-kernel | 独立 kernel 包及调用点 | kernel 包存在不代表当前模型/backend 一定 dispatch 到它 |
+
+对应阅读：[[SGLang-多模态]]、[[SGLang-LoRA]]、[[SGLang-前端语言]]、[[SGLang-model-gateway]]、[[SGLang-sgl-kernel]]。
+
+## 按症状反查入口
+
+| 症状或修改目标 | 先打开 | 暂时不要先看 |
+|----------------|----------|----------------|
+| HTTP 422、OpenAI messages/tool 转换错误 | `http_server.py`、OpenAI serving handler | CUDA kernel |
+| 请求已接受但 Scheduler 没看到 | `tokenizer_manager.py`、`io_struct.py` | 模型实现 |
+| TTFT 高、waiting queue 增长 | `scheduler.py`、`schedule_policy.py`、metrics reporter | Detokenizer |
+| KV usage 高或发生 retract | Scheduler admission、KV pool、radix cache | HTTP route |
+| token id 正常但文本不返回 | `detokenizer_manager.py`、TokenizerManager 回包状态 | attention backend |
+| CUDA Graph capture/replay 异常 | `model_runner.py`、attention backend graph metadata | CLI parser |
+| 新模型权重缺失或 shape 不匹配 | registry、model class `load_weights`、loader | schedule policy |
+| prefix cache 命中不符合预期 | radix cache key/insert/match、请求 token 序列 | 只看 GPU utilization |
+| 多机某 rank 没完整 HTTP API | Engine 启动与 node rank 分支 | OpenAI handler |
+
+## 静态验证
+
+从知识库根目录执行：
 
 ```powershell
-@(
+$paths = @(
   'sglang/python/sglang/cli/main.py',
   'sglang/python/sglang/cli/serve.py',
   'sglang/python/sglang/launch_server.py',
   'sglang/python/sglang/srt/entrypoints/http_server.py',
+  'sglang/python/sglang/srt/entrypoints/grpc_server.py',
+  'sglang/python/sglang/srt/entrypoints/grpc_bridge.py',
+  'sglang/proto/sglang/runtime/v1/sglang.proto',
+  'sglang/rust/sglang-grpc/src/server.rs',
   'sglang/python/sglang/srt/managers/tokenizer_manager.py',
   'sglang/python/sglang/srt/managers/scheduler.py',
+  'sglang/python/sglang/srt/managers/schedule_batch.py',
   'sglang/python/sglang/srt/managers/detokenizer_manager.py',
+  'sglang/python/sglang/srt/managers/communicator.py',
+  'sglang/python/sglang/srt/managers/data_parallel_controller.py',
+  'sglang/python/sglang/srt/managers/multimodal_processor.py',
   'sglang/python/sglang/srt/model_executor/model_runner.py',
   'sglang/python/sglang/srt/mem_cache/radix_cache.py',
   'sglang/python/sglang/srt/layers/radix_attention.py',
   'sglang/python/sglang/srt/disaggregation/prefill.py',
   'sglang/python/sglang/srt/disaggregation/decode.py',
+  'sglang/python/sglang/srt/speculative/spec_info.py',
+  'sglang/python/sglang/srt/speculative/spec_registry.py',
   'sglang/python/sglang/srt/lora/lora_manager.py',
-  'sglang/python/sglang/lang'
-) | ForEach-Object {
-  [pscustomobject]@{ Path = $_; Exists = (Test-Path -LiteralPath $_) }
-} | Format-Table -AutoSize
+  'sglang/python/sglang/srt/lora/mem_pool.py',
+  'sglang/python/sglang/srt/multimodal/processors/base_processor.py',
+  'sglang/python/sglang/lang/api.py',
+  'sglang/python/sglang/lang/ir.py',
+  'sglang/python/sglang/lang/interpreter.py',
+  'sglang/python/sglang/lang/backend/runtime_endpoint.py'
+)
+$missing = $paths | Where-Object { -not (Test-Path -LiteralPath $_) }
+if ($missing) { $missing; throw '源码地图存在失效路径' }
+"checked=$($paths.Count) missing=0"
 ```
 
-预期信号：所有 `Exists` 都应为 `True`。如果某条路径变为 `False`，先更新本页文件地图，再检查引用它的专题入口、导读路径和全链路追踪。
+预期输出 `missing=0`。这只证明文件入口仍存在；要证明行为没有漂移，继续运行对应专题的源码证据、单元测试或服务实验。
+
+## 复盘
+
+使用这张地图时始终做三步：先确定对象所有者，再确定跨进程或跨层交接，最后才打开具体实现。能够背出文件名不算读懂；能够解释“为什么这个症状先看这里、为什么另外两层暂时不用看”，才算建立了可迁移的源码地图。

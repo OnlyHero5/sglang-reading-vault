@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # RadixAttention · 核心概念
 
@@ -25,7 +25,7 @@ updated: 2026-07-10
 |------|----------|----------|
 | 目录卡 | `RadixCache` / `UnifiedRadixCache` | 不能解释 kernel 内部如何算 softmax |
 | 货架编号 | `torch.int64` KV pool indices | 不等于 K/V tensor 值本身 |
-| 取货单 | `req.prefix_indices` | 只描述已命中前缀，不描述本轮新 token 的计算 |
+| 取货单 | `req.prefix_indices` | 描述下一轮可跳过的已计算 KV；chunk commit 后不保证全部已进 tree |
 | 工位 | `RadixAttention.forward` | 不负责决定哪些前缀可共享 |
 
 用这张表读源码时，先问“这行代码是在改目录、改取货单、改货架编号，还是把新货交给工位”。这样能避免把 prefix cache、KV allocator、attention backend 混在一起。
@@ -174,7 +174,7 @@ class RadixKey:
         self.cache_protected_len: int = 0
 ```
 
-这段把读者需要追的字段集中放在一起：`prefix_indices` 是 device KV 命中，`last_node` 是要加锁的 tree 位置，`cache_protected_len` 是 tree 真正接管的 prefix 长度。三者不总是同长，尤其是 page tail 和 EAGLE bigram 场景。
+这段把读者需要追的字段集中放在一起：刚完成 `match_prefix_for_req` 时，`prefix_indices` 是 device tree hit；完成一次 `cache_unfinished_req` 后，它可能变成“tree 的 canonical indices + 请求私有 tail”。`last_node` 是锁锚点，`cache_protected_len` 才是 tree 真正接管的长度。三者不总是同长，尤其是 page tail 和 EAGLE bigram 场景。
 
 ## `TreeNode`：树节点保存前缀段和 KV indices
 
@@ -340,7 +340,54 @@ class TreeNode:
 
 ## Unified 只是同一前缀树上的多套资源视图
 
-`UnifiedTreeNode` 把不同 component 的 device/host value 放到 `component_data`。这不是换了一套 prefix 语义，而是让 Full KV、SWA、Mamba、HiCache 等资源在同一前缀节点上有各自的锁、LRU 和驱逐状态。
+`UnifiedTreeNode` 把 Full、SWA、Mamba 等 component 的 device/host value 放到 `component_data`。HiCache 不是第四种 `ComponentType`：它是围绕这些 component 增加 host/storage 层、异步 transfer、sidecar pool 与 load-back 的控制面。
+
+各 component 也不是完全对称：Full KV 是树的生存骨架，device/host 驱逐用 leaf set 与时间/策略；SWA、Mamba 等辅助 component 维护独立 device/host LRU。节点能否继续存在最终看 Full 是否至少在 device 或 host 一层存活；辅助数据不能脱离 Full 单独悬挂。
+
+```python
+# 来源：sglang/python/sglang/srt/mem_cache/unified_radix_cache.py L269-L273
+COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
+    ComponentType.FULL: FullComponent,
+    ComponentType.MAMBA: MambaComponent,
+    ComponentType.SWA: SWAComponent,
+}
+```
+
+```python
+# 来源：sglang/python/sglang/srt/mem_cache/unified_radix_cache.py L1409-L1440
+    def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
+        """D-leaf: Full device value present, no child with Full KV on device,
+        unlocked, not root.
+
+        Only the Full (base) component is required; auxiliary components
+        (Mamba, SWA) are not mandatory for D-leaf membership."""
+        ct = BASE_COMPONENT_TYPE
+        if node is self.root_node or node.evicted:
+            return False
+        if any(cd.lock_ref > 0 for cd in node.component_data):
+            return False
+        if any(
+            child.component_data[ct].value is not None
+            for child in node.children.values()
+        ):
+            return False
+        return True
+
+    def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
+        """H-leaf: evicted, Full host value present, no children, unlocked, not root.
+
+        Only the Full (base) component host_value is required; auxiliary
+        components are not mandatory for H-leaf membership."""
+        if node is self.root_node or not node.evicted:
+            return False
+        if not node.backuped:
+            return False
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        if len(node.children) > 0:
+            return False
+        return True
+```
 
 ```python
 # 来源：sglang/python/sglang/srt/mem_cache/unified_radix_cache.py L82-L115
@@ -380,7 +427,7 @@ class TreeNode:
         """Tree-level: Full KV not on device (non-root with value=None)."""
 ```
 
-初读时可以把 Unified 当作 classic tree 的扩展，不要一开始就把 HiCache、SWA、Mamba 全部展开。先掌握 classic 主线，再看多 component 如何改变 lock 和 evict。
+初读时可以把 Unified 当作 classic key/tree 语义的扩展，但不能把它理解成“给 classic node 多放几个 value”这么简单：它还区分 best device match 与 best device-or-host match、component consensus、device/host 两套锁、Full leaf set、aux LRU、tombstone、session 和异步 D↔H/storage 生命周期。
 
 ---
 

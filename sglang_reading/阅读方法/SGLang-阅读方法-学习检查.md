@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 
 # 阅读方法 · 学习检查
@@ -24,6 +24,8 @@ updated: 2026-07-10
 - [ ] 能画出配置与入口、请求调度、模型执行、内存与算子之间的边界。
 - [ ] 能说明 `cli/main.py`、`cli/serve.py`、`launch_server.run_server` 分别承担什么职责。
 - [ ] 能沿 `sglang serve --model-path M` 追到 HTTP 默认入口，并指出 gRPC、Ray、Encoder 模式在哪里分叉。
+- [ ] 能说明 `sglang serve` 是推荐 CLI 而非唯一入口，并区分 diffusion parser 与 SRT `ServerArgs`。
+- [ ] 能说明 `lang.api.Engine`、包级 `sglang.Engine` 最终指向同一个 SRT Engine 实现。
 - [ ] 读到一个结论时，能区分“已有源码证据”“需要继续验证的假设”和“仅用于理解的类比”。
 
 ## 最小验证

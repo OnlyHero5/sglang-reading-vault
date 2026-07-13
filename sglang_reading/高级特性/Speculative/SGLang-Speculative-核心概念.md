@@ -33,9 +33,12 @@ stateDiagram-v2
   SelectWorker --> NgramMatch: NGRAM
   Draft --> Verify: 写 batch.spec_info
   NgramMatch --> Verify: 构造 NgramVerifyInput
-  Verify --> Sample: target logits
-  Sample --> CommitKV: predict accept_lens accept_index
-  CommitKV --> Scheduler: GenerationBatchResult
+  Verify --> TreeAccept: EAGLE family / NGRAM
+  Verify --> BlockAccept: DFLASH
+  TreeAccept --> ConditionalKV: predict / accept_lens / accept_index
+  BlockAccept --> DFlashCommit: out_tokens / commit_lens
+  ConditionalKV --> Scheduler: GenerationBatchResult
+  DFlashCommit --> Scheduler: GenerationBatchResult
 ```
 
 这个模型有四本账。
@@ -53,7 +56,7 @@ stateDiagram-v2
 
 系统压力：投机算法既有内置实现，也允许插件扩展。Scheduler 不能在每个调用点写一串字符串分支，否则新增算法会污染调度层。
 
-源码把算法名统一成一个 duck-typed 对象：内置算法是 enum，插件算法来自 registry，但它们都暴露 `is_*` 和 `create_worker` 语义。
+源码把算法名统一成一个 duck-typed 对象：内置算法是 enum，插件算法来自 registry，调度所依赖的主接口是 `is_*`、`supports_*` 和 `create_worker`。边界是：注册期的一致性检查只枚举名字以 `is_` 或 `supports_` 开头的方法，并不证明插件实现了内置 enum 的每个辅助能力方法；插件若被新调用点要求 `need_topk` 或 `carries_draft_hidden_states`，仍可能在运行期暴露接口缺口。
 
 ```python
 # 来源：python/sglang/srt/speculative/spec_info.py L28-L57
@@ -206,9 +209,9 @@ class SpecInput(ABC):
 
 因此 PD 部署下看到 hidden transfer 问题，优先查 EAGLE family；看到 NGRAM 性能问题，优先查 corpus match、verify 成本和 accept rate，而不是 draft model。
 
-## 验收账：返回给 Scheduler 的长度包含 bonus token
+## 验收账：共同的是调度结果，不是验收函数
 
-target verify 不是简单判断“draft token 对不对”。它要输出三样东西：
+EAGLE family 与 NGRAM 的 tree verify 会在内部形成三样东西：
 
 | 字段 | 含义 | 谁消费 |
 |------|------|--------|
@@ -216,13 +219,15 @@ target verify 不是简单判断“draft token 对不对”。它要输出三样
 | `accept_index` | 被接受 token 在 verify block 中的位置 | KV mover、logprob 计算 |
 | `accept_lens` | 每个请求本轮向前推进几个 token | Scheduler、新 seq_lens |
 
-注意 `accept_lens` 包含 trailing bonus token；而 `move_accept_tokens_to_target_kvcache` 的 `num_correct_drafts` 参数只接收 draft 命中数量，所以调用者会传 `accept_lens - 1`。这不是 off-by-one，而是两个消费者对“长度”的语义不同。
+其中 `accept_lens` 包含 trailing bonus token；通用 KV mover 的 `num_correct_drafts` 参数只接收 draft 命中数量，所以 EAGLE `topk > 1` 与 NGRAM 调用者传 `accept_lens - 1`。EAGLE `topk == 1` 的 accepted chain 已位于每请求块前部，跳过 mover；DFLASH 则按固定 block 计算 `commit_lens/out_tokens`，不调用 `eagle_sample`，也没有这套 `accept_index → 通用 mover` 内部契约。
+
+真正跨算法稳定的是交回 Scheduler 的结果语义：本轮输出 token、每请求推进长度、新序列长度和下一轮内部输入必须彼此一致。把“共同结果契约”误读成“共同函数调用”，会让 DFLASH、EAGLE 单链和树状 EAGLE 的排障入口全部错位。
 
 ## 读者抓手
 
 首次阅读时，不要按文件名背诵。按这条链路复述：
 
-`ServerArgs` 选算法 → worker 工厂包住 target worker → draft 或 corpus match 提候选 → `SpecInput` 改写 batch 阶段 → target verify 得 logits → sampling 得 `predict/accept_lens/accept_index` → KV mover 并入主链 → `GenerationBatchResult` 回 Scheduler。
+`ServerArgs` 选算法 → worker 工厂包住 target worker → draft model、corpus match 或 DFLASH block 提候选 → `SpecInput` 改写 batch 阶段 → target verify 得 logits → 算法专用验收与提交 → `GenerationBatchResult` 回 Scheduler。
 
 排障时，从症状反推账本：
 
@@ -230,16 +235,16 @@ target verify 不是简单判断“draft token 对不对”。它要输出三样
 |------|----------|----------|
 | 启动失败 | 控制账 | `SpeculativeAlgorithm.from_string`、`CustomSpecAlgo.create_worker` |
 | Attention mask 或 padding 异常 | 阶段账 | `SpecInputType`、具体 `VerifyInput` |
-| KV 越界或 topk 输出错位 | KV 账 | `move_accept_tokens_to_target_kvcache` |
-| TP rank 结果不一致 | 验收账 | `eagle_sample` 的 broadcast |
-| accept rate 低且吞吐下降 | 验收账 | `accept_lens`、adaptive controller、draft 步数 |
+| KV 越界或 topk 输出错位 | KV 账 | EAGLE `_finalize_accept_tree_path`、NGRAM mover、DFLASH commit 分支 |
+| TP rank 结果不一致 | 验收账 | `eagle_sample` stochastic branch 的 broadcast 条件 |
+| accept rate 低且吞吐下降 | 验收账 | `accept_lens`、EAGLE adaptive controller、draft 步数 |
 
 ## 运行验证
 
 投机解码先从控制账和验收账验证。下面的检索覆盖算法枚举、插件式自定义算法、阶段输入、NGRAM 特例、EAGLE 采样返回的 `accept_index` 与 bonus token 语义。
 
 ```powershell
-rg -n 'SpeculativeAlgorithm|SpecInputType|class SpecInput|NGRAM|CustomSpecAlgo|create_worker|accept_lens|accept_index|bonus_tokens|eagle_sample|num_correct_drafts' sglang/python/sglang/srt/speculative/spec_info.py sglang/python/sglang/srt/speculative/spec_registry.py sglang/python/sglang/srt/speculative/eagle_utils.py
+rg -n 'SpeculativeAlgorithm|SpecInputType|class SpecInput|NGRAM|CustomSpecAlgo|create_worker|accept_lens|accept_index|bonus_tokens|eagle_sample|num_correct_drafts|commit_lens|compute_dflash' sglang/python/sglang/srt/speculative/spec_info.py sglang/python/sglang/srt/speculative/spec_registry.py sglang/python/sglang/srt/speculative/eagle_utils.py sglang/python/sglang/srt/speculative/dflash_worker_v2.py
 ```
 
-读输出时先看 `SpeculativeAlgorithm.from_string/create_worker`，确认算法名会选出不同 worker；再看 `SpecInputType`，确认 batch 当前处在 draft 还是 verify；最后看 `eagle_sample` 的返回值，确认 `num_correct_drafts + 1` 才对应包含 bonus token 的推进长度。
+读输出时先看 `SpeculativeAlgorithm.from_string/create_worker`，确认算法名会选出不同 worker；再看 `SpecInputType`，确认 batch 当前处在 draft 还是 verify；最后把 EAGLE/NGRAM 的 `num_correct_drafts + 1` 与 DFLASH 的 `commit_lens = accept_len + 1` 对照起来。两者都把 bonus 算进推进长度，但内部验收结构并不相同。

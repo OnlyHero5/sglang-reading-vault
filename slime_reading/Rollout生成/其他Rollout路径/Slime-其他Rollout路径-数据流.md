@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 其他Rollout路径 · 数据流
 
@@ -38,7 +38,7 @@ flowchart LR
 | 路径 | Sample 从哪里来 | 出口形状 | 关键风险 |
 |------|-----------------|----------|----------|
 | 默认 RL | SGLang 完整 JSON | `RolloutFnTrainOutput.samples` | filter/drop/abort 水位 |
-| fully-async | 后台 worker output queue | 裸 `list[list[Sample]]` 后被包装 | queue 不增长、ABORTED 回灌 |
+| fully-async | 后台 worker output queue | 裸 `list[list[Sample]]` 后被包装 | queue 不增长、异常丢组、超额 drain 丢组 |
 | streaming | SSE chunk 写入同一个 Sample | 仍走默认 rollout 输出 | cumulative SSE 假设 |
 | SFT | messages 生成 tokens/loss mask | 裸 samples 后被包装 | response_length 与 mask 不对齐 |
 | OPD | teacher server logprob | 写入已有 Sample | teacher logprob 长度不对齐 |
@@ -105,6 +105,7 @@ sequenceDiagram
 - DataSource 在 fully-async 下同时是取样口和 ABORTED 回灌口。
 - output queue 只放正常完成 group。
 - `gid` 是 worker 内顺序号，最终交给训练前还会按 `sample.index` 排序。
+- 完成队列不是可靠队列：callback 异常路径会丢组；有界队列满时阻塞 event loop；前台一次 drain 全部完成项后只返回 target，多余项不会回队列。
 
 ```python
 # 来源：slime/rollout/fully_async_rollout.py L182-L189
@@ -133,8 +134,10 @@ flowchart TB
 
 源码里的 snapshot 是为了处理 SGLang cumulative streaming：每个 chunk 代表“本次调用到目前为止的完整输出”，所以不能简单 append chunk delta。
 
+如果 server 改成 incremental streaming，这条 reset+append 流会只保留最新 delta；如果 chunk 没有 `output_token_logprobs`，文本流仍可能前进而 token 流为空。两种情况都要求在集成测试中同时比较 text、tokens、logprobs 和 response_length。
+
 ```python
-# 来源：slime/rollout/sglang_streaming_rollout.py L91-L105
+# 定位骨架（非逐行摘录）：slime/rollout/sglang_streaming_rollout.py L91-L105
     # Snapshot pre-call sample state. sglang's SSE chunks are cumulative
     # *within this call*; on each chunk we rebuild the post-call view of the
     # sample = prior state + chunk delta. That way a mid-stream break leaves
@@ -165,8 +168,10 @@ flowchart LR
 
 测试从读者角度说明了契约：assistant 内容应该出现在被 mask 的 response 尾部，user/system 内容不应该进入 SFT loss。
 
+测试没有覆盖 `response_length=0`。此时当前 `loss_mask[-response_length:]` 实际返回完整 mask，因此数据流必须要求至少存在一个可训练 assistant span，不能把零长度当作天然空尾部。
+
 ```python
-# 来源：tests/gemma4/test_gemma4_sft_rollout.py L45-L64
+# 定位骨架（非逐行摘录）：tests/gemma4/test_gemma4_sft_rollout.py L45-L64
 def test_tokens_full_mask_is_tail():
     messages = [
         {"role": "system", "content": "You are helpful."},
@@ -211,6 +216,8 @@ flowchart LR
         sample.teacher_log_probs = t_log_probs
 ```
 
+这条流没有长度门禁：teacher 返回过短会静默留下短 tensor，零 response 会因 `[-0:]` 留下完整 tensor。训练前应验证每条 `teacher_log_probs` 长度与 response token 数完全相等。
+
 ## forge load 的对象流
 
 forge load 直接从磁盘构造 Sample。它和 `load_debug_rollout_data` 的区别在系统边界：forge 不把 serving 关闭，因此可用于测量 server 与训练并存时的资源。
@@ -225,7 +232,7 @@ flowchart LR
 ```
 
 ```python
-# 来源：slime/rollout/forge_load.py L69-L91
+# 定位骨架（非逐行摘录）：slime/rollout/forge_load.py L69-L91
 def generate_rollout(args, rollout_id, data_source, evaluation: bool = False):
     path = _resolve_path(args, rollout_id, evaluation)
 
@@ -256,7 +263,7 @@ def generate_rollout(args, rollout_id, data_source, evaluation: bool = False):
 | plugin contracts | `tests/plugin_contracts` | 函数签名和返回形状 | 不验证真实吞吐 |
 
 ```python
-# 来源：tests/test_qwen2.5_0.5B_fully_async_short.py L30-L39
+# 定位骨架（非逐行摘录）：tests/test_qwen2.5_0.5B_fully_async_short.py L30-L39
     rollout_args = (
         # The only line that differs from test_qwen2.5_0.5B_async_short.py:
         # use the public fully-async rollout function.
@@ -269,7 +276,7 @@ def generate_rollout(args, rollout_id, data_source, evaluation: bool = False):
 ```
 
 ```python
-# 来源：tests/test_qwen3_4B_streaming_partial_rollout.py L34-L50
+# 定位骨架（非逐行摘录）：tests/test_qwen3_4B_streaming_partial_rollout.py L34-L50
     rollout_args = (
         # Streaming generate at the per-sample level — the outer rollout
         # loop is still the stock sglang one (semaphore, abort orchestration).

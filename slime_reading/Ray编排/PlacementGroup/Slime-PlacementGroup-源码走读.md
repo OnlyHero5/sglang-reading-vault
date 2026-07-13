@@ -9,13 +9,13 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # PlacementGroup · 源码走读
 
 这篇追踪一条真实启动路径：`train.py` 拿到最终 args 后，先生成 PG 资源座位表，再创建 RolloutManager，最后创建 actor/critic RayTrainGroup。
 
-读完后，你应该能解释：资源为什么卡在 PG ready、为什么要用 InfoActor 探测、为什么 rollout 只是 actor 视图的切片、为什么 colocate 和 external 的 GPU 数不能按直觉相加。
+读完后，你应该能解释：资源为什么卡在 PG ready、为什么要用 InfoActor 探测、为什么 rollout 视图来自同一重排列表的切片、为什么 colocate 和 external 的 GPU 数不能按直觉相加。
 
 ## 长文读法
 
@@ -27,8 +27,8 @@ updated: 2026-07-10
 | 排查 GPU 数不符合直觉 | 步骤一 | colocate 取 max，external 只申请 actor，debug 模式会重写布局 |
 | 排查 PG ready 卡住 | 步骤二 | ready 轮询会周期性打印 Ray 注册和可用 GPU 数 |
 | 理解 InfoActor | 步骤三到四 | InfoActor 是为了拿真实节点/GPU id，再按稳定规则重排 bundle |
-| 排查 actor/rollout 绑卡 | 步骤五到八 | actor 用 actor slice，rollout 用 rollout slice；rollout actor 本身只占少量 Ray GPU 资源 |
-| 排查 init 顺序 | 步骤九到十 | RolloutManager 先于 train models 创建，actor/critic init 后再接 rollout manager |
+| 排查 actor/critic/rollout 绑卡 | 步骤五到八 | actor/critic 复用前缀，rollout 从 offset 开始；0.4/0.2 是 Ray accounting，不是显存切片 |
+| 排查 init 顺序 | 步骤九 | RolloutManager 先于 train models 创建，actor/critic init 后再接 rollout manager |
 
 读的时候不要把“申请了多少 GPU”和“某个组件实际使用哪段 GPU”混在一起。前者由 layout 决定，后者由 slice 和 bundle index 决定。
 
@@ -85,7 +85,7 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
 执行逻辑：
 
 - 普通分离：申请 actor + rollout，rollout 从 actor 后面开始。
-- colocate：申请两者最大值，rollout 从 0 开始，表示共享。
+- colocate：申请两者最大值，rollout 从 0 开始；真实共享范围是共同前缀。
 - external：只申请 actor，rollout offset 等于 actor 数，切出来为空。
 - debug rollout only：只申请 rollout。
 - zero rollout：普通分离下 rollout 视图为空，但 actor 仍保留。
@@ -247,6 +247,7 @@ def create_placement_groups(args):
 
     num_gpus, rollout_offset = _get_placement_group_layout(args)
 
+    logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
@@ -266,7 +267,8 @@ def create_placement_groups(args):
 - `pgs["actor"]` 总是从 logical 0 开始。
 - `pgs["rollout"]` 从 `rollout_offset` 开始。
 - external 普通训练中 rollout 视图为空，但 external server 仍可被 HTTP 控制。
-- critic 视图等于 actor 视图，不会单独申请 PG。
+- critic 视图等于 actor 视图，不会单独申请 PG；参数校验也把 critic GPU 数强制等于 actor。
+- colocate 时两侧从 0 开始，但只在前 `min(A,R)` 个 slot 重叠，较大一侧有独占后缀。
 
 ## 步骤六：RolloutManager 是控制面，不占 GPU
 
@@ -365,7 +367,7 @@ for i in range(len(self.all_engines)):
 设计选择：RayTrainGroup 解包 actor PG 三元组，每个 rank 用 `PlacementGroupSchedulingStrategy` 绑定到 `reordered_bundle_indices[rank]`。
 
 ```python
-# 来源：slime/ray/actor_group.py L48-L116
+# 来源：slime/ray/actor_group.py L48-L62
 def _allocate_gpus_for_actor(self, pg, num_gpus_per_actor):
     world_size = self._num_nodes * self._num_gpus_per_node
 
@@ -407,16 +409,16 @@ for rank in range(world_size):
     ).remote(world_size, rank, master_addr, master_port)
 ```
 
-注意：`ray.remote(**actor_options)` 先声明 actor 类默认资源，`TrainRayActor.options(num_gpus=num_gpus_per_actor)` 在每个 rank 创建时覆盖调度份额。当前调用方给 `num_gpus_per_actor=0.4`。
+注意：`ray.remote(**actor_options)` 先声明 actor 类默认资源，`TrainRayActor.options(num_gpus=num_gpus_per_actor)` 在每个 rank 创建时覆盖调度份额。当前调用方给 `num_gpus_per_actor=0.4`；SGLang engine control actor 使用 0.2。它们是 Ray admission accounting，Slime 同时设置 NOSET visible-device 环境变量，实际模型仍会看见并使用整张目标设备。PPO 下 actor 0.4 + critic 0.4 + colocated rollout control actor 0.2 恰好可落在同一 bundle，但显存安全仍依赖 offload。
 
-## 步骤九：create_training_models 对齐 actor/critic start rollout id
+## 步骤九：create_training_models 选择 start rollout id，但不交叉校验 actor/critic
 
-系统压力：resume 时 actor/critic 每个 rank 必须从同一个 rollout id 继续，否则数据游标和 checkpoint 会错位。
+系统压力：resume 时 actor/critic 的恢复点若不一致，数据游标和 checkpoint 可能错位；因此必须看清代码究竟校验了什么。
 
-设计选择：先按角色解析 args 并创建 RayTrainGroup，再分别 `async_init`，检查返回 rollout id 集合大小为 1。启用 critic 时，当前逻辑采用 critic 返回的 id。
+设计选择：先按角色解析 args 并创建 RayTrainGroup，再分别 `async_init`。启用 critic 时只把 critic 返回列表赋给 `start_rollout_ids`，随后检查该列表内部集合大小为 1；actor 返回列表没有与 critic 比较。
 
 ```python
-# 来源：slime/ray/placement_group.py L152-L217
+# 来源：slime/ray/placement_group.py L152-L168
 def create_training_models(args, pgs, rollout_manager, actor_cls=None):
     actor_args = args
     if args.megatron_config_path is not None:
@@ -469,9 +471,11 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
     return actor_model, critic_model
 ```
 
-不变量：
+真实边界：
 
-- `async_init` 返回的 rollout ids 必须一致。
+- 无 critic 时，actor 各 rank 的 ids 必须一致。
+- 有 critic 时，critic 各 rank 的 ids 必须一致；actor ids 在这条 assert 中未被检查，更没有 actor/critic 交叉比较。
+- 显式 `start_rollout_id` 只阻止自动写回，不改变上述检查范围。
 - `rollout_manager` 创建必须早于 training models。
 - `rollout_global_dataset` 要等 `start_rollout_id` 决定后再 load。
 
@@ -480,12 +484,14 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
 布局矩阵：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_placement_group.py -q
 ```
 
 角色配置和参数校验：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/utils/test_megatron_role_config.py -q
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
@@ -495,6 +501,8 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 - `test_placement_group_layout` 覆盖 normal、debug、colocate、external、zero rollout。
 - role config 测试证明 `create_training_models` 会把 actor override 应用到 actor args。
 - argument validation 测试证明 colocate 自动打开 offload，并拒绝 delta weight update。
+
+环境分级：当前环境中参数校验 14 项实跑通过；placement 测试因缺 `ray`、role-config 测试因缺 `sglang/ray` 无法 collection。作为静态替代，从当前 `placement_group.py` AST 抽取布局函数执行测试文件同款 10 个 case，全部通过。真实 PG ready、InfoActor 探测和 fractional actor 共席仍需 Ray 集群验证。
 
 ## 复盘迁移
 

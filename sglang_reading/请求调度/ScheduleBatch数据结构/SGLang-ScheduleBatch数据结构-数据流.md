@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ScheduleBatch数据结构 · 数据流
 
@@ -21,13 +21,14 @@ updated: 2026-07-10
 
 ---
 
-## 总览：三条边界
+## 总览：四条边界、三种回程
 
 ```mermaid
 flowchart TB
     subgraph "TokenizerManager 进程"
         G["GenerateReqInput"]
         TG["TokenizedGenerateReqInput"]
+        TMOUT["请求结果聚合"]
     end
 
     subgraph "Scheduler 进程"
@@ -42,7 +43,7 @@ flowchart TB
     end
 
     subgraph "Detokenizer 进程"
-        SO["BatchStrOutput"]
+        SO["BatchStrOutput<br/>文本增量"]
     end
 
     G --> TG
@@ -50,12 +51,17 @@ flowchart TB
     R --> SB
     SB --> FB --> MR
     SB --> TO
-    TO -->|"ZMQ / msgpack"| SO
+    TO -->|"正常生成"| SO
+    TO -->|"skip-tokenizer-init"| TMOUT
+    SO --> TMOUT
 ```
+
+图中 embedding 输出没有硬塞进 token→string 链：`BatchEmbeddingOutput` 虽会经过 Detokenizer 进程的 dispatcher，但 handler 原样返回，因为 embedding 不需要字符串解码。于是回程实际上有三种：普通生成经 Detokenizer 产出 `BatchStrOutput`；skip-tokenizer 生成直接把 `BatchTokenIDOutput` 发给 TokenizerManager；embedding 以 `BatchEmbeddingOutput` 原样回传。
 
 | 边界 | 输入 | 输出 | 关键问题 |
 |------|------|------|----------|
 | API 到 IPC | `GenerateReqInput` | `TokenizedGenerateReqInput` | 宽松字段如何被规范化 |
+| Scheduler 进程内 | `Req` | `ScheduleBatch` | 单请求生命周期如何组成可变批次 |
 | Scheduler 到 ModelRunner | `ScheduleBatch` | `ForwardBatch` | 哪些张量进入 forward |
 | Scheduler 到 Detokenizer | `BatchTokenIDOutput` | `BatchStrOutput` | token 级输出何时变成字符串 |
 
@@ -126,9 +132,9 @@ Scheduler 内部有两层对象：
 | 对象 | 粒度 | 生命周期 |
 |------|------|----------|
 | `Req` | 单请求 | 从进入 Scheduler 到完成、abort 或 retract |
-| `ScheduleBatch` | 一次 forward 的请求集合 | prefill 或 decode 前创建、过滤、合并、准备张量 |
+| `ScheduleBatch` | 一批请求的可变调度工作台 | 新 prefill 等批次可按轮创建；`running_batch` 可跨多轮 decode 原地过滤、合并、prepare |
 
-`Req` 的状态会随着 decode 轮次变化。`ScheduleBatch` 则把多个 `Req` 暂时排成一个可执行批次。
+`Req` 的状态会随着 decode 轮次变化。`ScheduleBatch` 把多个 `Req` 排成可执行批次，但 running batch 本身也有跨轮身份：一次 decode 完成后，它通常不是被丢弃重建，而是过滤完成请求、合并新 prefill 请求、再为下一轮 prepare。开启 overlap 时，结果处理需要的则是一个受限浅拷贝，避免原 batch 继续 filter/merge 后破坏上一轮结果的请求顺序。
 
 ```mermaid
 stateDiagram-v2
@@ -196,7 +202,7 @@ stateDiagram-v2
 
 ## 边界三：ScheduleBatch 到 ForwardBatch
 
-`ForwardBatch` 是 ModelRunner 的输入快照。`ScheduleBatch` 中许多字段不会进入它，比如 `batch_is_full`、`chunked_req`、prefill stats。进入它的是 forward 必需张量和少量标志。
+`ForwardBatch` 是 ModelRunner 的本轮执行视图。`ScheduleBatch` 中许多字段不会进入它，比如 `batch_is_full`、`chunked_req`、prefill stats。进入它的是 forward 必需张量和少量标志；其中部分张量按引用借用，positions 等字段在构造时派生，三项 one-shot override 则被消费并在原 `ScheduleBatch` 上复位。
 
 ```python
 # 来源：python/sglang/srt/model_executor/forward_batch_info.py L640-L646
@@ -246,13 +252,13 @@ extend 模式下，`ForwardBatch` 会把 host list 转成 device tensor，并计
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 ```
 
-读者抓手：如果 attention metadata、position、extend length 异常，不要只查 ModelRunner。先确认 `ScheduleBatch.prepare_for_extend` 或 `prepare_for_decode` 是否已经给出正确 mode 和长度。
+读者抓手：如果 attention metadata、position、extend length 异常，不要只查 ModelRunner。先确认 `ScheduleBatch.prepare_for_extend` 或 `prepare_for_decode` 是否已经给出正确 mode 和长度；如果 hidden-state capture 或 CPU seq-lens cache 只在某一轮异常，还要检查 one-shot override 是否在预期的 `init_new` 被消费，调用方是否错误地期待它跨轮保留。
 
 ---
 
 ## 边界四：Scheduler 到 Detokenizer
 
-输出方向同样分层。`BatchTokenIDOutput` 是 Scheduler 的 token 级输出；它包含 finish reason、增量 decode ids、read offsets、logprob、hidden states 等。
+输出方向同样分层。`BatchTokenIDOutput` 是 Scheduler 的 token 级输出，但“token 级”不等于里面只有一种 token 增量：`decode_ids` 是 Detokenizer 续接 surrounding/read 上下文的窗口片段，`output_ids` 才是按客户端发送偏移切出的 output-token 增量。
 
 ```python
 # 来源：python/sglang/srt/managers/io_struct.py L1194-L1203
@@ -268,7 +274,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Detokenization configs
 ```
 
-`BatchStrOutput` 是 Detokenizer 转换后的字符串级输出，保留同样的 `rids` 顺序。
+`BatchStrOutput` 是 Detokenizer 转换后的字符串级输出，保留同样的 `rids` 顺序，并把 `output_ids` 一并透传。`output_strs` 通过每个 rid 的持久 `DecodeStatus`、`surr_offset`、`read_offset` 计算，所以不能用 `decode_ids` 直接逐包 `tokenizer.decode()` 来替代。
 
 ```python
 # 来源：python/sglang/srt/managers/io_struct.py L1276-L1283
@@ -281,7 +287,24 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_ids: Optional[List[array]]
 ```
 
-读者抓手：排查流式乱码、UTF-8 截断、stop string 裁剪时，入口是 Detokenizer；排查 token 采样、finish reason、logprob 时，入口是 Scheduler 输出聚合。
+```python
+# 来源：python/sglang/srt/managers/scheduler_components/ipc_channels.py L52-L64
+            send_to_tokenizer_raw = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+            if skip_tokenizer_init:
+                # Directly send to the TokenizerManager
+                send_to_detokenizer_raw = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                )
+            else:
+                # Send to the DetokenizerManager
+                send_to_detokenizer_raw = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                )
+```
+
+读者抓手：排查流式乱码、UTF-8 截断、stop string 裁剪时，入口是 Detokenizer；排查 token 采样、finish reason、logprob 时，入口是 Scheduler 输出聚合；如果启用了 `skip_tokenizer_init`，没有 `BatchStrOutput` 是预期拓扑，不是 Detokenizer 丢包。
 
 ---
 
@@ -345,18 +368,22 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 | prefill 组包 | `Req` 到 `ScheduleBatch` | `get_new_batch_prefill` | waiting queue 减少，`prefix_lens` 和 `extend_lens` 生成 |
 | decode 推进 | running `ScheduleBatch` | `update_running_batch` | 完成请求被过滤，剩余请求 `seq_lens` 加一 |
 | forward 执行 | `ScheduleBatch` 到 `ForwardBatch` | `ForwardBatch.init_new` | `positions`、`seq_lens`、`out_cache_loc` 准备好 |
-| token 输出 | `BatchTokenIDOutput` | `SchedulerOutputStreamer.to_payload` | 每个 `rid` 有对应 token 增量和 finish reason |
+| token 输出 | `BatchTokenIDOutput` | `SchedulerOutputStreamer.to_payload` | 每个 `rid` 的 detokenize 窗口、output-token 增量和 finish reason 对齐 |
 | 字符串输出 | `BatchStrOutput` | `DetokenizerManager.handle_batch_token_id_out` | `output_strs` 与 `rids` 同顺序 |
+| skip-tokenizer 回程 | `BatchTokenIDOutput` | `SchedulerIpcChannels.create` | 直接进入 TokenizerManager，不产生 `output_strs` |
+| embedding 回程 | `BatchEmbeddingOutput` | `handle_batch_embedding_out` | 不做字符串 detokenize，载荷原样返回 |
 
 ---
 
 ## 验证方式
 
-调试时可以加四个断点或临时日志：
+调试时可以加六个断点或临时日志：
 
 1. `TokenizerManager._send_one_request`：确认 `TokenizedGenerateReqInput.wrap_pickle_fields()` 已执行。
 2. `Scheduler.handle_generate_request`：确认 `Req` 已接住 `rid`、token ids、sampling params、embedding 覆盖。
 3. `ScheduleBatch.prepare_for_extend`：确认 `prefix_lens[i] + extend_lens[i] == seq_lens[i]`。
 4. `ForwardBatch.init_new`：确认 decode 模式下 `extend_seq_lens` 为空，extend 模式下存在。
+5. `ForwardBatch.init_new` 前后：确认 `capture_hidden_mode`、`seq_lens_cpu_cache`、`return_hidden_states_before_norm` 在构造后复位。
+6. `SchedulerOutputStreamer.accept`：同时记录 `decode_ids`、`output_ids`、`read_offset`；正常路径再在 Detokenizer 记录 `output_strs`。
 
 如果其中任意一步不成立，先不要看 kernel；问题通常还在数据契约或 batch 对齐层。

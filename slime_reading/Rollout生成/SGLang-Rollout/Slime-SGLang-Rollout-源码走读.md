@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang-Rollout · 源码走读
 
@@ -22,7 +22,7 @@ updated: 2026-07-10
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
 | 首次建立训练 rollout 主线 | 贯穿场景、步骤一到二 | Ray actor 边界是同步函数，默认 rollout 内部才进入 async 生成循环 |
-| 排查 batch 不足或 dynamic filter 丢太多 | 步骤三到四 | `remaining_batch_size` 管已提交水位，真正保留数量由 dynamic filter 后的 `data` 决定 |
+| 排查 batch 不足或 dynamic filter 丢太多 | 步骤三到四 | `remaining_batch_size` 记未被 filter 否决的已提交容量，不是 pending 数；真正保留数量由 `data` 决定 |
 | 排查 group / sample 并发形状 | 步骤五到六 | 外层一个 task 对应一个 prompt group，组内每个 `Sample` 再独立 generate 和 reward |
 | 排查 SGLang 请求字段 | 步骤七 | 文本、多模态、session routing、logprob、top-p replay、routed experts 都在 payload / meta_info 边界上 |
 | 排查 Sample 账本和训练字段 | 步骤八 | `append_response_tokens` 后要保持 token、logprob、loss mask、top-p offsets、finish status 长度一致 |
@@ -83,7 +83,7 @@ sequenceDiagram
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L650-L653
+# 定位骨架（据 `slime/ray/rollout.py` L650-L653 补充 debug 分支上下文）：
         if self.args.load_debug_rollout_data:
             data = self._load_debug_rollout_data(rollout_id)
         else:
@@ -125,6 +125,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
 
 - 函数签名必须与默认 `generate_rollout(args, rollout_id, data_source, evaluation=False)` 对齐。
 - 返回裸 list 只能表达 samples，无法附带 metrics。
+- `call_rollout_fn` 只按外层类型包装，不验证 train/eval dataclass 是否与 `evaluation` 一致，也不验证 payload shape；错误类型会晚到 `.samples`/`.data` 消费处失败。
 - eval 路径的 data 字典必须包含后续 logging 所需字段。
 
 ## 步骤二：同步入口只负责分派和回灌
@@ -223,9 +224,11 @@ def generate_rollout(
 
 不变量与失败模式：
 
-- `state.reset()` 必须在一轮结束后执行，否则 abort 标志和 pending 集合会污染下一轮。
+- `GenerateState` 是真正的进程级单例，第一次 args 决定 tokenizer、processor、semaphore 和采样模板；后续构造不会自动重跑 `__init__`。
+- `state.reset()` 必须在一轮结束后执行，但它只清空 pending 集合引用，不取消 task；调用前必须已由 abort drain。
 - custom generate 仍在 semaphore 内执行，不能绕开并发闸门。
 - 如果请求 top-p replay，custom generate 也要维护对应的 Sample 字段不变量。
+- `dp_rank_context()` 只维护进程内 `state.dp_rank`/计数；默认 HTTP payload 与 header 不携带该 rank，不能据此推断请求已定向某个 DP worker。
 
 ## 步骤四：async 主循环维护有效 batch 水位
 
@@ -295,14 +298,17 @@ def generate_rollout(
 
 - 外层循环直到 `len(data)` 达到 `rollout_batch_size`。
 - 内层循环按 `over_sampling_batch_size` 从 DataSource 补样。
-- `FIRST_COMPLETED` 让完成一个 group 就立刻处理。
+- `FIRST_COMPLETED` 让至少一个 group 完成后立刻处理；同一轮 `done` 可能含多个已完成 task。
 - filter drop 后降低 `remaining_batch_size`，触发继续补样。
 - filter 前所有完成 group 进入 `all_data`，有效 group 进入 `data`。
+
+`remaining_batch_size` 的准确含义是“已提交且尚未被 filter 否决的容量”。keep 后它不下降，因此同时包含已进入 `data` 的 group 和仍 pending 的 group；它不是 `len(state.pendings)` 的别名。
 
 不变量与失败模式：
 
 - `group` 长度必须等于 `n_samples_per_prompt`。
 - dynamic filter 丢弃的 group 默认不会写回 buffer。
+- 同一批 `done` 中若目标已被前面的 keep group 填满，后续 keep group 只进入 `all_data`，同样不会自动写回 buffer。
 - 如果 filter 过严且 DataSource 持续提供不可通过样本，主循环可能长时间补样。
 
 ## 步骤五：按 group 提交任务，组内再并发 sample
@@ -368,7 +374,7 @@ def generate_rollout(
 不变量与失败模式：
 
 - `group_rm=True` 不支持 eval rollout。
-- custom generate fan-out 后 group 形状可能成为 `list[list[Sample]]`，上游排序和日志已做兼容，但 dynamic filter 是否支持要看实现。
+- custom generate fan-out 后 group 形状可能成为 `list[list[Sample]]`，日志和最终排序只对首元素做了有限兼容；dynamic filter、group RM 赋 reward、partial abort 和 hook 是否支持必须分别核对。当前 group RM 循环会把内层 list 当作 Sample 设置 `.reward`，并非端到端闭合。
 - session id 缺失时自动生成，已有 session id 会保留。
 
 ## 步骤六：单 sample 路径处理扩展优先级和 RM
@@ -452,6 +458,7 @@ def generate_rollout(
 - custom generate 必须是 async callable。
 - group RM 模式不能在单 sample 层提前写 reward。
 - custom generate 如果返回 list，所有 sibling 的字段也要满足 Sample 合约。
+- 现有 contract test 只证明 `generate_and_rm` 在 `group_rm=True` 时能返回 list，没有继续覆盖 `generate_and_rm_group` 的组级 reward、filter 与 abort。
 
 ## 步骤七：默认 HTTP generate 把 Sample 翻译成 SGLang 请求
 
@@ -534,7 +541,7 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
 
 执行逻辑：
 
-- `_prepare_prompt_ids` 优先复用已有 tokens，其次 processor，最后 tokenizer。
+- `_prepare_prompt_ids` 的复用是条件化的：已有 tokens 且“没有有效多模态输入”或“已有 multimodal_train_inputs”时复用；否则有 processor 的多模态路径会重新处理 prompt，最后才是 tokenizer。
 - `return_logprob=True` 固定打开。
 - `use_rollout_routing_replay` 时请求 routed experts。
 - `append_response_tokens` 接收 text、tokens、log_probs 和 meta_info。
@@ -553,7 +560,7 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
 设计选择：`append_response_tokens` 统一维护 response、tokens、response_length、loss_mask、rollout_log_probs 和 meta_info；内部 `_apply_meta_info` 处理 top-p/routing/status。
 
 ```python
-# 来源：slime/utils/types.py L316-L381
+# 定位骨架（据 `slime/utils/types.py` L316-L381 删节）：
     def _apply_meta_info(
         self,
         args,
@@ -637,9 +644,9 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
 执行逻辑：
 
 - top-p offsets 必须和新 token 数对齐。
-- routed experts 需要 args 中的 layer/topk 信息才能 reshape。
+- routed experts 需要 args 中的 layer/topk 信息，并按整条 `tokens` 的 `len(tokens)-1` next-token 坐标 reshape；每次 meta 到来覆盖旧快照，不走 top-p 的增量 merge。
 - `finish_reason` 决定 `COMPLETED`、`TRUNCATED` 或 `ABORTED`。
-- 所有响应侧元数据最后都做长度校验。
+- response 侧 loss mask、logprob 与 top-p offsets 最后做长度校验；routed experts 不在该校验函数中按 `response_length` 检查。
 
 不变量与失败模式：
 
@@ -681,16 +688,19 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
 
 执行逻辑：
 
-- `abort` 释放 serving 资源并 drain pending task。
+- `abort` 向 router 当前 workers 发终止请求并等待 server idle，然后 drain pending task；它不等于卸载模型或释放 serving 进程资源。
 - sorted 恢复按 sample index 的确定性顺序。
-- `rollout_sample_filter_path` 只处理有效样本。
+- `rollout_sample_filter_path` 只处理有效 groups，正式契约是原地设置叶子 Sample 的 `remove_sample`，后续转训练数据时把 loss mask 置零。
 - `rollout_all_samples_process_path` 能看到 filter 前的全部完成样本。
+- 这里传给 all-samples hook 的 `data_source` 是 `generate_rollout_async` 收到的 bound `get_samples` callable，不是拥有 `add_samples` 的完整 DataSource 对象；hook 不能凭参数名假定可直接回灌。
 
 不变量与失败模式：
 
 - `state.reset()` 不能省。
 - `aborted_samples` 返回给同步入口后才会写回 DataSource。
 - hook 修改样本时必须保持 group 形状和 Sample 字段不变量。
+- `rollout_sample_filter_path` 发生在 batch 已凑满且 state reset 之后；它不应删除 group。即使标记 `remove_sample`，该样本仍已参与此前的 group reward/advantage normalization，只在训练 loss 阶段被 mask。
+- partial abort 的回收循环按 leaf 是 Sample 访问 `.response/.metadata`，custom fan-out 的更深嵌套需要额外适配。
 
 ## 步骤十：eval 展开固定数据集，不走训练水位
 
@@ -699,7 +709,7 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
 设计选择：eval 先按数据集并发，再在每个 dataset 内复制 prompt sample、注入 eval metadata/custom path、提交 `generate_and_rm` task。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L561-L582
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L561-L582 删节）：
     for _i, prompt_sample in enumerate(dataset.samples):
         for j in range(dataset_cfg.n_samples_per_eval_prompt):
             # use the same prompt for multiple samples
@@ -736,6 +746,8 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
 - eval 不支持 `group_rm`。
 - eval 不走 dynamic filter 和 oversampling。
 - 不 deepcopy 会让同一 prompt 的多次采样互相覆盖字段。
+- 多个 dataset 用 `results.update()` 按 name 合并，重名会静默覆盖；dataset cache 是进程级全局缓存。
+- 配置 reward key 时，汇总默认假定每条 reward 都是包含该 key 的 dict，否则会在最终列表推导处失败。
 
 ## 运行验证
 
@@ -750,6 +762,6 @@ python -m pytest slime/tests/plugin_contracts/test_plugin_generate_contracts.py 
 预期现象：
 
 - `test_rollout_metrics.py` 覆盖 top-p offset 合并、non-trainable token padding、routed experts 解码、logprob 必填等不变量。
-- plugin generate 契约测试覆盖默认 generate 分支、sample 级 custom generate 优先级、全局 custom generate、fan-out list 返回。
+- plugin generate 契约测试覆盖被 monkeypatch 的默认分支、sample 级 custom generate 优先级、全局 custom generate 和 `generate_and_rm` 的 fan-out list 返回；不覆盖真实 HTTP，也不覆盖 fan-out 进入 group RM/partial abort/filter/hook 的组合。
 
-若测试在 import 阶段失败，先检查 `httpx`、`ray`、`sglang_router`、Torch/NumPy 版本，而不是先怀疑本文主线。
+当前环境的直接结果不是通过：plugin contracts 先因缺 `httpx` collection 失败，最小 stub 后继续缺 `pylatexenc` 并触发 PyArrow/Torch—NumPy ABI 问题；rollout metrics 还缺 `ray`。本轮从当前源码 AST/函数体做 5 项隔离检查并通过：默认 HTTP 未消费 `state.dp_rank`、hook 顺序、eval update 合并、abort 的 Sample-leaf 假设，以及 fan-out + group RM 的真实 AttributeError。完整 router/HTTP/RM/Ray 行为仍需合格环境。

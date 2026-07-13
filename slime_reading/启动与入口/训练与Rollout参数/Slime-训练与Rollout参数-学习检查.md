@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 训练与Rollout参数 · 学习检查
 
@@ -18,12 +18,13 @@ updated: 2026-07-10
 ## 读者能做什么
 
 - [ ] 能区分 `rollout_function_path` 与 `custom_generate_function_path` 的边界。
-- [ ] 能从 `rollout_batch_size`、`n_samples_per_prompt`、`num_steps_per_rollout` 推出 `global_batch_size`。
+- [ ] 能区分 prompt group、rollout execution、Sample 行、global batch 和 micro-batch，并在默认路径中推导 `global_batch_size`。
 - [ ] 能说出 `dynamic_sampling_filter_path`、`rollout_sample_filter_path`、`rollout_all_samples_process_path` 的不同阶段。
 - [ ] 能解释 `custom_rm_path` 在 `group_rm=True` 时签名为什么变成 `(args, samples)`。
 - [ ] 能指出 custom advantage 和 custom loss 的实际消费点。
 - [ ] 能说明 disk/delta weight sync 的四个必要边界。
 - [ ] 能选择应跑的 contract test。
+- [ ] 能说明 contract test 通过为何仍不能证明 custom converter 满足当前 `rollout_ids` 调度契约。
 
 ## 推导题
 
@@ -37,7 +38,7 @@ updated: 2026-07-10
 
 参考答案：
 
-1. `128`。
+1. 默认路径中是每步 `128` 个 rollout execution；不是无条件的 128 条 Sample。compact sibling 共享 id 时，行数可以更多。
 2. `custom_generate_function_path`。
 3. `rollout_function_path`。
 4. `(args, samples)`。
@@ -45,21 +46,23 @@ updated: 2026-07-10
 6. 不合法；delta 必须 disk。
 7. validate 后等于 `rollout_function_path`。
 
-## 必跑验证
+## 运行验证与静态替代
 
 在 `slime/` repo 根目录下优先跑：
 
 ```powershell
+python -m pytest tests/test_dp_schedule.py -q
 python -m pytest tests/plugin_contracts -q
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
 
 预期结果：
 
-- contract tests 固定 path 加载、签名和默认行为。
-- argument validation tests 固定 batch 推导、eval 默认值、delta/disk 约束。
+- DP schedule tests 固定 rollout-id/compact/micro-batch 调度。
+- contract tests 固定 path 加载、部分签名和默认行为，但 custom converter 返回字段覆盖仍落后于当前 scheduler。
+- argument validation tests 固定 HF/AllGather-CP、zero rollout、delta/disk 等边界；当前没有固定 batch 推导或 eval 默认值。
 
-如果缺 `ray`、`httpx`、`sglang` 等依赖，要记录是收集失败还是断言失败。不要把依赖缺失当成源码行为失败。
+当前轻量环境中 DP schedule 9 项和 argument validation 14 项通过；plugin contracts 缺 `httpx`，在 collection 阶段失败。不要把依赖缺失当成源码行为失败，也不要把静态阅读记作运行通过。
 
 ## 下一步
 

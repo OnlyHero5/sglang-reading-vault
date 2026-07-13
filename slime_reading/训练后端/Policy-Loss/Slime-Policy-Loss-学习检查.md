@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Policy-Loss · 学习检查
 
@@ -22,6 +22,10 @@ updated: 2026-07-10
 - [ ] 能说明 CISPO 的 stop-gradient ratio 对梯度路径的影响。
 - [ ] 能解释 TIS 与 ICEPOP 都是同一个 hook 点的不同实现。
 - [ ] 能说明 `loss_function` 三元组如何对接 Megatron。
+- [ ] 能说明 old logprob 缺失时 ratio 为何从 1 起步，以及这不等于 Advantage 阶段已有 shape template。
+- [ ] 能解释 custom TIS 的 modified mask 为什么不会自动重算 `rollout_mask_sums`。
+- [ ] 能说明 custom PG reducer 不会接管 entropy、clipfrac、`ppo_kl` 与 reference KL。
+- [ ] 能区分 entropy“被计算用于日志”和“保存 backward 状态参与梯度”。
 
 ## 源码入口自测
 
@@ -34,11 +38,12 @@ updated: 2026-07-10
 
 ## 可执行验证
 
-- [ ] 运行 `python -m pytest slime/tests/test_cispo_loss.py`，确认 CISPO 数值和梯度路径。
-- [ ] 运行 `python -m pytest slime/tests/test_ppo_logprob_entropy.py`，确认 logprob/entropy 基础路径。
-- [ ] 运行 `python -m pytest slime/tests/test_loss_cp_invariance.py`，确认 CP 相关路径不变性。
-- [ ] 运行 `node maintenance/audit_source_evidence.mjs --note slime_reading/训练后端/Policy-Loss/Slime-Policy-Loss-源码走读.md`，确认源码引用可追踪。
-- [ ] 运行 `node maintenance/audit_wikilinks.mjs`，确认双链无断链。
+- [ ] 从知识库根目录执行 `Set-Location slime`，再运行 `python -m pytest tests/test_cispo_loss.py`，确认 CISPO 数值和梯度路径。
+- [ ] 运行 `python -m pytest tests/test_ppo_logprob_entropy.py`，确认 logprob/entropy 基础路径。
+- [ ] 运行 `python -m pytest tests/test_loss_cp_invariance.py`，确认 CP 相关路径不变性。
+- [ ] 用 `rg -n 'compute_policy_loss|compute_cispo_loss|compute_gspo|use_tis|icepop' slime/slime/backends/megatron_utils slime/slime/utils` 定位算法分支与 hook。
+
+Slime 测试必须从仓库目录 `slime/` 执行；预期同时检查数值和梯度 case 被收集。若只运行成功但显示 `0 tests collected`，不算通过。Windows 若在 collection 阶段报 `torch.compile` 不受支持，应把它记录为环境限制，不能伪装成算法测试失败或通过。
 
 ## 排障演练
 
@@ -46,6 +51,8 @@ updated: 2026-07-10
 - [ ] `--advantage-estimator cispo`：能指出 `ratio_truncated.detach()` 和对应测试。
 - [ ] `--use-tis`：能指出必须有 `rollout_log_probs`，且不能同时 `--use-rollout-logprobs`。
 - [ ] allgather-CP 空 token：能指出 `0 * logits.sum()` 的作用。
+- [ ] 人为让 full/current/old/mask 列表长度不等：能解释 `zip(strict=False)` 为什么可能静默少处理样本。
+- [ ] custom TIS 返回更小 mask：能分别核对 numerator、原 `rollout_mask_sums` denominator 和 pre-RS mismatch metrics。
 
 ## 迁移结论
 

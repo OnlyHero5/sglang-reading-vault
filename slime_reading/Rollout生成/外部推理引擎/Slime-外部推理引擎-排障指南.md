@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 外部推理引擎 · 排障指南
 
@@ -26,6 +26,10 @@ updated: 2026-07-10
 | router 没有 worker | 注册控制面 | `_init_external`、`_register_to_router` | 查 router `/workers` |
 | Ray 还在等 rollout GPU | PG 布局 | `_get_placement_group_layout` | external 下 PG GPU 数应只等于训练 GPU |
 | prefill 注册失败 | PD bootstrap | `external_engine_init_kwargs`、router payload | prefill server_info 是否含 bootstrap port |
+| 第二个多节点地址发现成功却未注册 | rank 坐标复用 | `_compute_server_args`、`_register_to_router` | adapter `node_rank` 是否被算成非 0 |
+| engine/GPU 数无故翻倍 | 地址重复 | `discover_external_engines` | 规范化 URL 后是否重复 |
+| 单侧 PD 启动但不能生成 | PD 完整性 | `any(info.is_pd_worker)` | prefill/decode 是否两侧都存在 |
+| `encoder_only="false"` 却没有注册 | schema 类型 | `_infer_worker_type` | 字段是否为 JSON boolean false |
 | generate 长时间 retry | HTTP 数据面 | `http_utils._post` | external server 和 router 是否持续 5xx/连接失败 |
 | update 权重失败 | 权重通道 | NCCL 或 disk/delta 选择 | trainer 与 engine 是否 NCCL 互通或共享同一路径 |
 | engine 挂了 Slime 没 recover | 生命周期所有权 | `ExternalRolloutServer.recover` | 外部编排系统是否重启 server |
@@ -97,7 +101,7 @@ def onload_kv(self):
 external discovery 写入的 `rollout_num_gpus` 是逻辑 serving 容量，来自所有 external engine 的 `num_gpus` 求和。Ray PG 布局另走 `rollout_external` 分支，不把这些 GPU 算进训练 job。
 
 ```python
-# 来源：slime/ray/placement_group.py L100-L128
+# 定位骨架（非逐行摘录）：slime/ray/placement_group.py L100-L128
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
@@ -178,7 +182,7 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
 router 注册阶段如果 prefill 没有 bootstrap port，会直接报错。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L216-L232
+# 定位骨架（非逐行摘录）：slime/backends/sglang_utils/sglang_engine.py L216-L232
 payload = {
     "url": worker_url,
     "worker_type": self.worker_type,
@@ -276,7 +280,7 @@ U.execute_train(
 `http_utils._post` 默认最多重试 60 次，每次失败睡 1 秒。它能处理短暂 5xx、连接 reset 或 router 切换，但外部 server 长时间不可用时仍会最终抛错。
 
 ```python
-# 来源：slime/utils/http_utils.py L165-L198
+# 定位骨架（非逐行摘录）：slime/utils/http_utils.py L165-L198
 async def _post(client, url, payload, max_retries=60, headers=None):
     retry_count = 0
     while retry_count < max_retries:
@@ -340,3 +344,49 @@ return servers, init_handles
 ```
 
 需要多模型或 frozen 模型时，优先用 `--sglang-config`。
+
+---
+
+## Q10：为什么第二个 external 地址发现成功，却没注册也不响应控制请求？
+
+先核对它是否代表跨多节点 engine。external construction 把地址序号直接作为 adapter `rank`；`_compute_server_args` 又计算 `nnodes=max(1,num_gpus//num_gpus_per_node)` 与 `node_rank=rank%nnodes`。Router 注册、`get_url` 和多数控制 POST 都只在 `node_rank==0` 执行。
+
+典型复现：两个地址各报告 16 GPU，Slime 配置每节点 8 GPU。rank 0 的地址得到 node-rank 0，rank 1 的地址得到 node-rank 1；后者会被当成“同一 engine 的第二节点”，尽管它其实是另一个独立 base URL。
+
+操作与预期：
+
+1. 对比 discovery 日志 URL 集合与 Router `/workers` URL 集合。
+2. 记录每个 adapter 的 `rank`、`num_gpus_per_engine`、`nnodes`、`node_rank`。
+3. 若缺失 URL 对应 `node_rank!=0`，不要靠增加 retry；这是 external 地址坐标与 managed-engine 节点坐标混用。当前部署应避免这种组合，或修正 construction 使每个独立地址的控制 adapter 都按 node-rank 0 工作。
+
+---
+
+## Q11：为什么 engine 数和 GPU 数刚好翻倍？
+
+`discover_external_engines` 不去重，地址列表中相同的规范化 URL 会被逐项 append。结果是 `rollout_num_engines`、`rollout_num_gpus`、连接池并发、GPU offset 和 adapter 数一起放大，并可能重复注册同一 worker。
+
+操作：把所有输入先规范化成 `http://host:port` 后做唯一性检查。预期是 discovery 日志、Router worker 与真实外部 server 三个集合一一对应；不能把 Router 自己的去重行为当成 Slime 拓扑正确的证据。
+
+---
+
+## Q12：为什么只有 prefill 或只有 decode，Router 仍进入 PD 模式？
+
+启动判据是 `any(info.is_pd_worker for info in infos)`，只证明“至少有一个 PD worker”，不证明 prefill/decode 成对。单侧 PD 可能顺利启动 Router，却无法闭合 generate 所需的数据流。
+
+操作：按 worker type 分组，要求 prefill 与 decode 两侧至少各一项；prefill 还要有 bootstrap port。预期是 Router `/workers` 同时出现两类 worker，而不是仅看到 `pd_disaggregation=True`。
+
+---
+
+## Q13：为什么 `encoder_only: "false"` 仍被识别成 encoder？
+
+`_infer_worker_type` 使用 `if server_info.get("encoder_only")`。Python 中非空字符串为真，所以字符串 `"false"` 会命中 encoder 分支；encoder 又会跳过 Router 注册。
+
+操作：检查原始 JSON 类型，而不只看日志文本。预期应是 JSON boolean `false`，不是字符串、数字或其他 truthy 值。服务端 schema 修正后，worker type 应回到 regular 或由 `disaggregation_mode` 决定。
+
+---
+
+## Q14：为什么 shutdown 后 Router 里还残留 external worker？
+
+external `SGLangEngine.shutdown` 在函数开头直接返回，因此既不会杀外部 server，也不会执行后续 remove-worker。前者符合外部所有权，后者意味着 shutdown 不是完整 detach。
+
+操作：训练任务退出或重接 external fleet 时查询 Router `/workers`。预期若复用旧 Router，必须由外围显式注销或重建 Router；不能期待 external shutdown 自动清理 worker。

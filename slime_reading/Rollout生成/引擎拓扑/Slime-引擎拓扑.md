@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 引擎拓扑
 
@@ -56,6 +56,13 @@ flowchart LR
 | 编译边界 | `rollout.py` | `gpu_offset`、`rank_offset`、`port_cursors`、`has_pd_disaggregation`、`has_encoder_disaggregation` |
 | 运行边界 | `SGLangEngine` 与 Router | `router_ip`、`router_port`、`engine.init` handle、`needs_offload` |
 
+## 先记住四个不显眼的编译风险
+
+- `ModelConfig.name` 没有全局唯一性校验；重名模型仍会各自启动 Router/group，最后却在 `servers[name]` 和 router map 中被后者覆盖，留下已启动但不可寻址的前一套资源。
+- `update_weights` 的自动推断只是模型路径字符串与 `args.hf_checkpoint` 的相等比较；相对路径、软链接或同路径冻结副本都可能让语义与字符串判断不一致，生产配置应显式填写。
+- 多节点 group 中 `_make_group` 计算的是“node actor 数”，不是逻辑 HTTP engine 数；逻辑 engine 还要除以 `nodes_per_engine`。不要直接用 `len(all_engines)` 报服务副本数。
+- 第一个 YAML model 决定旧版默认 Router；`get_model_url` 对未知名称静默回退默认 Router。模型顺序和拼写错误都会改变实际流量目标。
+
 ## 源码范围
 
 | 文件 | 角色 |
@@ -72,7 +79,7 @@ flowchart LR
 **判断：EngineTopology 的启动边界在 `RolloutManager.__init__`，不是第一次 generate 时。**
 
 ```python
-# 来源：slime/ray/rollout.py L430-L454
+# 定位骨架（据 `slime/ray/rollout.py` L430-L454 删节）：
 rollout_init_handles: list[Any] = []
 if self.args.debug_train_only:
     self.servers: dict[str, Any] = {}

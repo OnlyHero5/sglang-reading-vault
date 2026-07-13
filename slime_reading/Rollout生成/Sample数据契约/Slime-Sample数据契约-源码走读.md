@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Sample数据契约 · 源码走读
 
@@ -34,7 +34,7 @@ updated: 2026-07-10
 | 第一次理解 Sample 契约 | 先建立模型、1 到 3 | `Sample` 是 response 侧对齐账本，不只是 rollout 结果容器 |
 | 排查 token / mask / logprob 长度错误 | 3 到 5、8 | `response_length` 是主轴，`loss_mask`、`rollout_log_probs`、top-p offsets 都要贴着它校验 |
 | 接入 tool 或环境 token | 4 到 6 | 不可训练 token 要补 loss mask 0、logprob 0，并在已有 top-p replay 上追加空 span |
-| 排查 top-p 或 MoE replay | 1、2、6、7、13 | metadata 先解码，再校验 offsets、token ids、routed experts 形状，最后进入 train_data |
+| 排查 top-p 或 MoE replay | 1、2、6、7、13 | top-p 按 response ragged offsets 增量合并；routed experts 按整条 tokens 减一的完整快照覆盖 |
 | 做 debug dump 或跨 Ray 传输 | 9 到 10 | `to_dict` / `from_dict` 保留 enum、嵌套统计和未知字段，rollout 输出会被兼容包装 |
 | 接 compact rollout / subagent 输出 | 10 到 11 | 深层 `list[Sample]` 的 sibling 必须共享 `rollout_id`，否则损失聚合会把一次 rollout 算成多次 |
 | 看训练 batch 字段来源 | 12 到 13 | 行式 Sample 在这里转成列式 `train_data`，可选字段按首样本或配置进入 batch |
@@ -161,7 +161,7 @@ def _extract_rollout_top_p_token_data(
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L93-L149
+# 定位骨架（据 `slime/utils/types.py` L93-L149 选取核心字段）：
 @dataclass
 class Sample:
     group_index: int | None = None
@@ -187,9 +187,9 @@ class Sample:
 
 **执行逻辑：**
 
-- `tokens` 是 prompt tokens 和 response tokens 的拼接序列。
+- 默认 SGLang 路径在请求前把 prompt ids 写入 `tokens`，`append_response_tokens` 再追加 response；`Sample` 数据类本身不自动保证这一步。
 - `response_length` 只统计 response 侧 token 数，不包含 prompt。
-- `loss_mask`、`rollout_log_probs`、top-p offsets 按 response 侧长度对齐。
+- `loss_mask`、`rollout_log_probs`、top-p offsets 按 response 侧长度对齐；routed experts 例外地按 `len(tokens)-1` 对齐。
 - `remove_sample` 不删除对象，而是在转换训练数据时把 loss mask 置零。
 
 ### 4. trainable 与 non-trainable token 走不同分支
@@ -201,7 +201,7 @@ class Sample:
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L253-L314
+# 定位骨架（据 `slime/utils/types.py` L253-L314 选取追加主干）：
 tokens = _to_int_list(tokens)
 log_probs = _to_float_list(log_probs)
 if log_probs is not None and len(log_probs) != len(tokens):
@@ -240,7 +240,7 @@ if tokens:
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L286-L303
+# 来源：slime/utils/types.py L286-L302
 previous_response_length = self.response_length
 if tokens:
     self.tokens += tokens
@@ -277,7 +277,7 @@ if log_probs is not None:
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L39-L70
+# 定位骨架（据 `slime/utils/types.py` L39-L70 删节）：
 def _merge_rollout_top_p_token_data(
     base_token_ids: list[int] | torch.Tensor | None,
     base_offsets: list[int] | torch.Tensor | None,
@@ -318,7 +318,7 @@ def _pad_rollout_top_p_offsets(
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L316-L381
+# 定位骨架（据 `slime/utils/types.py` L316-L381 删节）：
 def _apply_meta_info(
     self,
     args,
@@ -345,7 +345,7 @@ def _apply_meta_info(
 ```
 
 ```python
-# 来源：slime/utils/types.py L352-L381
+# 定位骨架（据 `slime/utils/types.py` L352-L381 删节）：
 routed_experts = decode_int32_meta_array(meta_info, "routed_experts")
 if routed_experts is not None:
     if args is None:
@@ -371,7 +371,7 @@ if "weight_version" in meta_info:
 **执行逻辑：**
 
 - top-p 先按本次新增 token 数校验。
-- routed experts 需要 `args.num_layers` 和 `args.moe_router_topk` reshape。
+- routed experts 需要 `args.num_layers` 和 `args.moe_router_topk` reshape，首维为 `len(self.tokens)-1`；每次赋值覆盖旧快照，不做增量 merge。
 - `update_terminal_info=False` 时，不更新终态和统计，适合 streaming 中间 chunk。
 - speculative metrics 只有启用 `sglang_speculative_algorithm` 时才累加。
 - prefix cache stats 和 weight version 在终态 metadata 中进入 Sample。
@@ -385,7 +385,7 @@ if "weight_version" in meta_info:
 **源码证据：**
 
 ```python
-# 来源：slime/utils/types.py L375-L409
+# 定位骨架（据 `slime/utils/types.py` L375-L409 删节）：
 match meta_info["finish_reason"]["type"]:
     case "length":
         self.status = Sample.Status.TRUNCATED
@@ -405,7 +405,7 @@ def _validate_response_metadata_lengths(self):
 ```
 
 ```python
-# 来源：slime/utils/types.py L392-L409
+# 来源：slime/utils/types.py L392-L408
 if self.rollout_top_p_token_ids is None and self.rollout_top_p_token_offsets is None:
     return
 if self.rollout_top_p_token_ids is None or self.rollout_top_p_token_offsets is None:
@@ -426,6 +426,8 @@ if int(offsets[-1]) != token_id_count:
 ```
 
 **测试证据：** `tests/test_sample.py` 参数化覆盖 `length → TRUNCATED`、`abort → ABORTED`、`stop → COMPLETED`；`tests/test_rollout_metrics.py` 覆盖 top-p offsets 与 loss mask 的关系。
+
+未知 finish reason 没有 default case，会保持原 status；`FAILED` 需要 rollout 逻辑显式赋值。
 
 ### 9. 序列化边界保留 enum、嵌套统计和未知字段
 
@@ -468,6 +470,8 @@ def from_dict(data: dict):
 - `spec_info` 和 `prefix_cache_info` 保存为普通 dict，恢复为对应嵌套对象。
 - 未知字段不参与 dataclass 初始化，但会通过 `setattr` 保留。
 
+边界：这里没有调用 `_validate_response_metadata_lengths`。序列化可以忠实保存一个本来就不一致的对象；`to_dict` 还是浅拷贝，动态字段能否真正落盘取决于后续序列化器。
+
 **运行验证：** `tests/test_sample.py` 中 `test_from_dict_preserves_unknown_fields_as_attributes` 覆盖了这个兼容边界。
 
 ### 10. rollout 函数输出先包装，再校验 compact rollout_id
@@ -479,7 +483,7 @@ def from_dict(data: dict):
 **源码证据：**
 
 ```python
-# 来源：slime/rollout/base_types.py L7-L26
+# 定位骨架（据 `slime/rollout/base_types.py` L7-L26 删节）：
 @dataclass
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
@@ -500,7 +504,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L635-L665
+# 定位骨架（据 `slime/ray/rollout.py` L635-L665 删节）：
 if self.args.load_debug_rollout_data:
     data = torch.load(
         self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
@@ -525,6 +529,7 @@ return data, metrics
 - 正常路径先得到 `RolloutFnTrainOutput`，再拿 `samples`。
 - `_validate_rollout_id_annotated` 在展平前检查 compact 结构。
 - 展平后进入 `_convert_samples_to_train_data`。
+- debug load 已失去嵌套 sibling 结构，不会重跑 compact id 校验；正常空输出会在 `data[0]` 处失败。
 
 ### 11. compact rollout_id 只在深层 sibling 上强校验
 
@@ -535,7 +540,7 @@ return data, metrics
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L898-L925
+# 定位骨架（据 `slime/ray/rollout.py` L898-L925 删节）：
 def _validate_rollout_id_annotated(node, depth=0):
     if isinstance(node, Sample):
         return
@@ -568,7 +573,7 @@ def _validate_rollout_id_annotated(node, depth=0):
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L713-L778
+# 定位骨架（据 `slime/ray/rollout.py` L713-L778 删节）：
 raw_rewards, rewards = self._post_process_rewards(samples)
 
 rollout_ids = [sample.rollout_id for sample in samples]
@@ -593,7 +598,7 @@ train_data = {
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L747-L778
+# 定位骨架（据 `slime/ray/rollout.py` L747-L778 删节）：
 loss_masks = []
 for sample in samples:
     if sample.loss_mask is None:
@@ -631,7 +636,7 @@ train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L792-L824
+# 定位骨架（据 `slime/ray/rollout.py` L792-L824 删节）：
 if samples[0].rollout_log_probs is not None:
     train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
@@ -667,6 +672,7 @@ return train_data
 
 - `rollout_top_p != 1.0` 时，每条 sample 都必须带 top-p ids 和 offsets。
 - `samples[0]` 被用作若干字段是否存在的哨兵；混合 batch 要避免第一条缺字段而后面有字段。
+- routed experts 必须对每条 sample 满足首维 `len(tokens)-1`；它不按 `response_length` 校验。
 
 ## 运行验证
 
@@ -685,12 +691,12 @@ python -m pytest slime/tests/test_sample.py slime/tests/test_rollout_metrics.py 
 - top-p offsets 合并、不可训练 token padding、remove sample 跳过 metric。
 - trainable token 缺 logprob 或 non-trainable token 带 logprob 时抛错。
 
-如果缺 `ray` 或 `sglang_router`，`test_rollout_metrics.py` 可能在 import `slime.ray.rollout` 时失败；这种失败属于环境依赖，不是 Sample 本身的契约失败。`test_sample.py` 通常更轻量。
+直接运行时两组都在 collection 阶段受依赖阻塞：`test_sample.py` 缺 `httpx`，`test_rollout_metrics.py` 缺 `ray`。本轮只 stub 未被 Sample 使用的 `http_utils.is_port_available` 后，原样执行 `test_sample.py` 得到 `12 passed`；从当前 `rollout.py` AST 抽取 top-p metric 函数的两项行为检查通过。两条路径仍有 Torch/NumPy ABI 警告，且 AST 替代不等同完整 Ray/SGLang import 环境。
 
 ## 复盘
 
 - `Sample` 是 response 时间轴的账本，不是静态字段表。
 - `append_response_tokens` 是最重要的写入口；自定义 generate 应优先用它，而不是手写多个字段。
-- top-p replay、routed experts、teacher logprobs 都依赖 response 侧长度对齐。
+- top-p replay 与 teacher logprobs 依赖 response 侧长度；routed experts 依赖整条 `tokens` 的 next-token 长度。
 - `to_dict/from_dict` 是 debug、Ray 和跨版本兼容边界。
 - rollout 函数返回的是嵌套 batch，RolloutManager 会先校验 compact `rollout_id`，再行转列成 `train_data`。

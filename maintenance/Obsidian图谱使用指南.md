@@ -7,7 +7,7 @@ learning_role: reference
 tags:
   - maintenance
   - obsidian/graph
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # Obsidian 图谱使用指南
@@ -69,4 +69,4 @@ updated: 2026-07-10
 
 全局图谱重点看三类问题：没有入链的孤岛、只连模板或维护页的伪入口、跨框架主线中断。断链由 `node maintenance/audit_wikilinks.mjs` 检查，不能只靠图谱目测。
 
-本次重构未修改 `.obsidian/`。若未来需要调整 Graph 配置，应先在界面中验证过滤式，再由用户明确授权修改配置文件。
+`.obsidian/` 属于用户配置：未获得明确授权时不修改。若需要调整 Graph 配置，应先在界面中验证过滤式，再由用户明确授权修改配置文件。

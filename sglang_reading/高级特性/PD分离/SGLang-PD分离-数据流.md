@@ -9,13 +9,13 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # PD分离 · 数据流
 
 ## 你为什么要读
 
-这篇回答“对象在跨 Prefill、transfer、Decode 时长什么样”。如果 [[SGLang-PD分离-源码走读]] 关注执行顺序，本篇关注状态归属：哪个字段是路由主键，哪个 buffer 是跨节点 metadata，哪个队列持有请求，哪个对象最终进入 running batch。
+这篇回答“对象在跨 Gateway、两套服务、transfer、Decode 时长什么样”。如果 [[SGLang-PD分离-源码走读]] 关注执行顺序，本篇关注状态归属：Gateway 的一次 attempt 如何生成两个 HTTP 请求，哪个字段把它们重新关联，哪个 buffer 是跨节点 metadata，哪个队列持有请求，哪个对象最终进入 running batch。
 
 读完应能解决三类问题：
 
@@ -41,13 +41,15 @@ updated: 2026-07-10
 
 ```mermaid
 flowchart TB
-  subgraph "请求事实"
-    A["GenerateReqInput<br/>bootstrap_host/port/room"]
-    B["TokenizedGenerateReqInput<br/>token ids + bootstrap_*"]
-    C["Req<br/>scheduler 内部对象"]
+  subgraph "Gateway attempt"
+    A["选定 Prefill/Decode pair<br/>生成 bootstrap_room"]
+    B["Prefill HTTP GenerateReqInput"]
+    C["Decode HTTP GenerateReqInput"]
   end
 
   subgraph "Prefill 侧"
+    PTM["Prefill TokenizerManager"]
+    PR["Prefill Req"]
     D["PrefillBootstrapQueue<br/>KVSender + metadata slot"]
     E["WaitingQueue<br/>extend forward"]
     F["InflightQueue<br/>sender poll"]
@@ -55,19 +57,22 @@ flowchart TB
 
   subgraph "传输控制面"
     G["MetadataBuffers<br/>output token / cached tokens / bootstrap_room"]
-    H["Transfer Backend<br/>Mooncake / NIXL / Fake / Ascend"]
+    H["Transfer Backend<br/>backend-specific sender / receiver"]
   end
 
   subgraph "Decode 侧"
+    DTM["Decode TokenizerManager"]
+    DR["Decode Req"]
+    P["pending_reqs<br/>解析 Prefill DP rank"]
     I["DecodePreallocQueue<br/>KVReceiver + KV slot"]
     J["DecodeTransferQueue<br/>poll + gate"]
     K["WaitingQueue<br/>prebuilt admission"]
     L["RunningBatch<br/>decode step"]
   end
 
-  A --> B --> C
-  C --> D --> E --> F
-  C --> I --> J --> K --> L
+  A --> B --> PTM --> PR --> D --> E --> F
+  A --> C --> DTM --> DR --> P --> I --> J --> K --> L
+  DR -->|rank 可本地解析| I
   D --> H
   E --> G
   G --> J
@@ -78,14 +83,14 @@ flowchart TB
 
 | 线 | 起点 | 终点 | 判断问题 |
 |----|------|------|----------|
-| 请求线 | `GenerateReqInput` | `Req` | room 是否存在并进入 Scheduler |
+| 请求线 | Gateway attempt | Prefill/Decode 两个 `Req` | pair、room、prompt 是否一致进入两套 Scheduler |
 | KV 线 | Prefill KV pool | Decode KV pool | page indices 和 state indices 是否收发完成 |
 | metadata 线 | `MetadataBuffers.set_buf` | `_commit_transfer_to_req` | 首 token、cached tokens、room 校验是否落地 |
 | 执行线 | transferred `Req` | `RunningBatch` | `PREBUILT` 是否补齐 batch metadata |
 
 ## 请求线：room 是跨节点主键
 
-用户请求和分词后请求都带 PD 字段。这个字段不是单纯传给 backend 的临时参数，而是进入 `Req` 后贯穿调度、路由和校验。
+Gateway 向两套服务各发一个请求；每套服务都独立完成 normalize、建 `ReqState`、tokenize 和向本地 Scheduler 投递。PD 字段不是共享对象引用，而是复制进两侧请求并分别进入两个 `Req`，随后贯穿调度、路由和校验。
 
 ```python
 # 来源：python/sglang/srt/managers/io_struct.py L822-L827
@@ -129,12 +134,13 @@ Prefill 的默认 DP load balance 会跟随 room，把请求送到 `room % worke
 不变量：
 
 - 真实 backend 下 `bootstrap_room` 不能缺失。
+- 同一次 Gateway attempt 的 Prefill/Decode 请求必须使用同一 room；下一次 Gateway retry 必须生成新 room，不能复用可能已有半成状态的旧 room。
 - batch 请求不能让多个 parallel sample 复用同一 room。
 - 直连 prefill/decode 调试时，必须手动补齐 gateway 平时会分配的 room。
 
 ## 队列线：Prefill 和 Decode 的等待区不是对称的
 
-Prefill 的请求生命周期是 bootstrap、waiting、inflight。GPU forward 发生在 waiting，KV 传输完成发生在 inflight。
+Prefill 的名义生命周期是 bootstrap、waiting、inflight。默认 `optimistic_prefill_retries=0` 时，GPU forward 发生在 bootstrap 完成后的 waiting；显式开启 optimistic 模式后，`Bootstrapping` 请求也可能先进入 waiting 做 speculative forward，若握手仍未完成则释放本轮 KV 并回到 bootstrap 路径。KV 传输完成仍发生在 inflight。
 
 ```python
 # 来源：python/sglang/srt/disaggregation/prefill.py L1-L18
@@ -570,24 +576,43 @@ PD server args 定义了 mode、backend、bootstrap port、decode radix cache、
 | `disaggregation_decode_extra_slots` | 容量线 | Decode 可提前接收的 in-transfer 请求数改变 |
 | `disaggregation_decode_enable_radix_cache` | metadata 线、执行线 | prefix match 和 committed KV 边界改变 |
 | `SGLANG_DISAGG_STAGING_BUFFER` | KV 线 | receiver Success 还要等 staging scatter |
+| `optimistic_prefill_retries` | Prefill 队列线、重算成本 | `Bootstrapping` 时可提前 forward；未收敛则释放 KV 并 requeue |
 
 ## 交互时序
 
 ```mermaid
 sequenceDiagram
-  participant GW as Gateway 或客户端
-  participant TM as TokenizerManager
+  participant GW as Gateway
+  participant PTM as Prefill TokenizerManager
+  participant DTM as Decode TokenizerManager
   participant DS as Decode Scheduler
   participant PS as Prefill Scheduler
   participant TX as Transfer Backend
 
-  GW->>TM: GenerateReqInput + bootstrap_*
-  TM->>DS: TokenizedGenerateReqInput
-  TM->>PS: TokenizedGenerateReqInput
+  GW->>GW: 选 pair，生成新 bootstrap_room
+  par 并行 HTTP 双发
+    GW->>PTM: Prefill GenerateReqInput + bootstrap_*
+    PTM->>PS: TokenizedGenerateReqInput
+  and
+    GW->>DTM: Decode GenerateReqInput + 同一 room
+    DTM->>DS: TokenizedGenerateReqInput
+  end
   DS->>DS: Req -> DecodeRequest
+  opt Prefill DP rank 尚未知
+    DS->>DS: pending_reqs -> ensure info/query room rank
+  end
   DS->>TX: receiver send_metadata(page, metadata index)
   PS->>TX: sender bootstrap(room)
-  PS->>PS: extend forward
+  alt bootstrap 已收敛
+    PS->>PS: 正常进入 waiting 并 extend forward
+  else optimistic retries 未耗尽
+    PS->>PS: Bootstrapping 状态先 speculative forward
+    alt 握手仍未完成
+      PS->>PS: release KV, reset, requeue
+    else 握手随后完成
+      PS->>PS: finalize sender
+    end
+  end
   PS->>TX: set metadata buffer and send KV pages
   DS->>TX: poll receiver
   DS->>DS: metadata gate and all-reduce
@@ -595,13 +620,15 @@ sequenceDiagram
   DS->>DS: prepare_for_prebuilt and merge running
 ```
 
-读这张图时，不要把 Gateway 画成唯一事实源。源码里真正持续保存状态的是 `Req`、`DecodeRequest`、`MetadataBuffers` 和各队列。
+读这张图时要同时守住两个边界：Gateway 是 pair、room 与 HTTP retry 的事实源；请求进入服务后，持续保存运行状态的是两侧各自的 `Req`、`DecodeRequest`、`MetadataBuffers` 和队列。Gateway 不转发 KV，也不持有一个跨两侧共享的 TokenizerManager 请求对象。
 
 ## 排查入口
 
 | 现象 | 首先检查的对象 | 源码入口 |
 |------|----------------|----------|
 | prefill bootstrap 长时间不动 | `DecodePreallocQueue.queue`、receiver metadata | `_create_receiver_and_enqueue`、`send_metadata` |
+| Decode 尚未开始 prealloc | `DecodePreallocQueue.pending_reqs` | `_ensure_prefill_info`、`_resolve_pending_reqs` |
+| Prefill GPU 算过但没有发送 | `pending_bootstrap`、`prefill_retry_count` | `handle_pending_bootstrap`、`optimistic_release_and_requeue` |
 | prefill forward 完成但没有返回 | `disagg_prefill_inflight_queue` | `process_disagg_prefill_inflight_queue` |
 | decode transfer 一直 Transferring | `metadata_buffers.bootstrap_room` | `_apply_metadata_gate` |
 | metadata mismatch abort | `metadata_buffer_index` 是否复用错 | `_commit_transfer_to_req` |

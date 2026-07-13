@@ -9,187 +9,177 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 多模态 · 源码走读
 
-> 走读主线：multimodal manager 先把模型架构映射到 processor；processor 基类负责媒体加载、特殊 token 识别、占位符展开和 `mm_items` 组装；模型专用 processor 再补齐图像/视频预处理、MRoPE 等模型契约；ViT CUDA Graph 与 EVS 分别处理视觉编码加速和长视频 token 裁剪。
-
 ## 长文读法
 
-这篇不要按文件清单硬读，而要按一次多模态请求的形态变化读：`hf_config.architectures → processor → raw media / processor output / precomputed embedding → input_ids + mm_items → scheduler → 视觉优化`。读源码时先判断当前问题卡在哪个边界，再进入对应小节。
+不要按文件树顺序读。本篇沿一项媒体的生命周期走：
 
-| 读者任务 | 先读 | 要抓住的判断 |
-|----------|------|--------------|
-| 判断模型为什么找不到 processor | 1.1、1.2 | `PROCESSOR_MAPPING` 只按模型类名匹配，Transformers backend 还有兼容性闸门 |
-| 排查图片、视频、音频占位符对不上 | 2.2、3.1、3.2 | 文本特殊 token、媒体列表顺序、展开后的 token span 必须同时对齐 |
-| 理解 `mm_items` 为什么能跨 tokenizer/scheduler 边界 | 2.1、3.3 到 3.6 | raw media、processor output 和预计算 embedding 最终都收敛成 `MultimodalDataItem` |
-| 定位 Qwen-VL token 数、帧数或 MRoPE 异常 | 4.1 到 4.4 | 像素预算、抽帧、grid 和位置编码是模型专用契约，不属于通用 processor |
-| 排查视觉性能或长视频 token 爆炸 | 5.1、5.2 | ViT CUDA Graph 只复用稳定 shape 的视觉 block，EVS 只负责长视频 token 裁剪 |
-| 改代码前做回归确认 | 6 | 先用静态检索确认六个边界仍存在，再更新本文判断 |
-
-读完整篇后应该能回答三个问题：一个新 VLM 怎么接入 processor；一个带媒体请求如何从 prompt 占位符变成 scheduler 可消费的 `MultimodalProcessorOutput`；视觉侧性能优化为什么不能混进通用数据契约里。
-
----
-
-## 1. Processor 注册与选择
-
-### 1.1 `import_processors` 以包扫描维护架构到 processor 的映射
-
-问题与约束：
-- 多模态模型数量多，新增模型应该只增加 processor 类，不应该在统一入口里手写大量 if/else。
-- 某个 processor 模块导入失败不能拖垮整个 serving 启动，否则可选依赖会变成全局依赖。
-
-设计选择：
-- 启动时扫描目标包下的模块，收集定义在模块内且继承 `BaseMultimodalProcessor` 的类，再把类声明的 `models` 注册到全局 `PROCESSOR_MAPPING`。
-
-**读法：**
-`import_processors` 把“发现 processor”和“选择 processor”拆开。它只做包扫描、类筛选和映射注册；模块导入异常被记录为 warning 后跳过，`overwrite=True` 时允许按模型类名替换已有注册项。
-
-来源：python/sglang/srt/managers/multimodal_processor.py L16-L41
-
-**源码锚点：**
-```python
-def import_processors(package_name: str, overwrite: bool = False):
-    package = importlib.import_module(package_name)
-    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
-        if not ispkg:
-            try:
-                module = importlib.import_module(name)
-            except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}: {e}")
-                continue
-            all_members = inspect.getmembers(module, inspect.isclass)
-            classes = [
-                member
-                for name, member in all_members
-                if member.__module__ == module.__name__
-            ]
-            for cls in (
-                cls for cls in classes if issubclass(cls, BaseMultimodalProcessor)
-            ):
-                assert hasattr(cls, "models")
-                for arch in getattr(cls, "models"):
-                    if overwrite:
-                        for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-                            if model_cls.__name__ == arch.__name__:
-                                del PROCESSOR_MAPPING[model_cls]
-                                break
-                    PROCESSOR_MAPPING[arch] = cls
+```text
+模型架构
+→ Processor 选择
+→ raw / preprocessed / precomputed 三路输入
+→ prompt placeholder 展开
+→ input_ids + MultimodalDataItem
+→ TokenizerManager 发送
+→ Scheduler IPC 重建与 hash/pad
+→ ViT / Audio tower 或预计算 embedding
+→ prefix cache
+→ 可选 encoder disaggregation
 ```
 
-代码逻辑：
-- 导入 processor 包，并枚举包下非 package 模块。
-- 每个模块导入失败时只 warning 并继续。
-- 只保留当前模块自己定义的 class，避免把 import 进来的基类重复注册。
-- 对每个 `BaseMultimodalProcessor` 子类，读取 `models` 并写入 `PROCESSOR_MAPPING`。
+每一节只回答一个设计判断，并给出它的适用边界。
 
-为什么这样写：
-- processor 的扩展点是 class-level `models`，新模型只需要在子类声明支持的架构。
-- import 失败不阻断启动，可以让缺少可选视觉、视频或音频依赖的环境仍服务其他模型。
+## 1. Processor 是架构适配器，不是通用图片函数
 
-不变量与失败模式：
-- processor 子类必须有 `models` 属性，否则 `assert hasattr(cls, "models")` 会失败。
-- `PROCESSOR_MAPPING` 的 key 是模型类对象；若两个模块注册同名架构，只有 `overwrite=True` 才会先删除旧项。
+启动时 `import_processors()` 触发各模型 processor 注册。TokenizerManager 还可导入 `SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`，并以 `overwrite=True` 覆盖同名模型映射。
 
-**要点：**
-这里的核心不是自动导入本身，而是把多模态模型支持做成“声明式插件表”。
+选择时先用 `hf_config.architectures` 匹配模型类名，再检查当前是否走 Transformers backend。后者只有在 processor 声明 `supports_transformers_backend` 时才允许返回。
 
-### 1.2 `get_mm_processor` 根据 backend 兼容性选择原生或 Transformers 路径
-
-问题与约束：
-- 同一模型可能既能走 SGLang 原生实现，也可能在 `model_impl=transformers` 下运行。
-- 如果 processor 不支持 Transformers backend，错误地复用原生 processor 会破坏模型调用契约。
-
-设计选择：
-- 先解析 `server_args.model_impl` 和 `model_config`，再用 `hf_config.architectures` 匹配注册表；只有原生路径或显式声明 `supports_transformers_backend` 的 processor 才能返回。
-
-**读法：**
-`get_mm_processor` 的选择逻辑分三层：先判断是否使用 Transformers backend；再按架构名遍历注册表；若没有可用专用 processor 且 backend 是 Transformers，则退到 `TransformersAutoMultimodalProcessor`；否则抛出包含已注册架构名的错误。
-
-来源：python/sglang/srt/managers/multimodal_processor.py L44-L83
-
-**源码锚点：**
 ```python
-model_impl = str(getattr(server_args, "model_impl", "auto")).lower()
-uses_transformers_backend = model_impl == "transformers"
-if model_impl == "auto" and model_config is not None:
-    from sglang.srt.model_loader.utils import get_resolved_model_impl
+# 来源：python/sglang/srt/managers/multimodal_processor.py L44-L67
+def get_mm_processor(
+    hf_config,
+    server_args: ServerArgs,
+    processor,
+    transport_mode,
+    model_config=None,
+    **kwargs,
+) -> BaseMultimodalProcessor:
+    model_impl = str(getattr(server_args, "model_impl", "auto")).lower()
+    uses_transformers_backend = model_impl == "transformers"
+    if model_impl == "auto" and model_config is not None:
+        from sglang.srt.model_loader.utils import get_resolved_model_impl
 
-    uses_transformers_backend = (
-        get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
-    )
-
-for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-    if model_cls.__name__ not in hf_config.architectures:
-        continue
-    if not uses_transformers_backend or getattr(
-        processor_cls, "supports_transformers_backend", False
-    ):
-        return processor_cls(
-            hf_config, server_args, processor, transport_mode, **kwargs
+        uses_transformers_backend = (
+            get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
         )
 
-if uses_transformers_backend:
-    from sglang.srt.multimodal.processors.transformers_auto import (
-        TransformersAutoMultimodalProcessor,
-    )
-
-    return TransformersAutoMultimodalProcessor(
-        hf_config, server_args, processor, transport_mode, **kwargs
-    )
+    for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+        if model_cls.__name__ not in hf_config.architectures:
+            continue
+        if not uses_transformers_backend or getattr(
+            processor_cls, "supports_transformers_backend", False
+        ):
+            return processor_cls(
 ```
 
-代码逻辑：
-- `model_impl=auto` 时用 model loader 的解析结果判断实际 backend。
-- 注册表匹配依赖 `hf_config.architectures` 中的模型类名。
-- Transformers backend 下，专用 processor 必须显式声明兼容。
-- 无专用 processor 时，Transformers backend 进入自动 processor 回退。
+### 为什么按类名匹配
 
-为什么这样写：
-- 多模态预处理和模型 forward 的输入字段强绑定；backend 不同，字段语义和调用路径可能不同。
-- 自动回退只对 Transformers backend 开放，避免原生路径悄悄使用性能和字段契约都不同的 HF 默认逻辑。
+HF config 提供的 architecture 常是字符串；注册表持有模型类。当前实现用 `model_cls.__name__` 对字符串列表匹配，使 processor 与模型实现保持松耦合。
 
-不变量与失败模式：
-- `hf_config.architectures` 必须包含模型类名，否则无法命中注册表。
-- 非 Transformers backend 且无注册 processor 时会抛 `ValueError`，部署新 VLM 时通常先从这里定位。
+### 失效边界
 
-**要点：**
-这个函数是多模态入口的“兼容性闸门”：先保证 processor 和 backend 匹配，再谈后续媒体处理。
+同名类来自不同包时，仅类名不能表达全部语义；外部覆盖必须由维护者确认行为兼容。注册成功也不代表 encoder disaggregation 支持，后者还有独立架构白名单。
 
-## 2. 基类数据契约
+## 2. TokenizerManager 即使跳过 tokenizer，也不跳过媒体
 
-### 2.1 `BaseMultiModalProcessorOutput` 保存加载后的媒体和可选原始 token
-
-问题与约束：
-- 请求可能带图片、视频、音频，也可能已经离线预处理成 tensor 或 input ids。
-- 后续组合逻辑需要保持媒体出现顺序，同时又要按 modality 分派给不同处理器路径。
-
-设计选择：
-- 用轻量 dataclass 保存 `input_text`、可选 `input_ids` 和三类媒体列表，并提供 `organize_results()` 统一展开为 `(Modality, data)` 序列。
-
-**读法：**
-这个结构处在“加载媒体”和“调用 HF processor/构造 mm_items”之间。它不承诺媒体已经变成特征，只保证文本、原始 token 和各 modality 的已加载对象可以被下一阶段统一消费。
-
-来源：python/sglang/srt/multimodal/processors/base_processor.py L48-L81
-
-**源码锚点：**
 ```python
-@dataclasses.dataclass
-class BaseMultiModalProcessorOutput:
-    input_text: str
-    input_ids: Optional[Union[List[int], torch.Tensor]] = None
-    images: Optional[list[Union[Image.Image, dict]]] = dataclasses.field(
-        default_factory=list
-    )
-    videos: Optional[list[Union[torch.Tensor, dict]]] = dataclasses.field(
-        default_factory=list
-    )
-    audios: Optional[list[Union[np.ndarray, dict]]] = dataclasses.field(
-        default_factory=list
-    )
+# 来源：python/sglang/srt/managers/tokenizer_manager.py L327-L350
+    def init_tokenizer_and_processor(self):
+        server_args = self.server_args
 
+        # Initialize tokenizer and processor
+        if self.model_config.is_multimodal:
+            import_processors("sglang.srt.multimodal.processors")
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
+            _processor = _get_processor_wrapper(server_args)
+            transport_mode = _determine_tensor_transport_mode(self.server_args)
+
+            # We want to parallelize the image pre-processing so we create an executor for it
+            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
+            # images even with skip_tokenizer_init=False.
+            self.mm_processor = get_mm_processor(
+                self.model_config.hf_config,
+                server_args,
+                _processor,
+                transport_mode,
+                model_config=self.model_config,
+            )
+
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = self.processor = None
+```
+
+`skip_tokenizer_init=True` 只要求调用方直接提供文本 `input_ids`。媒体仍要经过模型专用 processor，因为 grid、offset、pixel/audio feature 等契约不能由普通 tokenizer 替代。
+
+## 3. 请求先形成文本骨架，再接入媒体
+
+`_tokenize_one_request()` 按以下优先级形成文本侧输入：
+
+1. `input_embeds`：要求关闭 radix cache；
+2. `input_ids`：直接采用；
+3. 文本：通过 tokenizer；
+4. audio-only 多模态：允许先用空 list，等待 processor 生成。
+
+随后它规范化 image/video/audio 为 list，并执行每请求数量限制。
+
+```python
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/tokenizer_manager.py L793-L949
+input_embeds / input_ids / text
+→ contains_mm_input
+→ normalize media to lists
+→ _validate_mm_limits
+→ local processor or remote encoder receiver
+→ replace input_ids/token_type_ids from mm output
+→ optional caller mm_hashes
+→ optional SGLANG_MM_PRECOMPUTE_HASH
+→ _validate_one_request
+→ _create_tokenized_object
+```
+
+这个顺序揭示一个重要事实：长度校验发生在 processor 已可能展开媒体 placeholder 之后，所以它看到的是更接近实际 prefill 的 token 数；但自动截断只裁 input ids，后文会看到风险。
+
+## 4. 三路输入如何收敛
+
+### 4.1 Raw media
+
+Processor 负责下载/解码、resize/抽帧、模型专用预处理，得到 `pixel_values`、audio features、grid 等。
+
+### 4.2 已预处理 feature
+
+调用方可复用 processor output，避免再次下载和预处理，但仍需视觉塔或音频 encoder 计算 embedding。
+
+### 4.3 预计算 embedding
+
+item 标记为 `PRECOMPUTED_EMBEDDING`，模型执行侧跳过 encoder，直接把 embedding 对齐到 placeholder span。它常见于 encoder disaggregation。
+
+三路最终都必须给出同一组语义：媒体 modality、在 prompt 中的位置、内容身份，以及模型侧所需 metadata。
+
+## 5. Processor 输出通常不是 visual embedding
+
+`MultimodalDataItem` 同时容纳 `feature` 和 `precomputed_embeddings`，注释明确区分二者：
+
+```python
+# 来源：python/sglang/srt/managers/schedule_batch.py L259-L268
+    format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
+
+    # the raw features returned by processor, e.g. pixel_values or audio_features
+    feature: Union[torch.Tensor, np.ndarray] = None
+    # the precomputed embeddings, passed as final encoder embeddings
+    # One and only one of the feature and precomputed_embeddings will be empty
+    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+
+    # Model-specific data stored in a dictionary
+    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+```
+
+因此普通本地路径是：Processor 产生 encoder 输入，模型执行侧再跑 ViT/Audio tower。把 processor 写成“输出最终视觉 embedding”会混淆预处理和模型 forward 的边界。
+
+## 6. 为什么分箱后仍能保持 prompt 顺序
+
+通用结果容器按 IMAGE→VIDEO→AUDIO 整理：
+
+```python
+# 来源：python/sglang/srt/multimodal/processors/base_processor.py L72-L81
     def organize_results(self) -> List[Tuple[Modality, Any]]:
+        """
+
+        :return: a list of results, with their corresponding modalities
+        """
         return (
             [(Modality.IMAGE, data) for data in self.images]
             + [(Modality.VIDEO, data) for data in self.videos]
@@ -197,955 +187,281 @@ class BaseMultiModalProcessorOutput:
         )
 ```
 
-代码逻辑：
-- `input_text` 保存展开或重建后的文本。
-- `input_ids` 允许上游传入预 tokenized prompt。
-- 三个列表分别保存 image、video、audio 的加载结果或预处理 dict。
-- `organize_results()` 把三类列表合并为带 modality 标签的列表。
+`build_input_ids()` 则先扫描 prompt 中特殊 token，记录全局 modality 序列，再维护 `img_idx`、`video_idx`、`audio_idx` 三个独立游标。于是两种顺序不矛盾：内部按类别存储，展开按 prompt 播放。
 
-为什么这样写：
-- 下一阶段只关心“这个对象属于哪种 modality”，不应该重复判断它来自哪个字段。
-- 预处理输入可以携带 `input_ids`，避免强制 decode 再 tokenize。
+### 源码阅读抓手
 
-不变量与失败模式：
-- 列表顺序必须与 prompt 中对应特殊 token 的顺序能匹配，否则后续 offset 和特征会错位。
-- `dict` 项需要后续通过 `format` 或字段名识别；字段缺失会在收集 `mm_items` 时暴露。
+遇到多图/多视频错位，不要只比较总数。应同时打印：
 
-**要点：**
-它是多模态流水线中最早的统一容器，把“原始媒体形态很多”收敛成“带 modality 的对象流”。
+- `vision_start_indices`；
+- `modality_list`；
+- 三个 modality 游标；
+- 每项 `grid_thw` 或 audio length；
+- 生成的 offsets。
 
-### 2.2 `MultimodalSpecialTokens` 统一 token、token id 和正则匹配
+## 7. Qwen-VL 为什么必须单独读
 
-问题与约束：
-- 不同 VLM 的图片、视频、音频占位符可能是单 token，也可能是展开后的 token 序列。
-- 加载媒体时既要按文本切分特殊 token，也要在 input ids 中根据 modality 找 token id。
+`qwen_vl.py` 不是对基类的轻微包装，而是模型契约的集中地。它处理的典型问题包括：
 
-设计选择：
-- 用 `MultimodalSpecialTokens` 同时保存 token 字符串、token id 和 modality 正则，并在 `build()` 中补齐字符串、正则和组合正则。
+- 图片像素预算和 fast/base image processor 选择；
+- 视频采样、帧数、fps 与时间 metadata；
+- `grid_thw` 与 spatial merge 后的 token 数；
+- Qwen 系列 MRoPE position；
+- image/video/audio 特殊 token 的模型差异；
+- 部分 CPU/AMX 或设备专用预处理路径。
 
-**读法：**
-这个类把多模态占位符抽象成一个可查询对象：文本阶段用 `combined_regex` split prompt，收集阶段用 `get_modality_of_token` 判断片段属于哪种媒体，offset 阶段用 `get_token_id_by_modality` 找对应 token id。
+通用 processor 只保证框架级形状；Qwen-VL processor 决定“这份形状是否符合 Qwen-VL”。接入新模型时，应把模型专用约束放在对应 processor，而不是塞进基类。
 
-来源：python/sglang/srt/multimodal/processors/base_processor.py L84-L177
+## 8. `validate()` 仍是空壳
 
-**源码锚点：**
 ```python
-@dataclasses.dataclass
-class MultimodalSpecialTokens:
-    image_token: Optional[Union[str, List[str]]] = None
-    video_token: Optional[Union[str, List[str]]] = None
-    audio_token: Optional[Union[str, List[str]]] = None
-
-    image_token_id: Optional[int] = None
-    video_token_id: Optional[int] = None
-    audio_token_id: Optional[int] = None
-
-    image_token_regex: Optional[re.Pattern] = None
-    video_token_regex: Optional[re.Pattern] = None
-    audio_token_regex: Optional[re.Pattern] = None
-    combined_regex: Optional[re.Pattern] = None
-
-    def build(self, processor):
-        self.convert_to_strs(processor)
-        self.parse_regex()
-        self.get_combined_regex()
-        return self
-
-    def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
-        return {
-            Modality.IMAGE: self.image_token_id,
-            Modality.VIDEO: self.video_token_id,
-            Modality.AUDIO: self.audio_token_id,
-        }.get(modality)
+# 来源：python/sglang/srt/managers/schedule_batch.py L335-L338
+    def validate(self):
+        ...
+        # TODO
 ```
 
-代码逻辑：
-- `build()` 将 token id 转回 token 字符串，并补齐默认正则。
-- `get_modality_of_token()` 先查精确 token，再查 modality regex。
-- `get_combined_regex()` 把所有存在的 modality regex 合并成一个 split pattern。
-- `get_token_id_by_modality()` 为 offset 计算提供反向映射。
+这段极短代码比长篇注释更值得记住：当前基线没有一个统一入口证明 item 的 feature、offset、hash、grid 都自洽。严谨文档必须把验证责任描述为“分散式”，并在排障与实验里逐层验证。
 
-为什么这样写：
-- 文本切分、token id 替换、modality 判断使用同一份配置，避免每个 processor 重复维护占位符规则。
-- regex 支持展开后的图片 token 串，例如 Qwen-VL 的 vision start/pad/end 组合。
+## 9. hash、pad 与 RadixAttention
 
-不变量与失败模式：
-- 至少要有一个 modality token 或 regex；否则组合正则会没有有效模式。
-- token id 和 token 字符串必须对应同一 tokenizer，否则文本 split 和 ids offset 会出现不一致。
+每项媒体先对 feature 或 precomputed embedding 做 hash，再派生词表外 pad value。若设置 `SGLANG_MM_SKIP_COMPUTE_HASH`，则使用随机 UUID，等价于放弃跨请求的稳定内容身份。
 
-**要点：**
-这是多模态 prompt 解析的中心结构，后面的 fast path、legacy path 和 offset 计算都依赖它。
+TokenizerManager 允许外部路由器传 `mm_hashes`：
 
-### 2.3 `BaseMultimodalProcessor.__init__` 固定配置、执行器和字段归属表
+- item 数不匹配：整组忽略并内部重算；
+- 单项十六进制解析失败：该项回退内部重算；
+- 合法：写入 item.hash，使后续 pad 与外部路由身份一致。
 
-问题与约束：
-- 媒体加载包含 I/O、CPU 预处理和可选 CUDA IPC，不能阻塞 tokenizer event loop。
-- HF processor 输出字段很多，后续要把字段归属到 image/video/audio 的 `MultimodalDataItem`。
+`SGLANG_MM_PRECOMPUTE_HASH` 只决定 pad 是在 tokenizer 阶段算，还是留给 Scheduler。它不改变最终身份语义。
 
-设计选择：
-- 基类构造时保存 server 配置、拆分 image/video/audio 配置，创建 I/O 与 CPU executor，并维护字段名到 modality 的映射表。
+## 10. Scheduler 不是被动收件人
 
-**读法：**
-构造函数把 processor 子类共享的运行环境一次性准备好：解析 tokenizer，设置媒体处理配置，创建线程/进程池，维护 `ATTR_NAME_TO_MODALITY` 与 `FEATURE_NAMES`，并在启用 CUDA IPC 时给 tokenizer worker 分摊特征缓存池。
+`MultimodalInputs.from_processor_output()` 会重建 IPC、计算 hash/pad，并复制模型专用可选字段。
 
-来源：python/sglang/srt/multimodal/processors/base_processor.py L180-L282
-
-**源码锚点：**
 ```python
-class BaseMultimodalProcessor(ABC):
-    models = []
-    gpu_image_decode = True
-
-    def __init__(
-        self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
-    ):
-        self.hf_config = hf_config
-        self._processor = _processor
-        self.server_args = server_args
-        self.transport_mode = transport_mode
-
-        mm_process_config = self.server_args.mm_process_config
-        self.image_config = mm_process_config.get("image", {})
-        self.video_config = mm_process_config.get("video", {})
-        self.audio_config = mm_process_config.get("audio", {})
-
-        if hasattr(self._processor, "tokenizer"):
-            self._tokenizer = self._processor.tokenizer
-        else:
-            self._tokenizer = self._processor
-
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
-        )
-        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
-```
-
-代码逻辑：
-- 保存 config、processor、server args 和 transport mode。
-- 从 `mm_process_config` 拆出三类 modality 的配置。
-- 兼容直接传 tokenizer 或带 tokenizer 的 processor。
-- 建立 I/O thread pool 和 CPU process pool。
-- 后续代码继续定义字段归属表、feature 字段名以及可选 CUDA IPC pool。
-
-为什么这样写：
-- I/O 与 CPU 预处理被隔离到 executor，避免媒体解码拖慢请求主路径。
-- 字段归属表集中在基类，模型子类返回 HF processor output 时不必重复拆字段。
-
-不变量与失败模式：
-- `server_args.mm_process_config` 应该是按 modality 分组的 dict。
-- Windows 或非 fork 环境下进程池上下文可能需要特别注意；源码这里明确使用 `mp.get_context("fork")`。
-- CUDA IPC pool 的每 worker 分配依赖 `tokenizer_worker_num`，配置异常会影响特征缓存容量。
-
-**要点：**
-基类构造函数把“模型无关的多模态运行时”固定下来，子类主要补模型特有 token 和处理逻辑。
-
-## 3. Prompt、媒体和 `mm_items` 的组合
-
-### 3.1 `load_mm_data` 在 fast path 与 legacy path 之间做一致性分流
-
-问题与约束：
-- Prompt 中的多模态特殊 token 数量必须和实际传入媒体数量一致。
-- 离线预处理数据可能已经带 `input_ids` 和特征，不能再强行 decode 或重新加载。
-
-设计选择：
-- 先验证媒体数据，再对“预 tokenized 且媒体都已预处理”的请求直接返回；否则用组合正则统计 prompt 中 modality token 数，数量不一致或需要动态帧展开时转 legacy path。
-
-**读法：**
-`load_mm_data` 是媒体加载的路由层。它优先保护预处理输入的零拷贝/少处理路径；对普通文本 prompt，则通过 `MultimodalSpecialTokens` split 文本并统计 image/video/audio token，只有 token 数和媒体数完全对齐时才进入 fast load。
-
-来源：python/sglang/srt/multimodal/processors/base_processor.py L785-L864
-
-**源码锚点：**
-```python
-BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
-
-input_ids = prompt if isinstance(prompt, list) else None
-if input_ids is not None and self._all_mm_data_is_preprocessed(
-    image_data, video_data, audio_data
-):
-    return BaseMultiModalProcessorOutput(
-        input_text="",
-        input_ids=input_ids,
-        images=list(image_data or []),
-        videos=list(video_data or []),
-        audios=list(audio_data or []),
-    )
-
-multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
-if isinstance(prompt, list) and return_text:
-    assert len(prompt) and isinstance(prompt[0], int)
-    prompt = self._tokenizer.decode(prompt)
-
-text_parts = re.split(multimodal_tokens_pattern, prompt)
-cnt = {Modality.IMAGE: 0, Modality.VIDEO: 0, Modality.AUDIO: 0}
-for text_part in text_parts:
-    modality = multimodal_tokens.get_modality_of_token(text_part)
-    if modality is not None:
-        cnt[modality] += 1
-```
-
-代码逻辑：
-- 校验媒体输入格式。
-- 如果 prompt 已是 ids 且所有媒体都是预处理数据，直接构造 `BaseMultiModalProcessorOutput`。
-- 将 ids prompt decode 成文本，或直接使用字符串 prompt。
-- 用组合正则拆分文本，统计每种 modality 的占位符数量。
-- 数量不匹配、跳过 tokenizer 初始化或动态帧展开时转 legacy path，否则进 fast path。
-
-为什么这样写：
-- 预处理输入通常来自离线 engine API，重复 tokenize 或解码会改变用户给定 token。
-- fast path 只在 token 数和媒体数完全对齐时成立，避免图片/视频错配。
-
-不变量与失败模式：
-- `prompt` 最终必须是字符串；若 list prompt 为空或元素不是 int，会触发断言。
-- prompt 中 token 数和媒体列表长度不一致时不会走 fast path。
-- `support_dynamic_frame_expansion` 打开后，普通数量对齐也必须走 legacy path。
-
-**要点：**
-这里的关键判断是“是否能确定 prompt 占位符与媒体列表一一对应”。
-
-### 3.2 `build_input_ids` 把一个占位符扩展成真实视觉/音频 token span
-
-问题与约束：
-- 模型 forward 需要的不是一个图片 token，而是按 grid 或音频长度展开后的连续 token span。
-- scheduler 需要知道每个媒体对象在 `input_ids` 中的 offset，以便替换 pad value 和绑定特征。
-
-设计选择：
-- 基类按 prompt 中 image/video/audio token 的出现顺序扫描，依据 `grid_thw` 或 `audio_seq_lens` 计算 token 数，将占位符替换为重复的 modality token id，并记录 `(start, end)` offset。
-
-**读法：**
-`build_input_ids` 是从 prompt-level 占位符到 model-level token span 的转换点。它不处理特征张量，只根据模型输出的 grid/长度信息重写 `input_ids`，并返回保持出现顺序的 `modality_list`。
-
-来源：python/sglang/srt/multimodal/processors/base_processor.py L295-L360
-
-**源码锚点：**
-```python
-if not isinstance(prompt, list):
-    prompt = self._tokenizer.encode(prompt)
-
-img_token_id = getattr(self, "IM_TOKEN_ID", None)
-video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
-audio_token_id = getattr(self, "audio_token_id", None)
-spatial_merge_size = getattr(self, "spatial_merge_size", 1)
-
-vision_start_indices = []
-for i in range(len(prompt) - 1):
-    if img_token_id is not None and prompt[i + 1] == img_token_id:
-        vision_start_indices.append((i, Modality.IMAGE))
-    elif video_token_id is not None and prompt[i + 1] == video_token_id:
-        vision_start_indices.append((i, Modality.VIDEO))
-    elif audio_token_id is not None and prompt[i + 1] == audio_token_id:
-        vision_start_indices.append((i, Modality.AUDIO))
-
-for mm_start_idx, modality in vision_start_indices:
-    if modality == Modality.IMAGE:
-        mm_token_num = img_grid_thw[img_idx].prod() // (spatial_merge_size**2)
-        mm_token_id = img_token_id
-    elif modality == Modality.VIDEO:
-        mm_token_num = video_grid_thw[video_idx].prod() // (
-            spatial_merge_size**2
-        )
-        mm_token_id = video_token_id
-    elif modality == Modality.AUDIO:
-        mm_token_num = int(audio_seq_lens[audio_idx].item())
-        mm_token_id = audio_token_id
-
-    input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
-    mm_offset_start = len(input_ids)
-    input_ids.extend([mm_token_id] * mm_token_num)
-    offsets.append((mm_offset_start, len(input_ids) - 1))
-```
-
-代码逻辑：
-- 字符串 prompt 先由 tokenizer 编码成 ids。
-- 扫描 prompt 中紧跟在 start token 后的 modality token。
-- 图片和视频 token 数来自 `grid_thw.prod() / spatial_merge_size^2`。
-- 音频 token 数来自 `audio_seq_lens`。
-- 将一个占位符扩展成连续 token span，并记录 offset。
-
-为什么这样写：
-- 多模态特征长度由视觉网格或音频特征长度决定，不能只保留单个占位符。
-- offset 和 modality 顺序在这里同时生成，后续 `mm_items` 可以直接按同一顺序绑定特征切片。
-
-不变量与失败模式：
-- `img_grid_thw`、`video_grid_thw`、`audio_seq_lens` 的长度必须覆盖 prompt 中出现的对应媒体数量。
-- `spatial_merge_size` 必须与视觉模型实际 merge 规则一致，否则 token span 长度会错。
-- `cur_idx <= mm_start_idx` 断言保护 prompt 扫描顺序。
-
-**要点：**
-这一步把用户 prompt 的“语义占位符”改写成模型实际看到的“特征 token 区间”。
-
-### 3.3 `get_mm_data` 将预计算 embedding 切成带 offset 的 `MultimodalDataItem`
-
-问题与约束：
-- 离线或上游可能直接提供 image/video/audio embedding，而不是原始图片或视频。
-- embedding 是按 modality 拼接的，但 `input_ids` offset 是按 prompt 出现顺序排列的。
-
-设计选择：
-- 先复用 `build_input_ids` 生成 offsets 和 modality 顺序，再用每个 modality 的消费游标从 embedding dict 中切片，构造 `precomputed_embeddings` 类型的 `MultimodalDataItem`。
-
-**读法：**
-`get_mm_data` 把预计算特征接入同一个 scheduler 契约：`input_ids` 描述 token 序列，`mm_items` 保存每段特征及其 offset。不同 modality 的 embedding 被独立消费，避免图片和视频交错出现时切错特征。
-
-来源：python/sglang/srt/multimodal/processors/base_processor.py L362-L400
-
-**源码锚点：**
-```python
-input_ids, offsets, modality_list = self.build_input_ids(
-    prompt,
-    img_grid_thw=img_grid_thw,
-    video_grid_thw=video_grid_thw,
-    audio_seq_lens=audio_feature_lens,
-)
-assert all(isinstance(modality, Modality) for modality in modality_list)
-
-mm_items = []
-consumed_per_modality = {}
-
-for modality, offset in zip(modality_list, offsets):
-    num_tokens = offset[1] - offset[0] + 1
-    embedding_start = consumed_per_modality.get(modality, 0)
-    embedding_slice = embeddings[modality][
-        embedding_start : embedding_start + num_tokens
-    ]
-    consumed_per_modality[modality] = embedding_start + num_tokens
-    mm_items.append(
-        MultimodalDataItem(
-            modality=modality,
-            offsets=[offset],
-            precomputed_embeddings=embedding_slice,
-        )
-    )
-```
-
-代码逻辑：
-- 调用 `build_input_ids` 得到扩展后的 ids、offsets 和 modality 顺序。
-- 为每种 modality 维护已消费 token 数。
-- 按当前 offset 的 token 数从对应 modality embedding 中切片。
-- 将切片和 offset 包装成 `MultimodalDataItem`。
-- 返回 `MultimodalProcessorOutput`，同时填入 image/video token id。
-
-为什么这样写：
-- 同一 prompt 中可能出现“图、文、图、视频”的交错顺序；按 modality 独立消费才能保持特征和 offset 对齐。
-- 预计算 embedding 仍然进入标准 `MultimodalProcessorOutput`，scheduler 不需要关心特征来自哪里。
-
-不变量与失败模式：
-- `embeddings` 必须以 `Modality` 为 key，并且每种 modality 的长度不少于所有对应 offset token 数之和。
-- `modality_list` 和 `offsets` 必须一一对应。
-- 切片长度如果和 token span 不一致，会在后续模型输入对齐时暴露。
-
-**要点：**
-这段说明 SGLang 的多模态契约并不强制从原始媒体开始，也可以从预计算特征进入。
-
-### 3.4 `collect_mm_items_from_processor_output` 将 HF processor 字段归并到 `MultimodalDataItem`
-
-问题与约束：
-- HF processor 返回值可能是 dict，也可能是带属性对象；字段名随模型变化。
-- 一次 processor 输出可能同时包含 image、video、audio 字段，还可能包含 metadata、hash、pad value。
-
-设计选择：
-- 使用统一 getter 读取返回对象，先解析显式 modality，再按基类字段归属表把字段归到对应 `MultimodalDataItem`；metadata 字段跳过通用 set，单 item 场景再单独处理。
-
-**读法：**
-这个函数把模型专用 processor output 转成 scheduler 可理解的 `MultimodalDataItem`。特征字段名如 `pixel_values`、`pixel_values_videos`、`audio_features` 会被规范成 item 的 `feature`，非特征字段保存在 item 的模型专用数据里。
-
-来源：python/sglang/srt/multimodal/processors/base_processor.py L1098-L1186
-
-**源码锚点：**
-```python
-get_data_value = (
-    data_dict.get
-    if hasattr(data_dict, "get")
-    else lambda name, default=None: getattr(data_dict, name, default)
-)
-
-explicit_modality = modality
-modality_value = get_data_value("modality")
-if explicit_modality is None and modality_value is not None:
-    explicit_modality = (
-        modality_value
-        if isinstance(modality_value, Modality)
-        else Modality.from_str(str(modality_value))
-    )
-
-items: dict[Modality, MultimodalDataItem] = {}
-for attr_name, value in data_dict.items():
-    if attr_name in (
-        "input_ids",
-        "format",
-        "modality",
-        "hash",
-        "pad_value",
-        "offsets",
-    ):
-        continue
-
-    current_modality = explicit_modality or self.ATTR_NAME_TO_MODALITY.get(
-        attr_name
-    )
-
-    if attr_name == "precomputed_embeddings":
-        current_modality = current_modality or Modality.IMAGE
-```
-
-代码逻辑：
-- 构造兼容 dict 和对象属性的 getter。
-- 解析显式 modality 参数或返回对象里的 `modality` 字段。
-- 跳过 input ids、format、hash、pad value、offsets 等 metadata。
-- 用显式 modality 或字段归属表判断当前字段属于哪类媒体。
-- `precomputed_embeddings` 没有显式 modality 时默认归入 image。
-- 单 item 时，后续代码把 offsets、hash、pad value 从 tensor 转成 Python 类型。
-
-为什么这样写：
-- HF processor 输出不稳定，统一 getter 和字段映射能吸收模型差异。
-- metadata 不能和普通 tensor 字段一样塞进 item，否则 pad/hash/offset 的语义会混乱。
-
-不变量与失败模式：
-- 未出现在 `ATTR_NAME_TO_MODALITY` 且没有显式 modality 的字段不会生成 item。
-- 多 item 场景下 metadata 归属不明确，源码只在 `len(items) == 1` 时回填 offsets/hash/pad value。
-- 默认把裸 `precomputed_embeddings` 归为 image 是兼容策略，音频或视频预计算输入应显式提供 modality。
-
-**要点：**
-这是模型输出到 scheduler 输入的适配层，字段名差异在这里被压平。
-
-### 3.5 `process_and_combine_mm_data` 统一处理 raw、processor output 和预计算输入
-
-问题与约束：
-- 同一个请求可能包含原始媒体、已处理 processor output、预计算 embedding，甚至文本-only。
-- 重新 tokenize 可能导致 prompt token drift，但不处理 raw media 又无法得到真实特征长度。
-
-设计选择：
-- 先按 `BaseMultiModalProcessorOutput.organize_results()` 分类 raw 和 dict item；raw 走 processor，dict item 按 format 直通或包装；随后补齐 input ids、offsets，最后拆分 bundled item 并设置 pad value。
-
-**读法：**
-这个函数是多模态基类的汇合点。它把媒体形态差异收敛成三件事：一组 `MultimodalDataItem`、一个 tensor 化的 `input_ids`、以及 processor 返回的额外数据。对 raw image 的 retokenize drift，还提供 `SGLANG_MM_AVOID_RETOKENIZE` 保护路径。
-
-来源：python/sglang/srt/multimodal/processors/base_processor.py L1293-L1451
-
-**源码锚点：**
-```python
-all_loaded_data = base_output.organize_results()
-if not all_loaded_data:
-    input_ids = self._tokenizer(
-        base_output.input_text,
-        return_tensors="pt",
-        add_special_tokens=True,
-    ).input_ids.flatten()
-    return [], input_ids, {}
-
-dict_items, raw_images, raw_audios, raw_videos = [], [], [], []
-for modality, item in all_loaded_data:
-    if isinstance(item, dict):
-        dict_items.append((modality, item))
-    elif modality == Modality.IMAGE:
-        raw_images.append(item)
-    elif modality == Modality.AUDIO:
-        raw_audios.append(item)
-    elif modality == Modality.VIDEO:
-        raw_videos.append(item)
-
-if raw_images or raw_audios or raw_videos:
-    collected_items, input_ids, ret = self._process_and_collect_mm_items(
-        input_text=base_output.input_text,
-        images=raw_images,
-        audios=raw_audios,
-        videos=raw_videos,
-        **kwargs,
-    )
-    all_collected_items = collected_items
-```
-
-代码逻辑：
-- 无媒体时直接 tokenize 文本并返回空 `mm_items`。
-- 按 item 类型和 modality 将数据分为 dict、raw image、raw audio、raw video。
-- raw 媒体调用 `_process_and_collect_mm_items` 获取 processor output、input ids 和 items。
-- dict item 根据 format 进入 `PROCESSOR_OUTPUT` 或 `PRECOMPUTED_EMBEDDING` 分支。
-- 若还没有 input ids，则依次尝试 `base_output.input_ids`、dict item 的 `input_ids`、重新 tokenize 文本。
-- 对缺 offset 的 item，根据 modality token id 在 input ids 中查找 offset。
-- 调用 `get_new_expanded_mm_items` 拆分 bundled item，并给已处理/预计算 item 设置 pad value。
-
-为什么这样写：
-- 一个统一汇合点能让 raw media、离线 processor output 和预计算 embedding 共享后续 scheduler 逻辑。
-- offset 补齐放在最后，能覆盖 raw 和 dict 两类输入。
-- bundled item 拆分提高缓存粒度，避免多个媒体共享一个粗粒度缓存键。
-
-不变量与失败模式：
-- dict item 的 `format` 必须能被 `_get_preprocessed_input_format` 识别。
-- 缺 offset 的 item 必须能通过 modality 找到 token id，否则抛 `ValueError`。
-- `SGLANG_MM_AVOID_RETOKENIZE` 只覆盖“raw image 且无 audio/video”的场景，其他场景仍可能 fallback 到 decode+retokenize。
-
-**要点：**
-理解这段后，可以把多模态处理看成统一产物：`input_ids + mm_items + optional model-specific metadata`。
-
-### 3.6 `MultimodalProcessorOutput` 是 scheduler 前的稳定交付格式
-
-问题与约束：
-- processor 输出进入 scheduler 前，需要携带 input ids、已构造的媒体 item、padding/hash 信息和模型专用位置字段。
-- scheduler 需要把媒体 token span 替换为 pad value，但只有 item 具备 hash/pad/offset 时才能安全替换。
-
-设计选择：
-- 用 `MultimodalProcessorOutput` dataclass 固定字段集合，并提供 `build_padded_input_ids` 在 item 完整时构造 padded ids。
-
-**读法：**
-这个输出结构是 processor 与 scheduler 的边界。它把通用的 `mm_items`、input ids、image/video/audio token id、Qwen MRoPE、Moss-VL 字段和 Transformers 兼容字段放在同一个 typed object 里，减少 dict 字段拼写错误。
-
-来源：python/sglang/srt/managers/schedule_batch.py L380-L461
-
-**源码锚点：**
-```python
-@dataclasses.dataclass
-class MultimodalProcessorOutput:
-    mm_items: List[MultimodalDataItem]
-    input_ids: Optional[List[int]] = None
-    padded_input_ids: Optional[List[int]] = None
-
-    im_token_id: Optional[int] = None
-    im_start_id: Optional[int] = None
-    im_end_id: Optional[int] = None
-    video_token_id: Optional[int] = None
-    audio_token_id: Optional[int] = None
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-    token_type_ids: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def build_padded_input_ids(input_ids, mm_items: List[MultimodalDataItem]):
-        if input_ids is None or not mm_items:
-            return None
+# 来源：python/sglang/srt/managers/schedule_batch.py L505-L544
+    def from_processor_output(obj: MultimodalProcessorOutput):
+        mm_items = obj.mm_items
+        assert isinstance(mm_items, list)
+        mm_items = [item for item in mm_items if item.is_valid()]
+
+        # try reconstructing from cuda-ipc
+        reconstruct_device = None
+        for mm_item in mm_items:
+            if mm_item.has_cuda_ipc_proxy():
+                if reconstruct_device is None:
+                    reconstruct_device = torch.cuda.current_device()
+                mm_item.reconstruct(reconstruct_device)
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            # Multi-modal feature hashing optimization:
+            # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
+            # for faster hash computation, while avoiding OOM issues.
+            from sglang.srt.managers.mm_utils import (
+                init_feature_buffer,
+                is_feature_buffer_initialized,
+                reset_buffer_offset,
+                try_add_to_buffer,
+            )
+
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
+            for item in mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
 
         for item in mm_items:
-            if item.pad_value is None or item.offsets is None:
-                return None
+            item.set_pad_value()
 
-        padded_input_ids = list(input_ids)
-        for item in mm_items:
-            for start, end in item.offsets:
-                padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
-        return padded_input_ids
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            for item in mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
 ```
 
-代码逻辑：
-- dataclass 声明 processor 到 scheduler 的所有可选字段。
-- `from_dict` 兼容旧 dict 输出。
-- `build_padded_input_ids` 在 input ids、items、pad value、offsets 都存在时才替换。
-- 每个 item 的 offset span 被 item 的 `pad_value` 覆盖。
+“临时上 GPU 算 hash，随后回 CPU”说明 feature 的 device 位置是实现策略，不是语义身份。监控和断点应记录每一站的 device，而不是假定一次驻留后永不变化。
 
-为什么这样写：
-- scheduler 可以先处理文本 token，再通过 pad value/hash 将多模态特征关联到缓存和模型输入。
-- 字段可选让不同模型只填自己需要的 position 或 modality 信息。
+## 11. CUDA IPC 为什么不是零复制
 
-不变量与失败模式：
-- `mm_items` 是必填；没有 item 时 padded ids 返回 None。
-- 任一 item 缺少 `pad_value` 或 `offsets`，就不能构造 padded ids。
-- 如果 input ids 是 tensor，需要先 flatten/list 化；源码包含 tensor 分支。
+producer 侧 proxy 保存 CUDA storage handle、shape、dtype、stride、offset 与共享同步区 metadata。consumer 打开 storage slice后，仍会创建新的目标 tensor 并 copy：
 
-**要点：**
-这是多模态 processor 最终交给调度层的“稳定合同”。
-
-## 4. Qwen-VL 代表实现
-
-### 4.1 Qwen-VL 常量把图像、视频预算对齐到 patch/grid 约束
-
-问题与约束：
-- Qwen-VL 系列视觉 token 数由图像尺寸、patch/grid 和 spatial merge 决定。
-- 用户可能传入超大图片或长视频，需要在预处理阶段限制像素和帧数，避免显存和计算爆炸。
-
-设计选择：
-- 在 processor 模块层定义 image/video 的 factor、min/max pixels、frame factor、fps 上下限，并允许部分预算通过环境变量调整。
-
-**读法：**
-Qwen-VL 的多模态 processor 先导入模型类、`MRotaryEmbedding` 和基类契约，再定义 `IMAGE_FACTOR=28`、图片像素上下限、视频总像素预算、帧率/帧数限制。这些常量会被 `smart_resize`、`smart_nframes` 和视频预处理复用。
-
-来源：python/sglang/srt/multimodal/processors/qwen_vl.py L1-L60
-
-**源码锚点：**
 ```python
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
-from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
+# 来源：python/sglang/srt/utils/cuda_ipc_transport_utils.py L407-L430
+    def _copy_slice_tensor_to_target(
+        self,
+        slice_tensor: torch.Tensor,
+        rebuild_device: torch.device,
+        recons_shape,
+        recons_dtype,
+    ):
+        with torch.cuda.device(rebuild_device):
+            reconstructed_tensor = torch.empty(
+                recons_shape, dtype=recons_dtype, device=rebuild_device
+            ).contiguous()
+            reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
 
-IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
-MAX_RATIO = 200
-VIDEO_TOTAL_PIXELS = int(
-    float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9))
-)
+            open(SHM_LOCK_FILE, "a").close()
+            # write the shm_sync_buffer with a file lock
+            with open(SHM_LOCK_FILE, "w+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                sync_flag = self.get_sync_flag
+                sync_flag += 1
+                fcntl.flock(f, fcntl.LOCK_UN)
 
-VIDEO_MIN_PIXELS = 128 * 28 * 28
-VIDEO_MAX_PIXELS = 768 * 28 * 28
-FRAME_FACTOR = 2
-FPS = 2.0
-FPS_MIN_FRAMES = 4
-FPS_MAX_FRAMES = 768
+            self.close_shm()
+
+        return reconstructed_tensor
 ```
 
-代码逻辑：
-- 导入 MRoPE、scheduler 数据结构和 processor 基类。
-- 定义图像尺寸对齐 factor 和像素上下限。
-- 从环境变量读取图片/视频上限。
-- 定义视频帧数必须对齐的 factor 和默认 FPS 策略。
+共享计数的含义是“这个 consumer 已完成复制”。当预期 TP consumers 都完成后，producer pool 才能回收对应 chunk。
 
-为什么这样写：
-- factor 和像素预算必须与模型视觉 patch/grid 规则一致，否则 token 数和视觉特征会不匹配。
-- 环境变量让部署侧可以按显存和吞吐调整上限，而不改代码。
+### pool 大小陷阱
 
-不变量与失败模式：
-- 输入图像长宽比超过 `MAX_RATIO` 会在 `smart_resize` 中报错。
-- 视频总像素预算和帧数上限过大时会增加视觉编码成本；过小则可能损失视觉信息。
+每 worker 至少 128 MiB：
 
-**要点：**
-Qwen-VL processor 的大部分“模型特异性”首先体现在这些预算和对齐常量上。
-
-### 4.2 `smart_resize` 在长宽比、像素预算和 factor 对齐之间折中
-
-问题与约束：
-- 图像尺寸必须能被 factor 整除，且总像素要落在模型可接受范围内。
-- 直接裁剪会改变图像语义，直接缩放到固定尺寸又可能破坏宽高比。
-
-设计选择：
-- 先按 factor 近似取整，再根据最大/最小像素预算按面积比例缩放，并用 floor/ceil 到 factor 的倍数。
-
-**读法：**
-`smart_resize` 先拒绝极端长宽比，再得到 factor 对齐后的 `h_bar/w_bar`。若面积超过 `max_pixels`，用 `sqrt(height*width/max_pixels)` 计算缩小比例；若低于 `min_pixels`，用相反比例放大；最终返回仍满足 factor 对齐的尺寸。
-
-来源：python/sglang/srt/multimodal/processors/qwen_vl.py L80-L110
-
-**源码锚点：**
 ```python
-def smart_resize(
-    height: int,
-    width: int,
-    factor: int = IMAGE_FACTOR,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-) -> tuple[int, int]:
-    if max(height, width) / min(height, width) > MAX_RATIO:
-        raise ValueError(
-            f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
-        )
-    h_bar = max(factor, round_by_factor(height, factor))
-    w_bar = max(factor, round_by_factor(width, factor))
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = floor_by_factor(height / beta, factor)
-        w_bar = floor_by_factor(width / beta, factor)
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = ceil_by_factor(height * beta, factor)
-        w_bar = ceil_by_factor(width * beta, factor)
-    return h_bar, w_bar
+# 来源：python/sglang/srt/multimodal/processors/base_processor.py L265-L269
+            worker_num = self.server_args.tokenizer_worker_num
+            per_worker_pool_size = max(
+                MM_FEATURE_CACHE_SIZE // worker_num,
+                128 * 1024 * 1024,
+            )
 ```
 
-代码逻辑：
-- 检查长宽比是否超过 `MAX_RATIO`。
-- 将高宽 round 到 factor 的倍数，且至少为 factor。
-- 面积超过上限时按面积比例缩小，并向下对齐 factor。
-- 面积低于下限时按面积比例放大，并向上对齐 factor。
-- 返回新的高宽。
+所以配置的全局预算更像“参与计算的目标值”，不是硬总上限。
 
-为什么这样写：
-- 视觉 token 数近似与像素面积成正比，面积约束就是 token 预算约束。
-- factor 对齐保证后续 patch/grid 计算不会产生非整数 token。
-- 保持宽高同比例缩放，尽量不改变视觉内容比例。
+## 12. feature 驻留策略
 
-不变量与失败模式：
-- `height` 和 `width` 必须为正数。
-- 极端长宽比直接抛错，而不是试图压缩到模型不可解释的形态。
-- `max_pixels` 和 `min_pixels` 配置不合理时，可能导致过度缩放或低质量输入。
+`keep_mm_feature_on_device=False` 时，普通 processor 路径倾向把 feature 移回 CPU；CUDA IPC 路径会跳过那次 CPU move。开启该参数后，即使 pool 包装失败，也可能继续保留 CUDA tensor。
 
-**要点：**
-这是 Qwen-VL 图片预处理里最直接控制 token 成本的函数。
+准确的判断表：
 
-### 4.3 `smart_nframes` 和 `preprocess_video` 把长视频转换成受控帧序列
+| IPC | keep on device | 可能结果 |
+|---|---|---|
+| 可用且入池 | 任意 | proxy 跨进程，consumer 重建并 device copy |
+| pool 满/包装失败 | false | fallback 到 CPU feature |
+| pool 满/包装失败 | true | fallback 保留 CUDA tensor |
 
-问题与约束：
-- 视频输入同时受总帧数、原始 FPS、目标 FPS、最小/最大帧数和总像素预算约束。
-- 视频帧数还需要对齐 `FRAME_FACTOR`，否则模型侧时间维 token 可能不匹配。
+实际分支仍应以当前函数为准；表格表达的是设计语义，不是替代源码。
 
-设计选择：
-- `smart_nframes` 从显式 `nframes` 或目标 `fps` 二选一计算帧数；`preprocess_video` 再等距抽帧、按每帧像素预算 resize，并返回视频 metadata。
+## 13. ViT CUDA Graph：总长度不是完整布局
 
-**读法：**
-Qwen-VL 视频路径先计算应抽取的帧数，再用 `np.linspace` 在原视频范围内等距取帧。每帧最大像素受总像素预算按帧数摊分限制，随后复用 `smart_resize` 得到尺寸，并通过 torchvision resize 得到 `TCHW` tensor。
-
-来源：python/sglang/srt/multimodal/processors/qwen_vl.py L130-L256
-
-**源码锚点：**
 ```python
-assert not (
-    "fps" in ele and "nframes" in ele
-), "Only accept either `fps` or `nframes`"
-if "nframes" in ele:
-    nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
-else:
-    fps = ele.get("fps", FPS)
-    min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
-    max_frames = floor_by_factor(
-        ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR
-    )
-    nframes = total_frames / video_fps * fps
-    nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
-    nframes = floor_by_factor(nframes, FRAME_FACTOR)
-
-idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
-idx = np.unique(idx)
-video = vr.get_frames_as_tensor(idx.tolist())
-video = video.permute(0, 3, 1, 2)
+# 来源：python/sglang/srt/multimodal/vit_cuda_graph_runner.py L115-L118
+    def _get_graph_key(self, x_3d: torch.Tensor) -> int:
+        # x_3d: [S, B, H], B=1, S as graph_key
+        return x_3d.shape[0]
 ```
 
-代码逻辑：
-- 禁止同时指定 `fps` 和 `nframes`。
-- 显式帧数路径按 `FRAME_FACTOR` 四舍五入。
-- FPS 路径根据原始时长估算帧数，再夹到最小/最大帧数和总帧数范围。
-- 等距抽帧后去重，读取帧 tensor。
-- 将 `NHWC` 转成 `TCHW`，再按像素预算 resize。
-- 返回视频 tensor 和包含 FPS、duration、帧索引、backend 的 metadata。
+graph 首次 capture 时还接收 `cu_seqlens`、`cu_window_seqlens`、position embeddings 等。key 却只有 `S`。因此：
 
-为什么这样写：
-- FPS 路径保留时间覆盖范围，`nframes` 路径满足用户显式预算。
-- 总像素预算按帧数摊分，避免“帧多且每帧很大”同时发生。
-- metadata 保留原始时长和帧索引，便于后续时间相关模型逻辑。
+- 同 `S`、同分段布局：合理复用候选；
+- 同 `S`、不同图片数量或窗口分段：可能复用旧 metadata；
+- 当前代码没有以布局差异触发 eager fallback 的判断。
 
-不变量与失败模式：
-- `fps` 和 `nframes` 只能二选一。
-- `nframes` 必须在 `[FRAME_FACTOR, total_frames]` 内，否则抛 `ValueError`。
-- `np.unique` 可能在极短视频或重复索引场景减少实际帧数，后续逻辑必须使用实际 tensor 形状。
+这是“形状稳定”与“语义布局稳定”不同的典型例子。
 
-**要点：**
-视频路径的目标不是简单解码，而是在时间覆盖、帧数和每帧 token 预算之间做可控折中。
+## 14. 自动截断为何跨层危险
 
-### 4.4 `QwenVLImageProcessor` 声明支持架构、特殊 token 和 MRoPE 计算
+Processor 已可能生成展开后的 input ids 和 offsets。之后 `_validate_one_request()` 若发现超长，会直接 `del input_ids[_max_req_len:]`。它没有同步更新 `mm_inputs`。
 
-问题与约束：
-- Qwen2-VL、Qwen2.5-VL、Qwen3-VL、Omni 等模型共享相似视觉占位符，但配置字段和位置编码细节不同。
-- 多模态 rotary 需要 image/video grid 信息，不能只依赖普通 token position。
+因此安全边界是：
 
-设计选择：
-- Qwen processor 在 class-level 声明支持架构和 Transformers backend 兼容；初始化时从 hf config 读取 token id，构造 vision start/pad/end 的特殊 token regex；`compute_mrope_positions` 调用 `MRotaryEmbedding.get_rope_index`。
+- 纯文本尾部截断通常只影响文本；
+- 截断点进入媒体 span，就可能使 offsets、feature 数和 token span 不一致；
+- 当前空 `validate()` 不会统一捕获这种破坏。
 
-**读法：**
-这个类把 Qwen 系列模型和基类契约连起来：`models` 让注册表能命中，`mm_tokens` 让 prompt split 和 offset 计算认识 Qwen 的 vision token 串，`compute_mrope_positions` 则把 `mm_items` 中的 grid 合并后交给 MRoPE。
+生产建议是提前做多模态 token 预算，而不是依赖此开关兜底。
 
-来源：python/sglang/srt/multimodal/processors/qwen_vl.py L260-L416
+## 15. Encoder disaggregation 改变了什么
 
-**源码锚点：**
-```python
-class QwenVLImageProcessor(SGLangBaseProcessor):
-    supports_transformers_backend = True
-    models = [
-        Qwen2VLForConditionalGeneration,
-        Qwen2_5_VLForConditionalGeneration,
-        Qwen3VLForConditionalGeneration,
-        Qwen3VLMoeForConditionalGeneration,
-        Qwen3_5ForConditionalGeneration,
-        Qwen3_5MoeForConditionalGeneration,
-        Qwen3_5ForCausalLMMTP,
-        InternS2PreviewForConditionalGeneration,
-        Qwen3OmniMoeForConditionalGeneration,
-    ]
+### 15.1 角色
 
-    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        self.model_type = hf_config.model_type
-        if hf_config.model_type == "qwen3_omni_moe":
-            hf_config = hf_config.thinker_config
+- `encoder_only`：只加载 encoder/processor 相关权重与服务；
+- `language_only`：语言侧可从远端 encoder 接收 embedding；
+- 两者互斥；encoder-only 也不与 PD prefill/decode 混用。
 
-        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+### 15.2 传输 backend
 
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.IM_TOKEN_ID = hf_config.image_token_id
-        self.VIDEO_TOKEN_ID = hf_config.video_token_id
+| backend | embedding 到哪里 | 关键生命周期 |
+|---|---|---|
+| `zmq_to_tokenizer` | TokenizerManager | tokenizer 等待 embedding 后再发 Scheduler |
+| `zmq_to_scheduler` | Scheduler endpoint | encoder 可等待 scheduler 注册 receive URL |
+| `mooncake` | 远端 buffer/RDMA | `/encode` 可先回 metadata，`/send` 等 ready 后传输 |
 
-        self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<|vision_start|><|image_pad|><|vision_end|>",
-            image_token_id=hf_config.image_token_id,
-            image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-            ),
-            video_token_id=self.VIDEO_TOKEN_ID,
-            audio_token_id=self.audio_token_id,
-        ).build(_processor)
-```
+ZMQ 路径把 embedding 转 CPU contiguous `TensorWrapper` 后 multipart 发送；它不是 GPU RDMA。Mooncake 则把元数据响应和真正数据 transfer 分成两个阶段。
 
-代码逻辑：
-- class-level `models` 列出注册表可匹配的模型架构。
-- `supports_transformers_backend=True` 允许 Transformers backend 下仍用该 processor。
-- Omni 模型使用 `thinker_config` 进入通用 Qwen 视觉配置。
-- 初始化 image/video/audio token id，并构造 Qwen vision token regex。
-- `compute_mrope_positions` 合并 image/video grid 后调用 `MRotaryEmbedding.get_rope_index`。
+### 15.3 Encoder batching 与缓存
 
-为什么这样写：
-- Qwen 系列模型多，但视觉 token 和 MRoPE 契约高度相似，可以共享一个 processor。
-- regex 匹配展开后的 `<|image_pad|>` 序列，适配已经包含多个 image pad 的 prompt。
-- MRoPE 由 processor 计算后传给模型，避免 scheduler 推测模型专用位置编码。
+image/audio 可跨请求 fusion；video 因每请求预处理 metadata 不同，不进入同样的 batch fusion。prefix MM cache 与 global cache 可跳过重复 ViT，但 TP rank 任一 cache hit 失败会广播 fallback mask，让所有 rank 一致重跑，避免分布式分歧。
 
-不变量与失败模式：
-- `hf_config` 必须提供 vision/image/video token id；缺字段会在初始化阶段失败。
-- `mm_items` 必须包含正确的 `image_grid_thw`、`video_grid_thw`，否则 MRoPE position 会错。
-- Omni 的配置分支依赖 `thinker_config` 存在。
+### 15.4 DP dispatcher
 
-**要点：**
-Qwen-VL 是典型的模型专用 processor：它不重写所有基类流程，而是提供模型需要的 token、grid 和位置编码细节。
+DP encoder 要求 `dp_size > 1` 且 `tp_size == 1`。dispatcher 按最少 pending 加 round-robin 选 rank，并保存 `req_id → rank`，确保后续 `/send` 回到执行 `/encode` 的同一 worker。watchdog、result listener 超时和 stale mapping 清理共同防止死 worker 永久占住请求。
 
-## 5. 视觉运行时优化
+### 15.5 动态发现
 
-### 5.1 ViT CUDA Graph runner 用 shape key 捕获并复用视觉 block 执行图
+`language_only` 可不提供静态 `encoder_urls`，由 bootstrap server 接受 encoder 注册。encoder 启动后在后台重试注册，不阻塞自身启动；退出时尝试注销。
 
-问题与约束：
-- ViT block 在小 batch 或固定形状视觉输入上有明显 kernel launch overhead。
-- CUDA Graph 要求输入 buffer、position embedding workspace 和输出 buffer 形状稳定。
+## 16. 参数校验顺序为什么值得读
 
-设计选择：
-- `run` 先把 `[seq_len, hidden]` 变成 `[S, B=1, H]`，用形状生成 graph key；没有图时创建，有图时更新 workspace/input 并 replay。
+`ServerArgs.__post_init__()` 先做 `mm_process_config` 浅层结构校验，再加载模型并处理大量 backend/default，之后才执行 `_handle_encoder_disaggregation()`、tokenizer batching 和其他校验。
 
-**读法：**
-runner 的 `run` 负责 graph lifecycle，`replay` 负责把新输入和位置编码拷入已捕获 graph 的 workspace。可选的 `output_indices` 用于 Qwen2.5-VL window permutation 的逆重排。
+这意味着：
 
-来源：python/sglang/srt/multimodal/vit_cuda_graph_runner.py L330-L388
+- `mm_process_config` 通过只说明形状像 `{image:{}, video:{}, audio:{}}`，不说明模型支持全部键；
+- VLM 会根据 vision config 启发式降低 `mem_fraction_static`，给视觉处理留空间；
+- `limit_mm_data_per_request` 的 modality key 校验更晚；
+- tokenizer batch encode 与 dynamic tokenizer 互斥，并且 generation 多模态会额外拒绝 batch encode。
 
-**源码锚点：**
-```python
-if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-    head_dim = rotary_pos_emb_cos.shape[1]
-    self._ensure_sin_cos_ws(graph_key, head_dim)
-    used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-    used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-    used_cos_ws.copy_(rotary_pos_emb_cos)
-    used_sin_ws.copy_(rotary_pos_emb_sin)
+读参数时要问“用户输入值是什么、哪一步被自动改写、最终运行值是什么”，而不是只看 dataclass 默认值。
 
-self.block_input[graph_key].copy_(x_3d)
-self.block_graphs[graph_key].replay()
-out = self.block_output[graph_key]
+## 17. 运行验证
 
-if output_indices is not None:
-    out = out.index_select(0, output_indices)
-
-def run(
-    self,
-    x: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_window_seqlens: torch.Tensor,
-    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-    rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-    output_indices: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    x_3d = x.unsqueeze(1)
-    graph_key = self._get_graph_key(x_3d)
-```
-
-代码逻辑：
-- 根据 rotary 输入更新 sin/cos workspace。
-- 将当前 `x_3d` 拷入 graph 对应输入 buffer。
-- replay 已捕获 graph，并读取对应输出 buffer。
-- 如需重排，按 `output_indices` 做 `index_select`。
-- `run` 中先扩 batch 维，再按 shape key 创建或复用 graph。
-
-为什么这样写：
-- CUDA Graph replay 只能复用已捕获的静态 buffer，更新输入必须用 copy 到 graph buffer 的方式完成。
-- shape key 避免不同长度的视觉 token 误用同一张 graph。
-- 输出重排放在 replay 后，保留 graph 内部固定执行形态。
-
-不变量与失败模式：
-- 新输入形状必须与 graph key 对应 buffer 兼容。
-- position embedding 或 rotary workspace 维度必须和捕获时一致。
-- 未命中的 shape 会创建新 graph，形状过多会增加 graph 缓存占用。
-
-**要点：**
-这段优化只改变视觉编码执行方式，不改变 processor 和 scheduler 之间的 `mm_items` 契约。
-
-### 5.2 EVS 用跨帧差异度裁剪长视频 token
-
-问题与约束：
-- 长视频的视觉 token 数随帧数线性增长，直接保留全部 token 会拉高显存和 attention 成本。
-- 首帧通常提供全局上下文，不能因为裁剪率高而全部丢失。
-
-设计选择：
-- 先计算最少保留 token 数，保证至少保留一帧；再用相邻帧 cosine dissimilarity 排序，保留差异最大的 token，并人为提升首帧权重。
-
-**读法：**
-EVS 的 retention mask 将 video embeddings reshape 成 `[T, H', W', hidden]`，比较相邻帧同空间位置的相似度，以 `1 - similarity` 作为变化量。首帧 dissimilarity 被设为很高，确保首帧 token 总能进入 top-k。
-
-来源：python/sglang/srt/multimodal/evs/evs_core.py L21-L97
-
-**源码锚点：**
-```python
-def compute_retained_tokens_count(
-    tokens_per_frame: int, num_frames: int, q: float
-) -> int:
-    total_tokens = tokens_per_frame * num_frames
-    evs_num_tokens = int(total_tokens * (1 - q))
-    min_num_tokens = tokens_per_frame
-    return max(min_num_tokens, evs_num_tokens)
-
-T, H, W = map(int, video_size_thw)
-video_embeds = video_embeds.reshape(
-    T,
-    H // spatial_merge_size,
-    W // spatial_merge_size,
-    video_embeds.size(-1),
-)
-tokens_per_frame = (H // spatial_merge_size) * (W // spatial_merge_size)
-similarity = torch.nn.functional.cosine_similarity(
-    video_embeds[1:, ...], video_embeds[:-1, ...], dim=-1
-)
-dissimilarity = 1 - similarity
-dissimilarity = torch.cat(
-    [255 * torch.ones_like(video_embeds[:1, :, :, 0]), dissimilarity], dim=0
-)
-order = torch.argsort(dissimilarity.view(-1), dim=-1, descending=True, stable=True)
-```
-
-代码逻辑：
-- `compute_retained_tokens_count` 根据裁剪率计算保留数量，并至少保留一帧 token。
-- 将扁平 video embedding reshape 回时间和空间网格。
-- 计算相邻帧同位置 embedding 的 cosine similarity。
-- 用 `1 - similarity` 表示变化量。
-- 首帧变化量填成高值，保证进入保留集合。
-- 对扁平变化量稳定降序排序，取前 `retain_num_tokens` 构造 boolean mask。
-
-为什么这样写：
-- 变化大的 token 更可能携带新增视觉信息，适合作为长视频裁剪依据。
-- 首帧保留策略给模型稳定的场景起点，避免视频只剩中后段局部变化。
-- stable sort 让相同分数下的选择更可复现。
-
-不变量与失败模式：
-- `video_size_thw` 与 `video_embeds` 长度必须满足 `T * H/spatial_merge_size * W/spatial_merge_size`。
-- `q` 应在 `[0, 1)`；过高会退化为只保留首帧级别 token。
-- 相邻帧差异度只衡量局部变化，静态但语义重要的后续帧可能被裁掉。
-
-**要点：**
-EVS 是多模态长视频路径的 token 预算阀门，和前面的 Qwen 视频抽帧共同控制视觉输入规模。
-
-## 6. 运行验证
-
-这条多模态主线可以先用静态检索验证，不必启动 VLM 服务。检查目标是确认四个边界仍然存在：Processor 选择、prompt/media 组合、模型专用 Qwen-VL 处理、视觉运行时优化。
+### 17.1 语法与入口
 
 ```powershell
-rg -n "PROCESSOR_MAPPING|import_processors|get_mm_processor|MultimodalSpecialTokens|load_mm_data|build_input_ids|collect_mm_items_from_processor_output|process_and_combine_mm_data|MultimodalProcessorOutput|smart_resize|smart_nframes|QwenVLImageProcessor|_get_graph_key|replay|compute_retained_tokens_count|cosine_similarity|argsort" `
-  sglang/python/sglang/srt/managers/multimodal_processor.py `
-  sglang/python/sglang/srt/multimodal/processors/base_processor.py `
-  sglang/python/sglang/srt/multimodal/processors/qwen_vl.py `
-  sglang/python/sglang/srt/multimodal/vit_cuda_graph_runner.py `
-  sglang/python/sglang/srt/multimodal/evs/evs_core.py `
-  sglang/python/sglang/srt/managers/schedule_batch.py
+@(
+  'sglang/python/sglang/srt/managers/multimodal_processor.py',
+  'sglang/python/sglang/srt/multimodal/processors/base_processor.py',
+  'sglang/python/sglang/srt/multimodal/processors/qwen_vl.py',
+  'sglang/python/sglang/srt/managers/schedule_batch.py',
+  'sglang/python/sglang/srt/managers/tokenizer_manager.py',
+  'sglang/python/sglang/srt/multimodal/customized_mm_processor_utils.py',
+  'sglang/python/sglang/srt/multimodal/evs/evs_core.py',
+  'sglang/python/sglang/srt/multimodal/vit_cuda_graph_runner.py',
+  'sglang/python/sglang/srt/utils/cuda_ipc_transport_utils.py',
+  'sglang/python/sglang/srt/disaggregation/encode_server.py',
+  'sglang/python/sglang/srt/server_args.py'
+) | ForEach-Object { python -m py_compile $_ }
 ```
 
-预期现象：
+预期：11 个文件都能编译。该检查只证明语法，不证明运行语义。
 
-- `multimodal_processor.py` 命中 `PROCESSOR_MAPPING`、`import_processors` 和 `get_mm_processor`，证明模型架构到 processor 的选择仍在 manager 层完成。
-- `base_processor.py` 命中特殊 token、媒体加载、`build_input_ids`、`collect_mm_items_from_processor_output` 和 `process_and_combine_mm_data`，证明 prompt 占位符到 `mm_items` 的转换仍由基类主导。
-- `schedule_batch.py` 命中 `MultimodalProcessorOutput`，证明交付给 scheduler 的稳定对象没有换名。
-- `qwen_vl.py` 命中 `smart_resize`、`smart_nframes` 和 `QwenVLImageProcessor`，证明 Qwen-VL 的像素/帧预算和模型专用 processor 仍在同一实现内。
-- `vit_cuda_graph_runner.py` 命中 shape key 与 replay，`evs_core.py` 命中保留 token 数、相邻帧相似度和排序，证明运行时优化没有进入通用 processor 契约。
+### 17.2 静态语义实验
 
-如果某条命中消失，先不要直接改本文结论；应回到对应文件看职责是否迁移。例如 `build_input_ids` 消失通常意味着占位符展开路径重构，`MultimodalProcessorOutput` 消失则表示 scheduler 交付契约发生了更大变化。
+```powershell
+rg -n "def validate\(|\.\.\.|TODO" sglang/python/sglang/srt/managers/schedule_batch.py
+rg -n "del input_ids\[_max_req_len:\]" sglang/python/sglang/srt/managers/tokenizer_manager.py
+rg -n "return x_3d.shape\[0\]" sglang/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
+rg -n "torch.empty\(|copy_\(slice_tensor\)" sglang/python/sglang/srt/utils/cuda_ipc_transport_utils.py
+```
+
+预期：分别证实空校验、仅裁 token、graph key 仅 `S`、consumer 新分配并复制。
+
+### 17.3 有 GPU 时的最小对照
+
+1. 同一图片跑 CPU feature transport 与 CUDA IPC，比较 logits/embedding。
+2. 构造同 `S` 不同分段布局，比较 ViT eager 与 graph。
+3. 构造接近 context limit 的媒体请求，确认禁用 auto truncate 时得到明确错误。
+4. 重复同一媒体，观察 hash/pad 与 prefix cache hit 是否稳定。
+
+预期：transport 只改变性能不改变结果；若 graph 布局实验不一致，应立即禁用或修正 key；超长请求不应静默破坏 offset。
+
+## 复盘
+
+源码主线不是“图片经过哪些函数”，而是“谁在每一步拥有文本位置与媒体内容之间的对应关系”。Processor 建立它，TokenizerManager 搬运它，Scheduler重建并内容寻址，模型执行兑现它；IPC、graph、cache 和 encoder disaggregation 都只能优化这条契约，不能改写它。

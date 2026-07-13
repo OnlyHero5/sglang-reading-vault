@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练步骤 · 源码走读
 
@@ -24,6 +24,8 @@ updated: 2026-07-10
 - `_get_rollout_data` 在 DP rank、本地 GPU、CP slicing 之间做了什么。
 - Actor 为什么可能做 ref/teacher/actor 三类 log-prob forward。
 - `model.train_one_step` 如何把 rollout 字段接入 Megatron `forward_backward_func`。
+- actor/critic 并行拓扑如何同时影响 DP schedule 和 values 的 worker 对齐。
+- 哪些长生命周期状态没有异常回滚，为什么失败后原地重试不可靠。
 
 ## 长文读法
 
@@ -71,7 +73,7 @@ flowchart TD
 源码入口：来源：train.py L63-L89
 
 ```python
-# 来源：train.py L67-L89
+# 定位骨架（基于 `train.py` L67-L89；省略保存周期分支）
 rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
 if args.offload_rollout:
@@ -98,7 +100,7 @@ actor_model.update_weights()
 
 - `rollout_data_ref` 是 rollout 侧已经切好的 `list[Box]`。
 - `num_critic_only_steps` 会让前几轮只训 critic，不训 actor。
-- actor 训练完成后，主循环才进入 `update_weights`，避免 rollout engine 提前看到半更新状态。
+- 同步主循环在 actor 训练完成后才进入 `update_weights`，避免 rollout engine 提前看到半更新状态；async 主循环则按 `update_weights_interval` 延迟同步。
 
 ## 2. async_train 只负责 Ray fan-out
 
@@ -132,6 +134,8 @@ def async_train(self, rollout_id, rollout_data_ref, external_data=None):
 ```
 
 不变量：critic refs 的列表长度必须等于 actor handlers 数量。这里的 “async” 是 Ray 调用异步，不代表 Megatron pipeline 与 optimizer 异步。
+
+这个长度断言只证明 world-size 相同。refs 仍按 global worker 序号直连，不携带 PP/DP 坐标；若 actor/critic 的 PP-last-stage rank 集合不同，actor last stage 对应位置可能拿到 critic 非 last stage 返回的 `{}`。
 
 ## 3. Actor 进程先恢复 rank-local rollout_data
 
@@ -169,7 +173,7 @@ def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
 源码入口：来源：slime/backends/megatron_utils/actor.py L222-L276
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L225-L245
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L225-L245；省略注释与函数外层）
 rollout_data = process_rollout_data(
     self.args,
     rollout_data_ref,
@@ -204,7 +208,7 @@ if "rollout_mask_sums" in rollout_data:
 源码入口：来源：slime/backends/megatron_utils/actor.py L402-L428
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L404-L428
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L404-L428；省略函数签名与空行）
 data_iterator = get_data_iterator(rollout_data)
 num_microbatches = rollout_data["num_microbatches"]
 global_batch_sizes = rollout_data["global_batch_sizes"]
@@ -242,7 +246,7 @@ return {}
 源码入口：来源：slime/backends/megatron_utils/model.py L345-L506
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L379-L417
+# 定位骨架（基于 `slime/backends/megatron_utils/model.py` L379-L417；省略注释与内部 docstring）
 for iterator in data_iterator:
     iterator.reset()
 
@@ -268,7 +272,7 @@ def forward_step(
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L471-L506
+# 定位骨架（基于 `slime/backends/megatron_utils/model.py` L471-L506；省略循环外上下文与注释）
 for step_id in range(num_steps_per_rollout):
     forward_data_store += forward_backward_func(
         forward_step_func=forward_step_with_progress,
@@ -300,6 +304,8 @@ return rollout_data
 
 读者抓手：动态 batch 下前向结果会按 `micro_batch_indices` 还原原始顺序，否则 advantage 与样本顺序可能错位。
 
+还原本身使用 `zip(values, origin_indices, strict=False)`，没有断言两者等长，也不验证 indices 是 permutation。pipeline 少返回一项时 `origin_values` 可残留 `None`；多返回一项则可能被静默截断。动态 batch 验收应检查所有输出槽位而非只看 list 长度。
+
 ## 6. Actor 路径：补齐 log-prob、注入 values、计算 advantage
 
 系统压力：actor 的 policy loss 需要当前 actor log-prob，可能还需要 ref/teacher log-prob、critic values、routing replay 状态和完整 rollout 级 advantage normalization。
@@ -309,7 +315,7 @@ return rollout_data
 源码入口：来源：slime/backends/megatron_utils/actor.py L430-L555
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L439-L510
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L439-L510；省略多条配置分支）
 if self.args.compute_advantages_and_returns:
     if "ref" in self.weights_backuper.backup_tags:
         self._switch_model("ref")
@@ -349,7 +355,7 @@ if self.args.compute_advantages_and_returns:
 源码入口：来源：slime/backends/megatron_utils/actor.py L520-L555
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L520-L555
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L520-L555；省略 profiling 与条件分支）
 if self.args.use_routing_replay:
     os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 with timer("actor_train"):
@@ -391,7 +397,7 @@ log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metri
 源码入口：来源：slime/backends/megatron_utils/loss.py L661-L760
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L686-L713
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L686-L713；省略注释与类型上下文）
 rollout_log_probs: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
 log_probs: list[torch.Tensor] | None = (
     rollout_log_probs if args.use_rollout_logprobs else rollout_data.get("log_probs")
@@ -421,7 +427,7 @@ rollout_data["kl"] = kl
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L720-L738
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L720-L738；选取 estimator 分支）
 elif args.advantage_estimator in ["grpo", "gspo", "cispo"]:
     rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
     returns = get_grpo_returns(rewards, kl)
@@ -453,7 +459,7 @@ elif args.advantage_estimator == "ppo":
 源码入口：来源：slime/backends/megatron_utils/model.py L704-L845
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L820-L835
+# 定位骨架（基于 `slime/backends/megatron_utils/model.py` L820-L835；省略循环注释）
 for step_id in range(num_steps_per_rollout):
 
     loss_dict, grad_norm = train_one_step(
@@ -481,7 +487,7 @@ for step_id in range(num_steps_per_rollout):
 源码入口：来源：slime/backends/megatron_utils/model.py L509-L680
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L576-L638
+# 定位骨架（基于 `slime/backends/megatron_utils/model.py` L576-L638；省略模型参数构造分支）
 batch = get_batch(
     data_iterator,
     _with_rollout_top_p_token_keys(
@@ -513,7 +519,7 @@ return output_tensor, partial(loss_function, args, batch, num_microbatches, step
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L640-L680
+# 定位骨架（基于 `slime/backends/megatron_utils/model.py` L640-L680；省略 valid-step 判定细节）
 forward_backward_func = get_forward_backward_func()
 losses_reduced = forward_backward_func(
     forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
@@ -542,7 +548,7 @@ if valid_step:
 源码入口：来源：slime/backends/megatron_utils/loss.py L1220-L1320
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L1254-L1299
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L1254-L1299；省略 recompute 与返回日志结构）
 num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
 
 sum_of_sample_mean = get_sum_of_sample_mean(
@@ -581,12 +587,65 @@ else:
 
 读者抓手：`rollout_mask_sums` 来自 RolloutManager，保证 compact/subagent 场景仍按 rollout 级分母归一化。
 
+## 11. actor 与 critic 通过两条隐式坐标链耦合
+
+系统压力：critic values 必须与 actor 的 rank-local 样本逐项对齐；RolloutManager 也只能按一套训练并行配置生成 partitions。
+
+设计现状：actor/critic GPU 数量被固定相同，但 role-specific Megatron YAML 除 `num_nodes/num_gpus_per_node` 外可以覆盖任意已知参数。创建完成后，actor group 先、critic group 后调用 `set_rollout_manager`；各自 rank 0 会把 `train_parallel_config` 写给 RolloutManager，所以 critic 配置最终覆盖 actor 配置。训练时 critic refs 又按 worker list position 交给 actor。
+
+源码入口：来源：slime/utils/arguments.py L1597-L1624
+
+源码入口：来源：slime/ray/placement_group.py L152-L216
+
+源码入口：来源：slime/ray/train_actor.py L123-L128
+
+源码入口：来源：slime/ray/actor_group.py L131-L149
+
+这意味着当前 PPO + Critic 路径实际上要求两组拓扑兼容：
+
+- RolloutManager 使用的 `dp_size/cp_size/vpp_size/mb_group` 必须能被 actor 和 critic 同时消费。
+- critic PP-last-stage global ranks 必须与 actor PP-last-stage global ranks 对齐，否则 values 落不到 actor 的消费 rank。
+- 即使 DP size 相同，CP 不同也会改变 dynamic token cap；VPP/mb-group 不同会改变 micro-batch 对齐。
+
+源码没有执行这组完整比较。要支持真正异构的 actor/critic，需要按 sample identity 重新路由和重分片 values，而不是依赖 worker 序号。
+
+## 12. 训练状态修改没有事务式回滚
+
+系统压力：一次训练会触碰 model mode、iterator、DDP callbacks、梯度、GC、环境变量、进度条和 offload 状态；任一层异常都可能让下一次调用从脏状态开始。
+
+当前实现的关键边界：
+
+- `forward_only` 先 `model.eval()`，正常结束才 `model.train()`；无 `try/finally`。
+- `train` 的 manual-GC 分支无条件关闭自动 GC 并 collect，`manual_gc_interval` 只参与非负断言，全库没有周期消费点。
+- `overlap_grad_reduce` 入口要求 `config.no_sync_func is None`，随后把 callback 写入 config；Slime wrapper 末尾不显式清空。
+- distributed optimizer 会临时禁用 forward pre-hook 和 `param_sync_func`；只有正常跑过第一 step 才恢复。
+- `train_one_step` 的 optimizer/zero-grad，以及 actor 的 `sleep()`，都不在统一 finally 中。
+
+源码入口：来源：slime/backends/megatron_utils/model.py L345-L506
+
+源码入口：来源：slime/backends/megatron_utils/model.py L704-L845
+
+源码入口：来源：slime/backends/megatron_utils/actor.py L380-L400
+
+因此异常后不能只 reset `DataIterator` 就重试。生产处置应先证明所有入口状态已恢复；当前缺少统一恢复协议，无法证明时重建 Ray actor。
+
+## 13. async 主循环显式引入 policy lag
+
+`train_async.py` 在训练当前 batch 前已经启动下一轮 generate。每到 `update_weights_interval` 边界，它先等待这次 generation 完成，再同步 actor 权重。因此刚完成的下一批 rollout 明确来自同步前策略；interval 大于 1 时，rollout engine 还会跨多个 actor optimizer step 保持旧版本。
+
+源码入口：来源：train_async.py L30-L69
+
+这不是普通“并发优化”细节，而是训练数据的行为策略版本契约。应同时记录 generation weight version、actor train version 和 rollout engine sync version。参数当前没有 `> 0` 校验，值为 0 会在取模表达式处失败。
+
 ## 运行验证
 
 - PPO + Critic：运行或阅读 `tests/test_qwen3_4B_ppo.py`。预期第 0 step 的 `train/ppo_kl` 和 `train/kl_loss` 在 CI 检查中接近 0。
 - Critic-only warmup：设置 `--num-critic-only-steps 1`。预期 rollout 0 只等待 `value_refs`，不调用 actor train。
 - 动态 batch：关注日志 `train/*global_batch_size`。预期它跟每个 step 的实际 rollout 数一致。
 - Ray 返回值：在 `RayTrainGroup.async_train` 处断点，预期 critic refs 解析为 dict 或 `{}`，actor refs 解析为 `None`。
+- actor/critic topology：打印两组 parallel config 与 PP-last-stage global ranks，预期兼容；只比较 handlers 数量不够。
+- 异常注入：分别在 aux forward、第一 train step、optimizer step 前后抛错，预期若无统一恢复则销毁 actor，不原地继续。
+- async 版本账：`update_weights_interval>1` 时记录三类 weight version，预期已预取的下一批属于同步前策略。
 
 ## 复盘迁移
 
@@ -595,3 +654,5 @@ else:
 - `forward_only` 是补材料，不是训练；`train_one_step` 才产生 optimizer step。
 - PP last stage 才有 log-prob、values、advantages；其他 stage 沉默是设计。
 - Loss 缩放依赖 `global_batch_sizes` 和 `rollout_mask_sums`，这把本专题和 RolloutManager 紧密接在一起。
+- PPO + Critic 还依赖两组并行拓扑和 worker 坐标一致；world-size 相同不是充分条件。
+- 训练入口会修改多类长生命周期状态，但当前没有事务式回滚；异常恢复是 actor 生命周期问题，不只是数据 iterator 问题。

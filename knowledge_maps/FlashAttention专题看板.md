@@ -8,7 +8,7 @@ tags:
   - framework/flash-attn
   - content/dashboard
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # FlashAttention 专题看板
@@ -31,3 +31,4 @@ updated: 2026-07-10
 
 性能问题先确认实际 API、shape、dtype 和 GPU 架构，再查看 dispatch 和 profiler；不要直接从任意 `.cu` specialization 开始。
 
+看板只说明知识库入口，不证明当前环境已加载 FA2/FA3/FA4。动态验收必须记录实际 extension、GPU arch 和 kernel trace。

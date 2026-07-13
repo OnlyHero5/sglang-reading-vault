@@ -9,254 +9,331 @@ tags:
   - framework/slime
   - content/reference
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
+
 # Slime 术语表
 
-本页用来把 Slime 文档中的 RL、Ray、Megatron、rollout 和权重同步术语对齐到源码入口。读完后，你应该能在遇到 `advantage`、`async_train`、`colocate`、`RolloutDataSource` 等词时知道先去哪个专题继续读。
+## 你为什么要读
 
-> RL + Slime 专有术语 · 首次出现代码出处
+这不是缩写翻译表，而是语义消歧表。同一个词在 Ray、RL、Megatron 和 SGLang 中可能指不同对象；定义后都给出“不要混淆什么”和继续阅读入口。源码基线为 `22cdc6e1`。
 
----
+## 最容易混淆的十组词
 
-## A
+| A | B | 关键区别 |
+|---|---|----------|
+| Ray Actor | RL actor/policy | 前者是远程进程抽象，后者是被训练的策略模型 |
+| outer rollout id | `Sample.rollout_id` | 前者是主循环时间轴，后者是一次 rollout 执行的 loss 分组键 |
+| `group_index` | `Sample.rollout_id` | 前者常表示同 prompt 的采样组，后者允许 compact siblings 共享一次执行身份 |
+| rollout batch | training step | 一次 outer rollout 可拆成多个 training steps |
+| training sample | rollout execution | compact/subagent 下，一次执行可产生多条训练 sample |
+| micro-batch | global batch size | 前者是单次执行切片，后者是当前 step 的全局 rollout 数 |
+| rollout logprob | current/ref logprob | 分别由生成时 policy、训练模型、reference policy 产生 |
+| optimizer step | `update_weights` | 前者改训练侧参数，后者把参数发布到 rollout engine |
+| colocate | same process | colocate 是 GPU bundle 重叠，通常仍是不同进程 |
+| weight version | checksum | 前者是发布序号，不能证明参数数值一致 |
 
-### advantage / advantage_estimator
+## 身份与索引
 
-**定义：** 策略梯度中 baseline 校正后的回报信号；Slime 支持 grpo、gspo、ppo、cispo 等。
+### outer `rollout_id`
 
-**代码：**
+同步/异步主循环的外层迭代索引，用于 generate/train/save/eval 和日志时间线。它不要求等于每条 `Sample.rollout_id`。
 
-```python
-## 来源：slime/backends/megatron_utils/loss.py L661-L667
-def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
-    """Supported methods: "grpo", "gspo", "cispo", "ppo", ..."""
-```
+→ [[Slime-训练主循环-核心概念]] · [[Slime-业务流程]]
 
-→ [[Slime-Advantage计算-核心概念]]
+### `Sample.rollout_id`
 
----
+一次 rollout 执行的训练聚合身份。compact/subagent 将一次执行拆成多个 sibling samples 时，siblings 必须共享该值，使 loss reducer 只计一次 rollout。
 
-### async_train
+→ [[Slime-Sample数据契约-核心概念]] · [[Slime-RL训练全链路]]
 
-**定义：** RayTrainGroup 向各 DP rank 异步提交 `train` remote call。
+### `group_index`
 
-**代码：**
+DataSource 为同一个 prompt 复制出的 sample group 分配的编号，常用于 reward group、zero-std/pass-rate 等语义。它不自动等同于 `rollout_id`。
 
-```python
-## 来源：train.py L77
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
-```
+### `index`
 
-→ [[Slime-RayTrainGroup-核心概念]]
+DataSource 分配的单条 sample 序号。默认一执行一 sample 的兼容路径可用它形成 rollout identity，但 compact 路径应显式填写 `rollout_id`。
 
----
+### DP rank
 
-## C
+Megatron 数据并行消费者身份。RolloutManager 返回长度等于 DP size 的 refs，每个 worker 根据自己的 DP rank 取一份 partition。
 
-### colocate
+## 运行主体
 
-**定义：** train GPU 与 rollout GPU 映射到同一物理 GPU，通过 offload 时分复用显存。
+### Ray Actor
 
-→ [[Slime-Ray参数-核心概念]]
+Ray 管理的远程 Python 对象/进程。Slime 的 training worker、RolloutManager、SGLangEngine wrapper、lock 等都可以是 Ray actors。
 
----
+### actor / policy
+
+被优化并用于 rollout 的策略模型。训练侧可同时维护 actor、old_actor、rollout_actor、ref、teacher 等参数快照。
 
 ### critic
 
-**定义：** 可选 value network；PPO 时先 train critic 再 train actor。
+可选 value model。当前 args 中 `advantage_estimator=ppo` 会派生 `use_critic=True`；critic 先计算/训练 values，再把 pipeline-last-stage 的 values 交给 actor。
 
-**代码：**
+### RolloutManager
 
-```python
-## 来源：train.py L74-L79
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
-```
+Ray actor 边界，持有 RolloutServer(s)、DataSource、rollout/eval functions、converter、DP schedule、debug/metrics/health/recovery。它不是实际 token generation 算法本身。
 
----
+→ [[Slime-RolloutManager]]
 
-## D
+### RayTrainGroup
 
-### DataSource / RolloutDataSource
+按 world rank 管理一组 training Ray actors，提供 async init/train、save、update/offload 等扇出接口。它把同一 rollout refs 发给所有 worker，不在 group 层按 DP 重切数据。
 
-**定义：** 提供 prompt、管理 rollout buffer 与 dataset 持久化。
+→ [[Slime-RayTrainGroup]]
 
-→ [[Slime-数据源-核心概念]]
+### SGLangEngine
 
----
+Slime 对 SGLang server 的 Ray actor wrapper，负责启动/连接 server、HTTP 控制、memory occupation、weight update/check 等。SGLang Scheduler/ModelRunner 仍属于 SGLang upstream。
 
-### DP（Data Parallel）
+→ [[Slime-SGLang-Engine]] · [[Slime与SGLang-阅读对照]]
 
-**定义：** Megatron 数据并行 rank；RolloutManager `_split_train_data_by_dp` 按 rank 拆分 train_data。
+### RolloutServer / ServerGroup
 
-→ [[Slime-训练数据-核心概念]]
+`RolloutServer` 表示一个 model 及其 router；可包含多个同配置 `ServerGroup`。group 可为 regular、prefill、decode、encoder、placeholder，并有独立 GPU 数、offset、offload 与 model path。
 
----
+## 数据对象
 
-## G
+### DataSource
 
-### GRPO（Group Relative Policy Optimization）
+抽象契约：`get_samples`、`add_samples`、`save`、`load`、`len`。默认参数使用 `RolloutDataSourceWithBuffer`：优先取 buffer，再从全局 dataset 取 prompt groups。
 
-**定义：** 组内相对 reward 的 advantage 估计；`--advantage-estimator grpo`。
+→ [[Slime-数据源]]
 
-→ [[Slime-Advantage计算-排障指南]]
+### prompt group
 
----
+一个 prompt 复制出 `n_samples_per_prompt` 条 sample seeds 后形成的组。group 用于相对 reward/统计，但一次 seed 后续可能再拆成 compact training samples。
 
-### generate / generate_rollout
+### `Sample`
 
-**定义：** RolloutManager.generate（Ray 层）vs rollout fn generate_rollout（样本生产层）。
+生成与训练之间的语义护照。当前核心字段为 `tokens`、`response`、`response_length`、`reward`、`loss_mask`、`rollout_log_probs`、`weight_versions`、status 与 metadata；注意 `reward/loss_mask` 是单数。
 
-→ [[Slime-RolloutManager-核心概念]] · [[Slime-SGLang-Rollout-核心概念]]
+→ [[Slime-Sample数据契约]] · [[Slime-关键概念]]
 
----
+### `RolloutFnTrainOutput`
 
-## L
+rollout function 的训练返回契约，包含 nested `samples` 与 `metrics`。它不是训练侧 `RolloutBatch`。
 
-### loss_masks
+### train data / `RolloutBatch`
 
-**定义：** 标记哪些 token 参与 policy loss（通常 response 部分为 1）。
+Sample 转换后的字段 dict。RolloutManager 补 `rollout_ids`、`loss_masks`、`rollout_mask_sums` 等，DP split 后又加入 partition、micro-batch schedule 与全局信息。
 
-**代码：** 见 [[Slime-Sample数据契约-核心概念]] 中 `Sample` 字段。
+### `Box(ObjectRef)`
 
----
+对 Ray object ref 的轻量包装。RolloutManager 返回每个 DP rank 一份；object-store 与 NIXL 都保持这一上层语义。
 
-## O
+### `loss_mask`
 
-### offload / offload_rollout / offload_train
+长度等于 `response_length`，标记哪些 response token 参与 loss。工具/环境 token、remove_sample 等路径可以产生 0 mask。
 
-**定义：** 训练或推理权重/KV 卸载到 CPU，释放 GPU 给另一角色。
+### `rollout_mask_sums`
 
-→ [[Slime-Ray参数-排障指南]]
+同一 `Sample.rollout_id` 下所有 sibling samples 的 loss-mask 总和，并按 sample 广播保存。micro-batch 拆分后仍用于恢复完整 rollout 的归一化分母。
 
----
+### `micro_batch_indices`
 
-### on-policy / off-policy
+DP schedule 预计算的 rank-local sample index 列表。DataIterator 按它取 batch，不重新决定如何 pack。
 
-**定义：** rollout_log_probs 与 train log_probs 一致为 on-policy；TIS/ICEPOP 处理 off-policy 偏差。
-
-→ [[Slime-Advantage计算-排障指南]]
-
----
-
-## P
+## 并行与资源
 
 ### PlacementGroup（PG）
 
-**定义：** Ray 资源 bundle；Slime 为 train/rollout/critic 分别创建 PG。
+Ray 资源 bundle 集合。Slime 通常创建一个 PG，再给 actor/rollout 不同或重叠的 bundle views；critic 复用 actor PG 描述，不是固定创建三个 PG。
 
-**代码：**
+→ [[Slime-PlacementGroup]]
 
-```python
-## 来源：slime/ray/placement_group.py L47-L48
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
-    pg = placement_group(bundles, strategy="PACK")
-```
+### DP / TP / PP / CP / EP / VPP
 
----
+| 缩写 | 含义 | Slime 中的关键影响 |
+|------|------|--------------------|
+| DP | Data Parallel | rollout partition、梯度同步、跨 DP normalization |
+| TP | Tensor Parallel | 层内张量/参数切分、logits collective |
+| PP | Pipeline Parallel | stage 输入输出、只有 last stage 产完整 logprob/value/metrics |
+| CP | Context Parallel | response/logprob/mask 的序列切片与 gather |
+| EP | Expert Parallel | MoE expert/routing 分布 |
+| VPP | Virtual Pipeline Parallel | model chunks 与 micro-batch group 对齐 |
 
-### PPO（Proximal Policy Optimization）
+这些 group 由 Megatron 建立；PG 只决定资源落点。
 
-**定义：** clipped policy gradient；`policy_loss_function` 实现。
+### colocate
 
-→ [[Slime-Policy-Loss-核心概念]]
+actor 与 rollout 使用重叠 GPU bundle，通过 offload/onload 时分复用。当前选择 tensor/CUDA IPC updater；流水异步入口不支持 colocate。
 
----
+### offload_train / offload_rollout
 
-## R
+分别管理训练与 rollout 显存生命周期。training sleep/wake 涉及 process groups 与 memory saver；rollout 只对 `needs_offload` 的 server groups release/resume，并区分 weights 与 KV/CUDA graph。
 
-### rollout_id
+### external rollout
 
-**定义：** 外层训练迭代索引；贯穿 generate/train/save/eval/trace。
+SGLang engines 由外部系统提供；Slime 应用外部地址/拓扑到 args，不在本地 PG 创建 engine actors。训练与 rollout 仍通过请求、样本和权重协议交接。
 
-→ [[Slime-关键概念#1 · rollout_id]]
+### NIXL
 
----
+可选 rollout-data tensor transport。它改变 Ray refs 中大 tensor 的传输方式，不改变 Sample、DP partition 或 `RolloutBatch` 的语义。
 
-### rollout_log_probs
+## 训练批次
 
-**定义：** SGLang 采样时记录的 log prob；用于 importance sampling 与 KL。
+### outer rollout
 
-→ [[Slime-Sample数据契约-核心概念]]
+一次主循环 generation + training + publication 节拍。它可以包含多个 training steps。
 
----
+### global batch size
 
-### RM / Reward Model
+当前 DP schedule/loss normalization 中，一个 training step 包含的 rollout execution 全局数量。默认一 execution 一 sample 时等于样本数；compact rollout 下不能解释成裸 sample 行数。
 
-**定义：** `rm_hub.async_rm` 对 Sample 打分；可替换为 rule-based verifier。
+### micro-batch
 
-→ [[Slime-Reward与过滤-核心概念]]
+一次 pipeline forward/backward 消费的执行切片。多个 micro-batches 累积后完成一个 optimizer step。
 
----
+### dynamic batch size
 
-## S
+按 token/workload 把样本 pack 成可执行 micro-batches。`balance_by_flops` 可改善计算均衡，但不保证 token cap，配置不当仍可 OOM。
 
-### Sample
+### DP schedule
 
-**定义：** Rollout 最小单元 dataclass；含 tokens、rewards、metadata 等。
+先按 `Sample.rollout_id` 保组到 training step，再 pack micro-batches，再把 micro-batches 分给 DP ranks，并保证 DP/VPP 所需对齐。
 
-→ [[Slime-Sample数据契约-核心概念]]
+→ [[Slime-RL训练全链路]] 的 DP schedule 小节
 
----
+## 概率、价值与优化
 
-### ServerGroup
+### reward / raw reward
 
-**定义：** 多 SGLang engine + router 的拓扑单元；支持 PD 分离。
+rollout/RM/verifier 给样本的结果信号。`reward` 可为 scalar 或 dict；`reward_key` 选择训练值。raw reward 与归一化 reward 不应混用。
 
-→ [[Slime-引擎拓扑-核心概念]]
+### rollout logprob
 
----
+SGLang 生成时的 token log probability，记录采样 policy。当使用 partial/async/不同推理训练实现时，它与训练侧重算值可能有差异。
 
-## T
+### current/train logprob
 
-### trace / trace_span
+Megatron actor 对同一 token 重新计算的概率。用于 policy loss、KL、mismatch 等；根据配置也可能作为 old policy 基线。
 
-**定义：** Sample 级执行 span；`trace_utils.trace_span` 记录耗时段。
+### ref logprob
 
-→ [[Slime-可观测性与CI]]
+reference 参数快照产生的概率，用于 reward shaping KL 或 KL loss。ref 可以按 `ref_update_interval` 从 actor 更新，不一定永久冻结。
 
----
+### value
 
-### TIS（Truncated Importance Sampling）
+critic 对 response positions 的价值预测。只在 pipeline last stage 形成完整返回；其他 stage 返回空 dict 是正常行为。
 
-**定义：** off-policy 校正；`vanilla_tis_function` in loss.py。
+### advantage / return
 
-→ [[Slime-Advantage计算-排障指南]]
+由 reward、KL、value、mask 与 estimator 计算。当前 estimator 包括 GRPO、GSPO、CISPO、PPO、REINFORCE++ 变体或 custom function。
 
----
+→ [[Slime-Advantage计算]]
 
-## U
+### policy/value/SFT/custom loss
 
-### update_weights
+训练目标的分派层。actor CLI 可选 policy、SFT、custom；critic 内部设置 value loss。不要把整个 Slime loss 概括成固定 PPO/GRPO。
 
-**定义：** 训练后将 Megatron 权重推送到 SGLang engine；闭环最后一步。
+### TIS
 
-**代码：**
+Truncated Importance Sampling。根据训练/rollout probability ratio 修正或裁剪 off-policy mismatch；与 `use_rollout_logprobs` 等配置存在互斥/分支关系。
 
-```python
-## 来源：train.py L89
-        actor_model.update_weights()
-```
+### OPSM
 
-→ [[Slime-分布式权重同步-核心概念]]
+Off-Policy Sequence Masking。按序列级 mismatch 条件生成 mask，参与 policy loss；不是 reward filter。
 
----
+### routing replay / rollout routing replay
 
-## 与 SGLang 术语对照
+训练侧记录/重放 MoE routing，或使用 rollout engine 返回的 routed experts。会改变 actor/ref 路由可比性与 KL 预期。
 
-| Slime | SGLang 对应 |
-|-------|------------|
-| SGLangEngine | `run_server` / HTTP Server |
-| generate HTTP | `/generate` → Scheduler |
-| update_weights reload | 权重热更新 / CheckpointEngine |
-| PD 拓扑 | Disaggregation P/D |
+### OPD
 
-→ [[Slime与SGLang-阅读对照]]
+On-Policy Distillation。teacher logprob 可来自 SGLang 或 Megatron teacher；KL penalty 叠加到 advantage，和 advantage estimator 正交。
 
----
+## 权重与版本
 
-## 导航
+### optimizer step
 
-- [[Slime-关键概念]]
-- [[Slime学习指南]]
+更新 Megatron 训练侧参数并推进训练 scheduler。它不自动修改 SGLang engine。
+
+### `update_weights`
+
+训练侧发布入口：取 updatable engines/lock，连接或恢复通信，调用具体 updater。debug-only 或没有 updatable engine 时可直接跳过。
+
+### update weight mode
+
+`full` 或 `delta`。delta 只支持 disk transport，需要共享发布目录和 rollout-host-local checkpoint，不支持 colocate。
+
+### update weight transport
+
+full 模式可用 NCCL 或 disk；colocate 由 tensor updater 处理。mode、transport 与资源关系共同决定实际 updater。
+
+### weight version
+
+updater/engine 的发布序号，并可记录进 `Sample.weight_versions`。版本一致用于判断发布顺序，不证明参数 checksum 或 optimizer step 一定改变了数值。
+
+### actor / old_actor / rollout_actor / ref / teacher
+
+训练进程内可能存在的参数备份 tags：
+
+| tag | 作用 |
+|-----|------|
+| actor | 当前待训练/已训练 policy |
+| old_actor | PPO/更新间隔等路径的旧策略快照 |
+| rollout_actor | update interval=1 时维护的 rollout 策略队列中间态 |
+| ref | KL reference，可周期更新 |
+| teacher | Megatron OPD teacher |
+
+它们是训练侧参数快照，不等同于 SGLang engine 当前装载版本。
+
+## 执行模式
+
+### synchronous baseline
+
+`generate(N) → train(N) → publish → generate(N+1)`。版本关系最清晰，适合首次学习。
+
+### pipeline async
+
+`train_async.py` 提前启动下一轮 generation，与当前训练重叠；更新前等待在途 generation。存在受控策略陈旧度，不支持 colocate。
+
+### fully async
+
+生成、buffer、训练、发布可独立推进，需要显式设计版本窗口、旧样本策略与生产消费速率。不是 pipeline async 的同义词。
+
+### debug rollout-only / train-only
+
+rollout-only 只验证生成，不转换/训练；train-only 不启动本地 SGLang，从保存 samples replay converter、DP schedule 与训练。两者不能同时开启。
+
+## 可观测与恢复
+
+### trace carrier / span / event
+
+动态绑定到 Sample 的诊断载体，包含 trace/sample/group id、attempt 与 events；可展开 SGLang PD/perf metadata。trace 操作多为尽力而为，缺记录不等于业务未执行。
+
+### health monitor / recover
+
+按 ServerGroup 监控 rollout engines；恢复死 engine 后，新 engine 还需重新加入权重连接/发布。健康恢复与权重一致性是两个连续步骤。
+
+### `check_weight_update_equal`
+
+bootstrap 或诊断时比较训练/rollout 权重的可选验证，比只看 weight version 更强，但仍要结合配置、量化与目标模型路径解释。
+
+## 字母索引
+
+| 字母 | 术语 |
+|------|------|
+| A | actor、advantage、async、attention（SGLang 所有） |
+| B | Box、batch、buffer、bootstrap update |
+| C | colocate、CP、critic、custom hook |
+| D | DataSource、DP、dynamic batch、debug mode |
+| E | EP、external rollout、engine |
+| G | global batch、GRPO/GSPO、group index |
+| L | logprob、loss mask、loss type |
+| M | Megatron、micro-batch、model tag |
+| N | NIXL |
+| O | ObjectRef、offload、OPD、OPSM、optimizer |
+| P | PG、policy、PP、prompt group、PPO |
+| R | Ray Actor、RayTrainGroup、reward、rollout、routing replay |
+| S | Sample、ServerGroup、SGLangEngine、synchronous |
+| T | TIS、TP、trace、transport |
+| U | update weight mode/transport/updater |
+| V | value、version、VPP |
+| W | weight version、weight publication |
+
+继续阅读：[[Slime-关键概念]] 负责建立关系，[[Slime-源码地图]] 负责定位文件，[[Slime-RL训练全链路]] 负责追踪对象生命周期。

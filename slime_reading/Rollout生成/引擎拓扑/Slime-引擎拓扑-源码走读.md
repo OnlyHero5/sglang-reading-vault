@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 引擎拓扑 · 源码走读
 
@@ -31,7 +31,7 @@ updated: 2026-07-10
 |----------|------|--------------|
 | 首次建立拓扑全景 | 先建立模型、贯穿场景、1 到 2 | 这是配置到运行时对象的编译过程，不是单个 engine 的启动函数 |
 | 排查 YAML 或 GPU 总数错误 | 2 到 3 | YAML 只表达结构，默认值和 `update_weights` 在 `ModelConfig.resolve` 阶段补齐 |
-| 计算 Router 和 ServerGroup 数量 | 4 到 5 | 每个 model 一个 Router；每个 group 用 `num_gpus/num_gpus_per_engine` 算 engine 数 |
+| 计算 Router 和 ServerGroup 数量 | 4 到 5 | 每个 model 启动 Router；多节点 group 要区分 node actor 数与逻辑 HTTP engine 数 |
 | 排查 Ray actor 或 GPU 绑定 | 5 到 6 | `gpu_offset` 映射到 placement group 重排后的 GPU，Ray actor 只申请少量 GPU 资源占位 |
 | 排查端口冲突或 PD bootstrap | 7 | 端口按节点 cursor 推进，prefill worker 还会多拿 `disaggregation_bootstrap_port` |
 | 排查 EPD 启动顺序 | 8 | encoder group 必须先 ready，URL 注入后 non-encoder group 才能启动 |
@@ -104,21 +104,31 @@ sglang:
 
 ```python
 # 来源：slime/ray/rollout.py L430-L454
-rollout_init_handles: list[Any] = []
-if self.args.debug_train_only:
-    self.servers: dict[str, Any] = {}
-else:
-    init_http_client(args)
-    self.servers, rollout_init_handles = start_rollout_servers(args, pg)
+        rollout_init_handles: list[Any] = []
+        if self.args.debug_train_only:
+            self.servers: dict[str, Any] = {}
+        else:
+            init_http_client(args)
+            self.servers, rollout_init_handles = start_rollout_servers(args, pg)
 
-data_source_cls = load_function(self.args.data_source_path)
-self.data_source = data_source_cls(args)
+        data_source_cls = load_function(self.args.data_source_path)
+        self.data_source = data_source_cls(args)
 
-self.generate_rollout = load_function(self.args.rollout_function_path)
-self.eval_generate_rollout = load_function(self.args.eval_function_path)
+        self.generate_rollout = load_function(self.args.rollout_function_path)
+        self.eval_generate_rollout = load_function(self.args.eval_function_path)
+        self.custom_reward_post_process_func = None
+        if self.args.custom_reward_post_process_path is not None:
+            self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
+        self.custom_convert_samples_to_train_data_func = None
+        if self.args.custom_convert_samples_to_train_data_path is not None:
+            self.custom_convert_samples_to_train_data_func = load_function(
+                self.args.custom_convert_samples_to_train_data_path
+            )
+        logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
+        logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
-if rollout_init_handles:
-    ray.get(rollout_init_handles)
+        if rollout_init_handles:
+            ray.get(rollout_init_handles)
 ```
 
 **执行逻辑：**
@@ -142,7 +152,7 @@ if rollout_init_handles:
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L1231-L1255
+# 定位骨架（据 `slime/ray/rollout.py` L1231-L1255 删节）：
 def _resolve_sglang_config(args) -> SglangConfig:
     if getattr(args, "sglang_config", None) is not None:
         config = SglangConfig.from_yaml(args.sglang_config)
@@ -178,6 +188,7 @@ def _resolve_sglang_config(args) -> SglangConfig:
 
 - YAML 总 GPU 少写或多写，失败点就是这里的 assert。
 - `--sglang-config` 与 `--prefill-num-servers` 互斥，参数校验在 `validate_args` 阶段已经阻止混用。
+- YAML 没有 model name 唯一性检查，也不要求 PD 的 prefill/decode 成对；这些结构错误会晚到字典覆盖或运行期路由。
 
 ### 3. YAML 只负责结构化，默认值在 resolve 里补齐
 
@@ -188,7 +199,7 @@ def _resolve_sglang_config(args) -> SglangConfig:
 **源码证据：**
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_config.py L157-L180
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_config.py` L157-L180 删节）：
 @staticmethod
 def from_yaml(path: str) -> "SglangConfig":
     with open(path) as f:
@@ -212,7 +223,7 @@ def from_yaml(path: str) -> "SglangConfig":
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_config.py L68-L100
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_config.py` L68-L100 删节）：
 def resolve(self, args) -> None:
     default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine
     default_model_path = self.model_path or args.hf_checkpoint
@@ -240,6 +251,7 @@ def resolve(self, args) -> None:
 
 - 同一模型下所有 group 必须使用同一个 `model_path`；否则一个 Router 后面会混多个模型权重。
 - ref/reward 模型如果忘写 `update_weights: false`，源码也会在 `model_path` 不同的时候自动推断为 false；但生产配置最好显式写，避免路径相同但语义冻结的模型被更新。
+- 路径判断只是字符串相等，不做 realpath/symlink 归一化；它不能替代显式模型角色声明。
 
 ### 4. 每个模型先拿一个 Router
 
@@ -250,7 +262,7 @@ def resolve(self, args) -> None:
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L1019-L1070
+# 定位骨架（据 `slime/ray/rollout.py` L1019-L1070 删节）：
 def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
     if not force_new and args.sglang_router_ip is not None:
         return args.sglang_router_ip, args.sglang_router_port
@@ -290,7 +302,9 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 **不变量与失败模式：**
 
 - Router 进程启动失败会在 `assert process.is_alive()` 处暴露。
+- 自建 Router 只 sleep 3 秒并检查进程仍活着，没有 HTTP readiness；复用用户给定 Router 时更是直接返回地址，不验证可达性。
 - 如果 PD 配置没有让 Router 开 `pd_disaggregation`，prefill/decode worker 角色就不会被正确调度；源码用 `model_cfg.has_pd_disaggregation` 自动推断这一点。
+- 只要有 prefill 或 decode 任一侧就会打开 PD；源码不校验两侧配对完整。
 
 ### 5. _make_group 把声明编译成 runtime group
 
@@ -301,7 +315,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L1089-L1169
+# 定位骨架（据 `slime/ray/rollout.py` L1089-L1169 删节）：
 config = _resolve_sglang_config(args)
 servers: dict[str, RolloutServer] = {}
 pending_init_handles: list[Any] = []
@@ -345,10 +359,11 @@ for model_idx, model_cfg in enumerate(config.models):
 
 **执行逻辑：**
 
-- `num_engines = num_gpus / 每个 engine 本地占用 GPU 数`，多节点 engine 时本地占用不超过单节点 GPU 数。
+- `_make_group` 中名为 `num_engines` 的值实际是 node actor 数：`num_gpus / min(gpus_per_engine, gpus_per_node)`。逻辑 HTTP engine 数是 `num_gpus / gpus_per_engine`，两者在多节点时不同。
 - `gpu_offset` 按 group 的 `num_gpus` 推进；placeholder 也推进。
 - `engine_offset` 按 `num_engines` 推进；placeholder 的 `all_engines=[]`，不会产生真实 actor。
-- `needs_offload` 由 group 的绝对起点是否落在 Megatron GPU 范围内决定。
+- `engine_offset` 因而按 node actor rank 推进，不是按 HTTP 副本推进。
+- `needs_offload` 只看 group 绝对起点是否落在 Megatron GPU 范围内；group 跨越训练/rollout 边界时会整组 offload，是粗粒度判定。
 
 **不变量与失败模式：**
 
@@ -365,7 +380,7 @@ for model_idx, model_cfg in enumerate(config.models):
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L137-L166
+# 定位骨架（据 `slime/ray/rollout.py` L137-L166 删节）：
 def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
     if port_cursors is None:
         port_cursors = {}
@@ -388,7 +403,7 @@ def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[lis
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L168-L216
+# 定位骨架（据 `slime/ray/rollout.py` L168-L216 删节）：
     RolloutRayActor = ray.remote(SGLangEngine)
     rollout_engines = []
     for i in range(len(self.all_engines)):
@@ -438,7 +453,7 @@ def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[lis
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L218-L246
+# 定位骨架（据 `slime/ray/rollout.py` L218-L246 删节）：
         rollout_engines.append((global_rank, rollout_engine))
         self.all_engines[i] = rollout_engine
 
@@ -484,7 +499,7 @@ def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[lis
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L945-L1016
+# 定位骨架（据 `slime/ray/rollout.py` L945-L1016 删节）：
 num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
 addr_and_ports: dict[int, dict] = {}
 node_port_cursor: dict[int, int] = {}
@@ -534,7 +549,7 @@ return addr_and_ports, node_port_cursor
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L1171-L1205
+# 定位骨架（据 `slime/ray/rollout.py` L1171-L1205 删节）：
 if has_epd:
     encoder_urls: list[str] = []
     for group_cfg in model_cfg.server_groups:
@@ -573,6 +588,7 @@ if has_epd:
 **不变量与失败模式：**
 
 - EPD 的 encoder URL 缺失时，regular/prefill group 不会带 `language_only` 和 `encoder_urls`，多模态分离路径无法成立。
+- 代码不会为“encoder group 存在但收集到空 URL”单独抛错，而是静默按无注入继续启动 non-encoder group；必须显式验收 URL 非空。
 - `tests/utils/test_sglang_config.py` 中的 EPD 单测明确检查 encoder init 先被 `ray.get`，再启动 regular group。
 
 ### 9. 最后暴露 RolloutServer 和模型 Router 表
@@ -584,7 +600,7 @@ if has_epd:
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L1217-L1228
+# 定位骨架（据 `slime/ray/rollout.py` L1217-L1228 删节）：
 servers[model_cfg.name] = RolloutServer(
     server_groups=server_groups,
     router_ip=router_ip,
@@ -599,7 +615,7 @@ return servers, pending_init_handles
 ```
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L65-L81
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L65-L81 删节）：
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     routers = getattr(args, "sglang_model_routers", None)
     if routers and model_name in routers:
@@ -619,6 +635,8 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
 
 - 默认 generate 不会自动遍历所有模型，它只用默认 `args.sglang_router_ip/port`。
 - 多模型 ref/reward 请求要么在 custom generate 中显式调用 `get_model_url`，要么不会被默认路径使用。
+- model name 没有唯一性校验：重名会覆盖 `servers`/router map 中的前一个对象，但前一个 Router/group 已经启动。
+- 默认 Router 由第一项决定；未知 model name 静默回退，配置顺序或拼写错误可能把流量送到错误模型而不报错。
 
 ### 10. update_weights 只看可更新模型
 
@@ -629,7 +647,7 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
 **源码证据：**
 
 ```python
-# 来源：slime/ray/rollout.py L511-L540
+# 定位骨架（据 `slime/ray/rollout.py` L511-L540 删节）：
 def _get_updatable_server(self) -> Any | None:
     for srv in self.servers.values():
         if srv.update_weights:

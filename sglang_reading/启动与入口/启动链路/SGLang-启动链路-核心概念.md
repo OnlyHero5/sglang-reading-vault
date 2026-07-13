@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 启动链路 · 核心概念
 
@@ -138,7 +138,7 @@ def main():
         kill_process_tree(os.getpid(), include_parent=False)
 ```
 
-这里的核心不变量是：插件要在 runtime import 前加载；`--model-type` 不进入 LLM parser；LLM 与 diffusion 有两套 parser；退出时要清理子进程树。
+这里要分清“当前调用顺序”和“真正不变量”：当前正常启动路径确实先 `load_plugins()`，再 import LLM/diffusion runtime；但 hook registry 能在 apply 时解析目标，也会传播补丁到已经 `from X import Y` 的模块绑定。真正必须保证的是每个相关进程都在 engine 开始服务前完成插件注册和 apply。另一个例外是 help 路径：它在 `load_plugins()` 之前直接打印两套帮助并返回。
 
 ## `ServerArgs` 是 LLM 服务配置事实
 
@@ -167,7 +167,7 @@ def main():
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
 ```
 
-`ServerArgs` 不是纯字段表。它在 `__post_init__` 做第二遍语义处理，处理模型无关校验、PD disaggregation、deprecated 参数、dummy model、量化语义等。
+`ServerArgs` 不是纯字段表，也不是一次无副作用的类型转换。它在 `__post_init__` 做第二遍语义处理：先处理模型无关校验和 PD disaggregation，随后可能读取模型配置、查询设备能力、选择 kernel backend、改写环境变量与派生默认值。它不会加载整套模型权重，但已经越过了“纯 argparse”边界。
 
 ```python
 # 来源：python/sglang/srt/server_args.py L2567-L2616
@@ -223,11 +223,11 @@ def main():
             self.quantization = None
 ```
 
-因此排查参数时要区分三种状态：CLI 原始字符串、`argparse.Namespace`、经过 `__post_init__` 的 `ServerArgs`。服务真正使用的是第三种。
+因此排查参数时至少要区分四个阶段：CLI 原始字符串、`argparse.Namespace`、经过 `__post_init__` 的 `ServerArgs`，以及 runtime 在 `Engine` 初始化时进一步执行 `check_server_args()` 后的可启动配置。不是所有跨字段约束都在 `__post_init__` 中完成。
 
 ## 插件是启动前的改线器
 
-插件通过 setuptools entry points 被发现，通过 `SGLANG_PLUGINS` 白名单和 `SGLANG_PLATFORM` 平台过滤控制加载范围。
+统一插件框架声明了 platform 与 general 两组 setuptools entry points。本专题里的 `load_plugins()` 实际只执行 general plugin；它读取 platform entry points 是为了在设置 `SGLANG_PLATFORM` 时排除未选平台发行包携带的 general hooks。`SGLANG_PLUGINS` 再对白名单名字做过滤。
 
 ```python
 # 来源：python/sglang/srt/plugins/__init__.py L1-L11
@@ -267,11 +267,11 @@ class HookRegistry:
     """
 ```
 
-所以插件不是请求时动态扩展系统，而是启动前修改 runtime 行为。读启动链路时要把它看成和 argv 并行的一条控制面。
+所以插件不是请求时动态扩展系统，而是启动期修改 runtime 行为。当前主进程尽早调用它，engine core 和 worker 也应各自在开始服务前调用；`_plugins_loaded` 只保证单个进程内幂等，不会让一次失败的插件在后续调用中自动重试。读启动链路时要把它看成和 argv 并行、且具有进程局部状态的一条控制面。
 
 ## `run_server` 是最后分叉
 
-`ServerArgs` 里三个关键字段影响分支：`encoder_only`、`grpc_mode`、`use_ray`。判断顺序是 encoder-only 优先，其次普通 gRPC，再 Ray，最后默认 HTTP。
+`ServerArgs` 里三个关键字段影响分支：`encoder_only`、`grpc_mode`、`use_ray`。判断顺序是 encoder-only 优先，其次 legacy SMG gRPC，再 Ray，最后默认 HTTP。
 
 ```python
 # 来源：python/sglang/launch_server.py L15-L51
@@ -316,6 +316,8 @@ def run_server(server_args):
 
 这段解释了为什么 `encoder_only=True` 与 `grpc_mode=True` 时不会走普通 `grpc_server.serve_grpc`。它先命中 encoder 分支，再在 encoder 内部选择 gRPC 或 HTTP encoder server。
 
+组合参数也按同一优先级解释：`grpc_mode=True` 与 `use_ray=True` 同时出现时，先命中 legacy gRPC，Ray 分支不会执行。这里的 `grpc_mode` 不是默认 HTTP 路径中由环境变量预留的 native Rust gRPC 能力。
+
 ## 运行验证
 
 启动链路的轻量验证可以只看控制面，不必真的拉起模型。下面的命令覆盖入口注册、CLI 子命令、`ServerArgs` 字段、插件加载和最终 server 分支：
@@ -330,8 +332,10 @@ rg -n 'sglang =|sglang\.launch_server|def main\(|def serve\(|class ServerArgs|cl
 
 - `sglang --help` 没有 `--model-path`，不是缺参数，而是根命令只显示子命令。
 - `--model-type` 是 serve dispatcher 的 hint，不是 LLM `ServerArgs` 字段。
+- `--config` 不是任意写法都等价：当前合并器只识别两个 token 形式的 `--config FILE`；`--config=FILE` 不会进入合并分支。
+- 模型路径不能只放在 YAML：`serve()` 在 `prepare_server_args` 合并 config 之前就调用 `get_model_path()`。
 - `ServerArgs` 字段默认值不是最终真相，`__post_init__` 可能会校验、规范化或改写。
-- 插件加载失败不一定阻断启动，但 hook 没 apply 会改变后续 runtime 行为。
+- 插件加载失败不一定阻断启动，但 `_plugins_loaded` 已被置位，当前进程不会靠再次调用 `load_plugins()` 自动重试。
 - `PortArgs` 不是 CLI 解析结果，它是 runtime 启动时从 `ServerArgs` 派生出的 IPC/NCCL 坐标。
 
 下一篇 [[SGLang-启动链路-源码走读]] 沿一条命令主线把这些概念落到源码。

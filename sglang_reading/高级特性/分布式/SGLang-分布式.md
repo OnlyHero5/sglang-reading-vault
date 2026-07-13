@@ -9,16 +9,15 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 分布式
 
-> **SGLang 高级特性 · 分布式** | Git：`70df09b83363e0127b43c83a6007d3938f815b2d`
-> **源码范围：** `python/sglang/srt/distributed/`、`python/sglang/srt/managers/data_parallel_controller.py`、`python/sglang/srt/disaggregation/utils.py`、`python/sglang/srt/elastic_ep/`
+> 源码基线 `70df09b`。本专题同时覆盖模型 group、请求 DP、PD 状态同步与 Elastic EP；它们共享 rank，却不共享同一种通信对象。
 
 ## 读者为什么要读
 
-部署大模型时，`--tp-size`、`--pp-size`、`--dp-size`、`--ep-size`、`--attn-cp-size` 不是几组互不相关的数字。它们会把同一批 global rank 切成多套坐标系：模型层用 TP、Attention TP/CP、MoE EP/TP 做张量通信，请求入口用 DP Controller 把请求送到不同 Scheduler，PD 和 Elastic EP 又会在 CPU group 或 Mooncake backend 上做特殊同步。
+部署大模型时，`--tp-size`、`--pp-size`、`--dp-size`、`--ep-size`、`--attn-cp-size` 不是几组可随意相乘的数字。TP/PP 定义当前 scheduler 模型 WORLD 的主要切分；Attention、MoE、DCP 在其上投影或复用 group；外层 DP Controller 则可能启动/路由多个 scheduler worker。PD 与 Elastic EP 又会消费这些 group 的协调通道或恢复其 membership。
 
 这组文档解决三个问题：
 
@@ -28,7 +27,7 @@ updated: 2026-07-10
 
 ## 主线模型
 
-把 Distributed 看成“分布式坐标系编译器”：
+把 Distributed 看成“坐标编译 + 四类运行流”：
 
 ```mermaid
 flowchart LR
@@ -38,11 +37,11 @@ flowchart LR
   GC --> Ops["communication_op.py<br/>模型层 collective 入口"]
   Launch --> DPC["DataParallelController<br/>请求路由"]
   DPC --> Sched["多个 Scheduler worker"]
-  GC --> PD["disaggregation utils<br/>CPU gloo poll"]
-  GC --> EP["elastic_ep<br/>Mooncake recovery"]
+  GC --> PD["disaggregation utils<br/>CPU status tensor + coordination group"]
+  GC --> EP["elastic_ep<br/>Mooncake membership recovery"]
 ```
 
-读源码时先问一个问题：当前这段代码在处理“rank 之间同步张量”，还是在处理“请求应该送到哪个 worker”。前者走 `GroupCoordinator` 和 `communication_op.py`，后者走 `DataParallelController`。
+读源码时先确认**对象与作用域**：模型 tensor、请求对象、PD poll status、active-rank membership 分属不同运行流。即便都出现 `rank` 或 `all_reduce`，也不能互相套用故障模型。
 
 ## 阅读顺序
 
@@ -78,7 +77,7 @@ If you only need to use the distributed environment without model/pipeline
  steps.
 ```
 
-`initialize_model_parallel` 是切坐标系的主入口。参数名就是本专题的地图：TP、EP、PP、Attention DP/CP、MoE DP、DCP 都在这里进入。
+`initialize_model_parallel` 是模型 group 的主入口。参数名覆盖 TP、EP、PP、Attention DP/CP、MoE DP、DCP；但某些结果会直接别名已有 `_TP` / `_ATTN_CP`，并非每个名字都创建一个全新 ProcessGroup。
 
 ```python
 # 来源：python/sglang/srt/distributed/parallel_state.py L1967-L1979
@@ -116,15 +115,29 @@ class DataParallelController:
 
 ## 读者抓手
 
-第一次读，不要先背缩写。先把 global rank 写在一行，再把它投影成不同组：
+第一次读，不要先背缩写。先建立四本账：
 
-- TP/Attention/MoE/PP：模型权重和中间张量怎么在 GPU 间切。
-- DP Controller：请求怎么落到哪个 Scheduler worker。
-- CPU group：PD poll、对象同步、Mooncake recovery 等非模型张量场景。
+- **坐标账**：global/local/group rank 与 TP/PP/Attention/MoE/DCP membership。
+- **对象账**：tensor、request、poll status、active-rank mask 分别在流动什么。
+- **通道账**：device group、coordination group、ZMQ、Mooncake recovery 分别由谁拥有。
+- **生命周期账**：group 建立、alias、capture、destroy/recover 发生在何时。
 
-排障时也按这个顺序缩小范围：先看 `world_size == tp_size * pp_size` 是否成立，再看当前报错属于哪个 group，最后看它是 group 构造失败、collective backend 选错，还是 DP 请求路由错位。
+排障时先限定 `world_size == tp_size * pp_size` 的作用域：它是 `initialize_model_parallel` 对当前模型 WORLD 的硬校验，不是整个部署的 GPU 总量公式。然后再判断是 group 构造、collective backend、DP 请求路由、PD status 收敛还是 Elastic EP membership 恢复。
 
 ## 阅读路径
 
-← [[SGLang-PD分离|PD 分离]]
-→ [[SGLang-多模态|Multimodal：多模态 VLM]]
+前置：[[SGLang-架构分层]]、[[SGLang-关键概念]]
+
+关联：[[SGLang-PD分离]]、[[SGLang-MoE]]、[[SGLang-ModelRunner]]
+
+## 静态验证
+
+```powershell
+rg -n "world_size != tensor_model_parallel_size|_ATTN_TP = _TP|_MOE_EP = _TP|class DataParallelController|poll_and_all_reduce|try_recover_ranks" `
+  sglang/python/sglang/srt/distributed/parallel_state.py `
+  sglang/python/sglang/srt/managers/data_parallel_controller.py `
+  sglang/python/sglang/srt/disaggregation/utils.py `
+  sglang/python/sglang/srt/elastic_ep/elastic_ep.py
+```
+
+预期同时命中模型 WORLD 校验、group alias、请求 controller、PD poll 与 recovery；这证明本专题至少包含五种不同边界，不能被压缩成一条 NCCL 主线。

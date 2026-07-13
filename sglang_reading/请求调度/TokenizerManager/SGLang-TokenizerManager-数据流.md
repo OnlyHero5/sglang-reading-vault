@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # TokenizerManager · 数据流
 
@@ -22,6 +22,7 @@ updated: 2026-07-10
 ```mermaid
 flowchart TD
     A["GenerateReqInput<br/>HTTP/API 原始请求"]
+    N["normalize<br/>single batch n rid defaults"]
     B["ReqState<br/>rid_to_state[rid]"]
     C["TokenizedGenerateReqInput<br/>Scheduler IPC"]
     D["BatchTokenIDOutput<br/>Scheduler 输出 token ids"]
@@ -29,8 +30,9 @@ flowchart TD
     F["out_dict<br/>ReqState.out_list"]
     G["HTTP/SSE JSON chunk"]
 
-    A -->|"normalize + _init_req_state"| B
-    A -->|"_tokenize_one_request"| C
+    A --> N
+    N -->|"_init_req_state"| B
+    N -->|"_tokenize_one_request"| C
     C -->|"ZMQ PUSH"| D
     D -->|"普通模式 detokenize"| E
     D -->|"skip_tokenizer_init=True"| F
@@ -38,18 +40,21 @@ flowchart TD
     F -->|"_wait_one_response"| G
 ```
 
-这个生命周期里最重要的状态持有者只有一个：`ReqState`。Scheduler 不知道 HTTP 协程，HTTP 协程也不直接读 Scheduler 回包。
+这个生命周期里每个实际 `rid` 的前台等待状态由 owner TokenizerManager 进程中的 `ReqState` 持有。Scheduler 不知道 HTTP 协程，HTTP 协程也不直接读 Scheduler 回包；多 worker 模式还必须先把输出路由回持有该 state 的进程。
 
 ## 对象形态变化
 
 | 阶段 | 对象 | 持有者 | 关键字段 | 下一跳 |
 |------|------|--------|----------|--------|
 | API 输入 | `GenerateReqInput` | HTTP route / Engine | `text`、`input_ids`、`stream`、`sampling_params`、`rid` | `generate_request` |
+| 请求整形 | 同一个 `GenerateReqInput` 的规范化状态 | TokenizerManager 前台协程 | `is_single`、`batch_size`、`parallel_sample_num`、展开后的 per-item 参数 | `_init_req_state` |
 | 等待状态 | `ReqState` | `TokenizerManager.rid_to_state` | `event`、`out_list`、`finished`、`text_chunks`、`output_ids` | 前台等待和后台写入共享 |
 | 后端请求 | `TokenizedGenerateReqInput` | Scheduler IPC | `input_ids`、`sampling_params`、`lora_id`、`http_worker_ipc`、routing 字段 | Scheduler |
 | token 回程 | `BatchTokenIDOutput` | Scheduler/TokenizerManager | `rids`、`decode_ids`、`read_offsets`、`output_ids`、finish/meta | Detokenizer 或 skip path |
 | 文本回程 | `BatchStrOutput` | Detokenizer/TokenizerManager | `output_strs`、`output_ids`、logprobs、token counts、customized info | `_handle_batch_output` |
 | HTTP 输出 | `out_dict` | `ReqState.out_list` | `text` 或 `output_ids`、`meta_info`、可选 `prompt_token_ids` | `_wait_one_response` |
+
+parallel sampling 不能只画成一条 rid。对 `B` 个 prompt、`N>1` 个 samples，当前基线实际出现三组内部 state：normalization 先创建 `B×N` 个 placeholder state；每个 prompt 再创建一个预热 state；最后创建 `B×N` 个实际 sample state。预热和 sample state 有正常 finished 回包清理，展开代码还显式删除前 `B` 个 placeholder state，但剩余 `B×(N-1)` 个 placeholder state 在正常路径上没有对应输出或删除。这是数据流中一个未闭合的所有权边界。
 
 ## IPC 边界
 
@@ -86,12 +91,23 @@ TokenizerManager.send_to_scheduler -> scheduler_input_ipc_name
 DetokenizerManager -> tokenizer_ipc_name -> TokenizerManager.recv_from_detokenizer
 ```
 
-多 worker 下：
+多 tokenizer、单 detokenizer 的典型回程：
 
 ```text
 TokenizerWorker -> tokenizer_worker_ipc_name -> MultiTokenizerRouter -> Scheduler
 Scheduler/Detokenizer -> MultiTokenizerRouter -> owner tokenizer_ipc_name
 ```
+
+多 detokenizer 时则是：
+
+```text
+Scheduler -> MultiDetokenizerRouter
+  -> hash(http_worker_ipc) 固定 detokenizer worker
+  -> DetokenizerManager
+  -> owner tokenizer_ipc_name
+```
+
+固定哈希的目的不是负载均衡本身，而是让同一请求持续落到同一个 detokenizer，保护它的增量 `decode_status`。
 
 ## `rid` 和 `http_worker_ipc` 是两套身份
 
@@ -154,15 +170,16 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
 1. 前台 `_wait_one_response` 等 `state.event.wait()`。
 2. 后台 `_handle_batch_output` 把 `out_dict` append 到 `state.out_list`。
-3. 后台按 `batch_notify_size` 批量 `event.set()`。
+3. 后台处理同一个 `Batch*Output` 时，每累计 `batch_notify_size` 个待通知 rid 就 `event.set()` 并让出一次 event loop；遍历结束后会立即通知剩余 rid。
 4. 前台醒来后一次性 drain `out_list`，然后 `event.clear()`。
 
 这个协议解释两个现象：
 
 | 现象 | 原因 |
 |------|------|
-| 流式输出可能一次 yield 多个 token 的合并结果 | 前台醒来前已经堆积多个 out_dict，incremental 模式会 coalesce |
+| 流式输出可能一次 yield 多个 token 的合并结果 | 前台消费速度或协程调度使同一 rid 在醒来前积压多个 out_dict，incremental 模式会 coalesce |
 | 后台已经删除 `rid_to_state`，前台仍能返回最后一包 | 删除发生在 finished 分支，但局部 `state` 仍持有最后的 out_list 和 event |
+| 只有 `n>1` 时 `rid_to_state` 完成后仍净增长 | normalization 创建的 placeholder rid 多于 `_handle_batch_request` 实际消费并显式删除的原始 rid；比较 `B×N` 次创建与 `B` 次删除 |
 
 ## pause 和权重更新的数据流
 
@@ -189,7 +206,7 @@ generate_request
 | `--enable-tokenizer-batch-encode` | batch text 请求可以先批量 tokenizer，再构造多个 tokenized objects |
 | `--incremental-streaming-output` | streaming chunk 是互不重叠的 delta；多个 chunk backlog 需要 coalesce |
 | `--tokenizer-worker-num > 1` | 请求先到 router；输出按 `http_worker_ipc` 回 owner worker；pause/continue 要广播到所有 worker |
-| `--batch-notify-size` | 后台收包唤醒前台的批量阈值，影响 wakeup 开销和 ITL |
+| `--batch-notify-size` | 处理一个批回包时每通知多少个 rid 就让出 event loop；末尾余数仍立即通知，它不是跨多个后端消息攒 token 的缓冲区 |
 
 ## 和相邻模块的数据接口
 

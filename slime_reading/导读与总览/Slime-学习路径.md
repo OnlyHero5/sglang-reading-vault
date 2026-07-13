@@ -9,13 +9,13 @@ tags:
   - framework/slime
   - content/guide
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Slime 学习路径
 
-> 按闭环职责组织的学习路线：每个主题给出阅读目标与源码锚点
+> 按读者任务与运行时责任组织的学习路线。源码锚点用于定位，不替代专题全文。
 
-建议顺序：先补 Ray/Megatron 直觉，再建立启动、参数与资源视图，然后走通 rollout、训练和权重更新，最后阅读定制与生态。
+建议顺序：先补 Ray/Megatron 直觉，再用同步 baseline 建立版本清晰的闭环；随后分别深挖资源、样本、训练与权重发布，最后才进入流水异步、fully async、Agent 和插件。
 
 ## 长文读法
 
@@ -32,6 +32,18 @@ updated: 2026-07-10
 
 读的时候先选目标再进入对应主题。入口页负责定位，不替代专题源码走读。
 
+## 先选运行模式
+
+同一个函数名在不同主循环里可能承担不同的一致性责任。进入专题前先确定自己读的是哪种模式：
+
+| 模式 | 入口 | 适合先研究什么 | 暂时不要假设什么 |
+|------|------|----------------|------------------|
+| 同步 baseline | `train.py` | 对象生命周期、critic 分支、offload、每轮权重屏障 | 不要把所有输出都简化成 PPO/GRPO 固定字段 |
+| 流水异步 | `train_async.py` | future 预取、生成/训练重叠、更新间隔、策略陈旧度 | 不要假设 rollout 永远使用刚训练出的最新权重，也不要启用 colocate |
+| fully async | `examples/full_async` | buffer、生产消费速率、版本窗口、旧样本策略 | 不要把它当成 `train_async.py` 的同义词 |
+
+首次学习固定在同步 baseline，直到你能证明“某条 sample 由哪版权重生成、由哪轮训练消费、何时发布下一版权重”。
+
 ---
 
 ## Ray / Megatron 零基础先修
@@ -43,7 +55,7 @@ updated: 2026-07-10
 **源码锚点：**
 
 ```python
-## 来源：train.py L11-L20
+# 定位骨架（非逐行摘录）：来源 train.py L11-L20
     # allocate the GPUs
     pgs = create_placement_groups(args)
     init_tracking(args)
@@ -59,16 +71,16 @@ updated: 2026-07-10
 
 ---
 
-## 项目愿景与三角架构
+## 项目边界与四类责任
 
-**目标：** 理解 Slime 解决什么问题、三角三角色分工。
+**目标：** 理解 Slime 解决什么问题，并区分资源编排、样本生产、训练消费和权重发布。
 
 **阅读：** [[Slime-阅读方法-核心概念]]
 
 **源码锚点：**
 
 ```python
-## 来源：train.py L62-L81
+# 定位骨架（非逐行摘录）：来源 train.py L62-L81
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
         actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
@@ -92,7 +104,7 @@ updated: 2026-07-10
 **源码锚点：**
 
 ```python
-## 来源：train.py L9-L32
+# 定位骨架（非逐行摘录）：来源 train.py L9-L32
 def train(args):
     configure_logger()
     pgs = create_placement_groups(args)
@@ -117,7 +129,7 @@ def train(args):
 **源码锚点：**
 
 ```python
-## 来源：slime/utils/arguments.py L1546-L1559
+# 定位骨架（非逐行摘录）：来源 slime/utils/arguments.py L1546-L1559
 def parse_args(add_custom_arguments=None):
     configure_logger()
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
@@ -139,7 +151,7 @@ def parse_args(add_custom_arguments=None):
 **源码锚点：**
 
 ```python
-## 来源：slime/ray/placement_group.py L15-L18
+# 来源：slime/ray/placement_group.py L15-L18
 @ray.remote(num_gpus=1)
 class InfoActor:
     def get_ip_and_gpu_id(self):
@@ -159,7 +171,7 @@ class InfoActor:
 **源码锚点：**
 
 ```python
-## 来源：slime/ray/rollout.py L546-L559
+# 定位骨架（非逐行摘录）：来源 slime/ray/rollout.py L546-L559
     def generate(self, rollout_id):
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
@@ -181,7 +193,7 @@ class InfoActor:
 **源码锚点：**
 
 ```python
-## 来源：slime/rollout/sglang_rollout.py L618-L632
+# 定位骨架（非逐行摘录）：来源 slime/rollout/sglang_rollout.py L618-L632
 def generate_rollout(
     args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
@@ -201,7 +213,7 @@ def generate_rollout(
 **源码锚点：**
 
 ```python
-## 来源：slime/backends/sglang_utils/sglang_engine.py L52-L77
+# 定位骨架（非逐行摘录）：来源 slime/backends/sglang_utils/sglang_engine.py L52-L77
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     if getattr(server_args, "encoder_only", False):
         from sglang.srt.disaggregation.encode_server import launch_server_process as sglang_launch_server_process
@@ -226,7 +238,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 ```
 
 ```python
-## 来源：slime/backends/sglang_utils/sglang_engine.py L464-L488
+# 定位骨架（非逐行摘录）：来源 slime/backends/sglang_utils/sglang_engine.py L464-L488
     def update_weights_from_distributed(
         self,
         names,
@@ -264,7 +276,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 **源码锚点：**
 
 ```python
-## 来源：slime/backends/megatron_utils/actor.py L380-L394
+# 定位骨架（非逐行摘录）：来源 slime/backends/megatron_utils/actor.py L380-L394
     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
         if self.args.offload_train:
             self.wake_up()
@@ -287,7 +299,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 **源码锚点：**
 
 ```python
-## 来源：slime/backends/megatron_utils/loss.py L661-L669
+# 定位骨架（非逐行摘录）：来源 slime/backends/megatron_utils/loss.py L661-L669
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
     Supported methods: "grpo", "gspo", "cispo", "ppo",
@@ -306,7 +318,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 **源码锚点：**
 
 ```python
-## 来源：slime/backends/megatron_utils/actor.py L583-L586
+# 来源：slime/backends/megatron_utils/actor.py L583-L586
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -316,14 +328,14 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
 ## 定制接口与 Agent
 
-**目标：** 17 类 `--*-path`；TrajectoryManager 多轮轨迹。
+**目标：** 理解 `--*-path` 动态加载边界，以及 TrajectoryManager 如何保存多轮轨迹；具体 hook 数量以当前参数定义为准，不把易变计数当接口契约。
 
 **阅读：** [[Slime-自定义扩展-源码走读]] · [[Slime-Agent轨迹-源码走读]]
 
 **源码锚点：**
 
 ```python
-## 来源：slime/utils/misc.py L37-L45
+# 来源：slime/utils/misc.py L37-L45
 def load_function(path):
     """
     Load a function from a module.
@@ -336,7 +348,7 @@ def load_function(path):
 ```
 
 ```python
-## 来源：slime/utils/arguments.py L327-L339
+# 定位骨架（非逐行摘录）：来源 slime/utils/arguments.py L327-L339
             parser.add_argument(
                 "--rollout-function-path",
                 type=str,
@@ -352,7 +364,7 @@ def load_function(path):
 ```
 
 ```python
-## 来源：slime/agent/trajectory.py L283-L305
+# 定位骨架（非逐行摘录）：来源 slime/agent/trajectory.py L283-L305
     def record_turn(
         self,
         sid: str,
@@ -385,7 +397,7 @@ def load_function(path):
 **源码锚点：**
 
 ```python
-## 来源：slime_plugins/rollout_buffer/buffer.py L54-L103
+# 定位骨架（非逐行摘录）：来源 slime_plugins/rollout_buffer/buffer.py L54-L103
 def discover_generators():
     """
     Automatically discover generator modules in the generator directory.
@@ -418,7 +430,7 @@ def discover_generators():
 ```
 
 ```python
-## 来源：slime_plugins/rollout_buffer/buffer.py L125-L138
+# 来源：slime_plugins/rollout_buffer/buffer.py L125-L138
 class BufferQueue:
     def __init__(
         self,
@@ -456,6 +468,21 @@ class BufferQueue:
 | update_weights | [[Slime-分布式权重同步]] · [[Slime-磁盘权重同步]] |
 | Agent/定制 | [[Slime-Agent轨迹]] · [[Slime-自定义扩展]] |
 | 插件生态 | [[Slime-插件与示例]] |
+
+---
+
+## 每一阶段怎样验收
+
+| 阶段 | 通过标准 | 可执行或静态验证 |
+|------|----------|------------------|
+| 启动与资源 | 能从参数推导 actor/rollout/critic 的 PG slice 与 colocate 关系 | 给 `_get_placement_group_layout` 构造 debug、external、colocate 参数表并核对返回值 |
+| Rollout | 能解释 `Sample` 的 tokens、mask、reward、rollout id、weight version 在何处形成 | 保存一轮 debug rollout data，检查字段长度和版本 metadata |
+| DP 调度 | 能解释为何先按 rollout 保组，再 pack micro-batch | 对 `build_dp_schedule` 输入不同长度与 sibling rollout id，观察 partitions 与 indices |
+| 训练 | 能区分 rollout/current/ref logprob 与 critic value | 沿 `train_actor` 的配置分支列出每个字段的生产者 |
+| 权重发布 | 能说明所选 updater 如何限制半更新可见性，以及失败后可能留下什么状态 | 先选 distributed、disk、tensor colocate 或 external 路径，再静态追踪其 writer/lock、payload、cache/commit 与版本点；可运行时核对所有目标 engine 的 version |
+| 异步 | 能画出 sample version 与 actor version 的时间线 | 对 `update_weights_interval > 1` 手工推演每轮 generation 使用的最近已发布版本 |
+
+如果环境无法启动 Ray、SGLang 或多卡 Megatron，静态验证必须写出输入、调用链、预期结果和无法运行的环境限制；只写“阅读源码可知”不算完成。
 
 ---
 

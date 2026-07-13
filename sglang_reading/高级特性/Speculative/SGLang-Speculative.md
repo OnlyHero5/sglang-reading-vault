@@ -42,10 +42,18 @@ flowchart LR
   F[ScheduleBatch] --> G[draft 或 NGRAM corpus]
   G --> H[SpecInput 写入 batch.spec_info]
   H --> I[target verify forward]
-  I --> J[eagle_sample 或 reject sampling]
-  J --> K[accept_index accept_lens predict]
-  K --> L[move_accept_tokens_to_target_kvcache]
-  L --> M[GenerationBatchResult]
+  I --> J{算法验收实现}
+  J -->|EAGLE family 或 NGRAM| K[eagle_sample]
+  J -->|DFLASH| L[block verify]
+  K --> M[predict accept_lens accept_index]
+  L --> N[out_tokens commit_lens]
+  M --> O{提交布局}
+  O -->|EAGLE topk 大于 1 或 NGRAM| P[KV mover]
+  O -->|EAGLE topk 等于 1| Q[前部链已是主布局]
+  N --> R[DFLASH 自有提交路径]
+  P --> S[GenerationBatchResult]
+  Q --> S
+  R --> S
 ```
 
 把投机解码读成四本账：
@@ -54,8 +62,8 @@ flowchart LR
 |------|------|----------|
 | 控制账 | 用哪个算法、哪个 worker、哪些参数默认值 | `SpeculativeAlgorithm`、`CustomSpecAlgo`、`create_worker` |
 | 阶段账 | 当前 batch 是 draft、draft extend 还是 verify | `SpecInputType`、`SpecInput`、`batch.spec_info` |
-| KV 账 | draft 写了哪些 KV，accept 后如何写回 target KV | `prepare_for_draft_extend`、`move_accept_tokens_to_target_kvcache` |
-| 验收账 | 哪些 token 被接受，bonus token 如何产生，accept rate 如何反馈 | `eagle_sample`、`reject_sampling`、`AdaptiveController` |
+| KV 账 | verify 临时布局怎样变成已提交主链；哪些算法根本不走通用 mover | `prepare_for_draft_extend`、`_finalize_accept_tree_path`、DFLASH commit |
+| 验收账 | 哪些 token 被接受、bonus token 如何产生、不同算法怎样交付共同调度结果 | `eagle_sample`、DFLASH block verify、`GenerationBatchResult` |
 
 ## 核心源码证据
 
@@ -166,15 +174,15 @@ worker 工厂再把算法变成具体执行器。EAGLE family、DFLASH、Frozen-
 
 - 看到投机变慢，先看 accept rate 和 draft/verify 成本，不要只看 draft token 数。
 - 看到 EAGLE/NGRAM 路径差异，先看 `has_draft_kv` 和 worker 类型。
-- 看到 verify 结果跨 TP 不一致，先看采样结果是否 broadcast。
-- 看到 KV 错位，先看 `accept_index` 的宽度、`accept_lens - 1` 和 target KV mover。
+- 看到 EAGLE/NGRAM 随机验收跨 TP 不一致，检查 CUDA/MUSA stochastic branch 是否从 rank 0 broadcast；greedy 以及 HIP/NPU 强制 argmax 分支不走这段同步。
+- 看到 KV 错位，先分算法：EAGLE 仅 `topk > 1` 进入通用 mover，`topk == 1` 已是前部链；NGRAM 总是搬；DFLASH 使用独立 block commit。
 - 看到自定义算法启动失败，先看注册名是否保留、`supports_overlap` 是否满足当前调度。
 
 ## 相邻专题
 
 | 专题 | 关系 |
 |------|------|
-| [[SGLang-Sampling]] | verify 后仍要走 target logits 的采样与约束逻辑 |
+| [[SGLang-Sampling]] | 对照普通采样；spec verify 只复用部分参数，走专用路径，当前 `eagle_sample` 不应用 min-p 或 custom logit processor |
 | [[SGLang-ScheduleBatch数据结构]] | 投机阶段通过 `ScheduleBatch.spec_info` 改变 batch 语义 |
 | [[SGLang-KV-Cache]] | accepted token 最终要写回 target KV cache |
 | [[SGLang-Attention]] | `SpecInputType` 会影响 attention mask 与 metadata |

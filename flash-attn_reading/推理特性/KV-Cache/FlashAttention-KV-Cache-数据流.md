@@ -9,7 +9,7 @@ tags:
   - framework/flash-attn
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # KV-Cache · 数据流
 
@@ -34,14 +34,14 @@ flowchart LR
     Combine --> Out
 ```
 
-主线里只有两个持久状态：`k_cache/v_cache` 和上层 runtime 维护的 cache 元数据。`q`、新 `k/v`、partial buffer、`softmax_lse` 都是本次调用内的对象。
+主线里只有两个跨 decode step 持久的状态：`k_cache/v_cache` 和上层 runtime 维护的 cache 元数据。`q`、新 `k/v`、可选 partial buffer、`softmax_lse` 都是本次调用内的对象；其中 partial buffer 只在最终 `num_splits>1` 时存在。
 
-## 对象 1：`cache_seqlens` 是长度状态
+## 对象 1：`cache_seqlens` 是结束位置与长度状态
 
-`cache_seqlens` 从 Python 传入 C++ 后进入 `params.cu_seqlens_k`。在 KV cache 路径里，kernel 通过 `BlockInfo` 把它解释为每条序列已有的 cache 长度，再把 `seqlen_knew` 加进去得到本次 attention 可见的 K 长度。
+`cache_seqlens` 从 Python 传入 C++ 后进入 `params.cu_seqlens_k`。在 KV cache 路径里，它首先是每条序列的 cache 结束位置和 append 坐标；`BlockInfo` 在有 leftpad 时减去 `leftpad_k`，才得到逻辑历史长度，再把 `seqlen_knew` 加进去形成本次 attention 可见的 K 长度。
 
 ```cpp
-// 来源：csrc/flash_attn/src/block_info.h L16-L24
+// 定位：csrc/flash_attn/src/block_info.h L16-L24（长度公式摘要；完整原文见下方卡片）
 __device__ BlockInfo(const Params &params, const int bidb)
     : sum_s_q(!Varlen || params.cu_seqlens_q == nullptr ? -1 : params.cu_seqlens_q[bidb])
     , sum_s_k(!Varlen || params.cu_seqlens_k == nullptr || !params.is_seqlens_k_cumulative ? -1 : params.cu_seqlens_k[bidb])
@@ -53,7 +53,7 @@ __device__ BlockInfo(const Params &params, const int bidb)
 
 数据含义：
 
-- `seqlen_k_cache` 是 append 前历史 cache 的有效长度。
+- `cache_seqlens` 是物理结束位置；`seqlen_k_cache` 才是扣除 leftpad 后、append 前历史 cache 的逻辑有效长度。
 - `actual_seqlen_k` 是本次 attention 看到的有效 K 长度。
 - `leftpad_k` 会把 dense cache 的逻辑起点向右移动。
 
@@ -68,7 +68,7 @@ __device__ BlockInfo(const Params &params, const int bidb)
 新 K/V 进入 C++ 后变成 `params.knew_ptr/vnew_ptr` 与 stride。kernel 只有在 `Append_KV` 模板分支下才会把它们复制进 cache。
 
 ```cpp
-// 来源：csrc/flash_attn/flash_api.cpp L1355-L1387
+// 定位：csrc/flash_attn/flash_api.cpp L1355-L1387（append 参数摘要）
 at::Tensor k, v, k_padded, v_padded;
 if (k_.has_value()) {
     TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
@@ -87,7 +87,7 @@ if (k_.has_value()) {
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_fwd_launch_template.h L113-L120
+// 定位：csrc/flash_attn/src/flash_fwd_launch_template.h L113-L120（模板分流摘要）
 BOOL_SWITCH(params.num_splits > 1, Split, [&] {
     BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
         ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
@@ -109,7 +109,7 @@ BOOL_SWITCH(params.num_splits > 1, Split, [&] {
 RoPE 指针在 C++ 入口写入 params，kernel 只在 append 分支里用它旋转新 K，并在加载 Q 时按相同位置语义旋转当前 Q。
 
 ```cpp
-// 来源：csrc/flash_attn/flash_api.cpp L1408-L1429
+// 定位：csrc/flash_attn/flash_api.cpp L1408-L1429（RoPE 校验摘要）
 if (rotary_cos_.has_value()) {
     TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
     auto rotary_cos = rotary_cos_.value();
@@ -125,7 +125,7 @@ if (rotary_cos_.has_value()) {
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_fwd_kernel.h L785-L820
+// 定位：csrc/flash_attn/src/flash_fwd_kernel.h L785-L820（Q RoPE 地址摘要）
 if (!Append_KV || params.rotary_dim == 0) {
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
@@ -141,7 +141,7 @@ if (!Append_KV || params.rotary_dim == 0) {
 
 数据含义：
 
-- RoPE 的位置来自 `seqlen_k_cache`，也就是 append 前长度。
+- RoPE 的物理位置由 `seqlen_k_cache + leftpad_k` 重建：前者是逻辑历史长度，后者把坐标移回 cache 中的物理 append 位置。
 - causal/local 时，多个 query token 使用递增位置。
 - 非 causal 且非 local 时，Q 的 RoPE row stride 为 0，表示所有 query token 使用同一位置。
 
@@ -150,7 +150,7 @@ if (!Append_KV || params.rotary_dim == 0) {
 无 paged KV 时，kernel 用 batch stride 和 row stride 线性定位 K/V。启用 paged KV 后，`block_table` 参与初始地址计算和每次 K/V tile 推进。
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_fwd_kernel.h L582-L594
+// 定位：csrc/flash_attn/src/flash_fwd_kernel.h L582-L594（初始 paged 地址摘要）
 const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
 const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
 const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
@@ -162,7 +162,7 @@ const index_t row_offset_k = block_table == nullptr
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_fwd_kernel.h L943-L950
+// 定位：csrc/flash_attn/src/flash_fwd_kernel.h L943-L950（paged 指针推进摘要）
 if (block_table == nullptr) {
     tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
 } else {
@@ -182,10 +182,10 @@ if (block_table == nullptr) {
 
 ## 对象 5：SplitKV partial buffer 只在 split 数大于 1 时出现
 
-SplitKV 把 K/V sequence 维切成多个 split。每个 split 先得到自己的 partial output 和 LSE，最后 combine kernel 合并。
+当最终 `num_splits>1` 时，SplitKV 才把 K/V sequence 维切成多份；每个 split 先得到自己的 partial output 和 LSE，最后由 combine kernel 合并。`num_splits==1` 则走 aligned single-split，不经过这条 partial 生命周期。
 
 ```cpp
-// 来源：csrc/flash_attn/flash_api.cpp L314-L325
+// 定位：csrc/flash_attn/flash_api.cpp L314-L325（partial buffer 分配摘要）
 if (p_dropout == 0.0f) {
     if (num_splits < 1) {
         params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
@@ -201,7 +201,7 @@ if (p_dropout == 0.0f) {
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_fwd_launch_template.h L136-L150
+// 定位：csrc/flash_attn/src/flash_fwd_launch_template.h L136-L150（combine 分流摘要）
 if (params.num_splits > 1) {
     constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
     dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
@@ -218,7 +218,122 @@ if (params.num_splits > 1) {
 
 - `num_splits=1`：没有 partial buffer，也没有 combine。
 - `num_splits=0`：自动选择，可能变成 1，也可能大于 1。
-- `num_splits>1`：多一次 partial 写回和 combine，换取长 K/V 上更多并行度。
+- `num_splits>1`：产生更多 CTA，同时增加 partial 写回与 combine。净性能取决于固定 GPU、shape、dtype、cache layout 和计时方法，不能只凭“并行度更高”断言必然更快。
+
+## 精确证据链
+
+上面的代码块是为了看对象流而压缩的定位摘要。下面只保留决定生命周期的原文：长度换算、append 契约、写后可见性、RoPE 门禁、paged 初始地址、multi-split 分配与 combine 条件。
+
+```cpp
+// 来源：csrc/flash_attn/src/block_info.h L16-L24
+    __device__ BlockInfo(const Params &params, const int bidb)
+        : sum_s_q(!Varlen || params.cu_seqlens_q == nullptr ? -1 : params.cu_seqlens_q[bidb])
+        , sum_s_k(!Varlen || params.cu_seqlens_k == nullptr || !params.is_seqlens_k_cumulative ? -1 : params.cu_seqlens_k[bidb])
+        , actual_seqlen_q(!Varlen || params.cu_seqlens_q == nullptr ? params.seqlen_q : params.cu_seqlens_q[bidb + 1] - sum_s_q)
+        // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
+        // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
+        , leftpad_k(params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb])
+        , seqlen_k_cache((!Varlen || params.cu_seqlens_k == nullptr ? params.seqlen_k : (params.is_seqlens_k_cumulative ? params.cu_seqlens_k[bidb + 1] - sum_s_k : params.cu_seqlens_k[bidb])) - leftpad_k)
+        , actual_seqlen_k(params.seqused_k ? params.seqused_k[bidb] - leftpad_k : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew))
+```
+
+```cpp
+// 来源：csrc/flash_attn/flash_api.cpp L1355-L1369
+    at::Tensor k, v, k_padded, v_padded;
+    if (k_.has_value()) {
+        TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
+        TORCH_CHECK(seqlens_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
+        TORCH_CHECK(seqlen_q <= seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
+        k = k_.value();
+        v = v_.value();
+        TORCH_CHECK(k.dtype() == q_dtype, "Key must have the same dtype as query");
+        TORCH_CHECK(v.dtype() == q_dtype, "Value must have the same dtype as query");
+        CHECK_DEVICE(k); CHECK_DEVICE(v);
+        TORCH_CHECK(k.stride(-1) == 1, "Key tensor must have contiguous last dimension");
+        TORCH_CHECK(v.stride(-1) == 1, "Value tensor must have contiguous last dimension");
+        int seqlen_knew = k.size(1);
+        CHECK_SHAPE(k, batch_size, seqlen_knew, num_heads_k, head_size_og);
+        CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og);
+```
+
+```cpp
+// 来源：csrc/flash_attn/src/flash_fwd_kernel.h L778-L783
+        }
+        // Need this before we can read in K again, so that we'll see the updated K values.
+        __syncthreads();
+        tKgK.data() = tKgK_data;
+        tVgV.data() = tVgV_data;
+    }
+```
+
+```cpp
+// 来源：csrc/flash_attn/flash_api.cpp L1408-L1426
+    if (rotary_cos_.has_value()) {
+        TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
+        auto rotary_cos = rotary_cos_.value();
+        CHECK_DEVICE(rotary_cos);
+        params.rotary_dim = rotary_cos.size(1) * 2;
+        TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+        TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+        const int seqlen_ro = rotary_cos.size(0);
+        TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
+        CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_cos);
+        TORCH_CHECK(rotary_cos.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+
+        TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+        auto rotary_sin = rotary_sin_.value();
+        CHECK_DEVICE(rotary_sin);
+        CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_sin);
+        TORCH_CHECK(rotary_sin.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+```
+
+```cpp
+// 来源：csrc/flash_attn/src/flash_fwd_kernel.h L582-L594
+    // We move K and V to the last block.
+    const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
+    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
+    const int block_table_offset = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
+    const index_t row_offset_k = block_table == nullptr
+        ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
+          + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
+        : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    const index_t row_offset_v = block_table == nullptr
+        ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
+          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
+        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+```
+
+```cpp
+// 来源：csrc/flash_attn/flash_api.cpp L314-L325
+    if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
+        if (num_splits < 1) {
+            // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+        }
+        if (params.num_splits > 1) {
+            softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+            out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            params.oaccum_ptr = out_accum.data_ptr();
+        }
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+```
+
+```cpp
+// 来源：csrc/flash_attn/src/flash_fwd_launch_template.h L136-L144
+    if (params.num_splits > 1) {
+        // We want kBlockM to be as small as possible for more parallelism.
+        // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
+        // If headdim is divisible by 64, then we set kBlockM = 8, etc.
+        constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
+        dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
+        EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+            if (params.num_splits <= 2) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+```
 
 ## 交互边界
 
@@ -228,7 +343,7 @@ if (params.num_splits > 1) {
 - 测试不只比输出，还在 append 场景读回 cache，验证状态更新。
 
 ```python
-# 来源：tests/test_flash_attn.py L2118-L2138
+# 定位：tests/test_flash_attn.py L2118-L2138（回读断言摘要；完整原文见终审源码走读）
 if new_kv:
     if paged_kv_block_size is None:
         k_cache_select = (
@@ -247,6 +362,15 @@ if new_kv:
     assert torch.equal(v_cache_select, v_cache_ref)
 ```
 
+## 静态验证
+
+```powershell
+rg -n 'seqlen_k_cache|actual_seqlen_k|knew_ptr|softmax_lse_accum|oaccum_ptr' flash-attn/flash-attention/csrc/flash_attn/src/block_info.h flash-attn/flash-attention/csrc/flash_attn/flash_api.cpp
+rg -n 'num_splits > 1|flash_fwd_splitkv_combine_kernel|Need this before we can read in K again' flash-attn/flash-attention/csrc/flash_attn/src/flash_fwd_launch_template.h flash-attn/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h
+```
+
+预期能闭合三段生命周期：`seqlen_k_cache → actual_seqlen_k` 的长度变化；`knew_ptr → cache → __syncthreads → attention read` 的状态更新；以及仅在 `num_splits>1` 时出现的 accum pointer 与 combine。静态定位不能替代 GPU 数值测试，但若这三段无法在源码中逐一指出，数据流仍没有读通。
+
 ## 读图复盘
 
-如果你只记一条线：`cache_seqlens` 决定旧长度，新 K/V 通过 `knew_ptr/vnew_ptr` 写入 cache，paged KV 通过 `block_table` 改变 K/V 地址，SplitKV 可能把长 K/V 拆成 partial attention 再合并。
+如果你只记一条线：`cache_seqlens` 决定物理结束位置，leftpad 再把它变成逻辑旧长度；新 K/V 通过 `knew_ptr/vnew_ptr` 写入 cache；paged KV 通过 `block_table` 改变 K/V 地址；最终 `num_splits>1` 时才有 partial attention 与 combine。

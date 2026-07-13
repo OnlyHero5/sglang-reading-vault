@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 训练与Rollout参数 · 核心概念
 
@@ -21,7 +21,7 @@ updated: 2026-07-10
 
 | 类别 | 典型字段 | 运行时含义 |
 |------|----------|------------|
-| 样本账参数 | `rollout_batch_size`、`n_samples_per_prompt`、`num_steps_per_rollout` | 决定一次 rollout 产出多少 prompt group、多少训练样本、几步训练消化 |
+| 样本账参数 | `rollout_batch_size`、`n_samples_per_prompt`、`num_steps_per_rollout` | 默认路径决定 prompt group 与 rollout execution 数；训练调度再按唯一 `rollout_id` 分步 |
 | 函数路径参数 | `data_source_path`、`rollout_function_path`、`custom_rm_path` | 通过 `load_function` 变成 callable 或 class |
 | 算法开关 | `loss_type`、`advantage_estimator`、`use_rollout_logprobs` | 决定 Megatron loss 和 advantage 分支 |
 | 后端透传 | `--sglang-*`、HF config 校验、Megatron 默认值 | 把 Slime 语义翻译给 SGLang 与 Megatron |
@@ -88,12 +88,20 @@ def __init__(self, args, pg):
 
 这段说明 `rollout_function_path` 和 `eval_function_path` 是“整条 rollout 函数”的替换点，而不是只改 SGLang HTTP 参数。
 
-## 样本账：prompt group 不等于训练样本
+## 样本账：五种计数不能混用
 
-`rollout_batch_size` 表示一次 rollout 要保留多少 prompt group；每个 prompt group 会生成 `n_samples_per_prompt` 个 response。训练侧的 sample 数通常是两者相乘。
+默认 SGLang 路径中，`rollout_batch_size` 是要保留的有效 prompt group 数，每组启动 `n_samples_per_prompt` 个生成 execution。通常一个 execution 返回一条 Sample，于是训练数据行数等于两者乘积；compact/subagent 路径却可以把一个 execution 展成多条 sibling Sample，它们必须共享同一个 `Sample.rollout_id`。
+
+| 单位 | 含义 | 是否总等于 `rollout_batch_size * n_samples_per_prompt` |
+|------|------|-------------------------------------------------------|
+| prompt group | 默认动态过滤保留的题目组 | group 数等于 `rollout_batch_size` |
+| rollout execution | 一次生成/子轨迹的训练计数身份 | 默认路径通常等于乘积 |
+| Sample 行 | converter 展平后的训练记录 | compact 时可多于 execution 数 |
+| global batch | 一个训练 step 消费的唯一 rollout id 数 | 不是裸 Sample 行数 |
+| micro-batch | token/样本打包后的设备执行单元 | 由 DP schedule、长度和动态 batch 决定 |
 
 ```python
-# 来源：slime/utils/arguments.py L676-L701
+# 来源：slime/utils/arguments.py L676-L702
 # batch sizes
 parser.add_argument(
     "--rollout-batch-size",
@@ -123,7 +131,7 @@ parser.add_argument(
 )
 ```
 
-validate 会把 `num_steps_per_rollout` 变成具体 `global_batch_size`：
+validator 仍用默认 rollout 规模公式推导 `global_batch_size`：
 
 ```python
 # 来源：slime/utils/arguments.py L1911-L1919
@@ -138,7 +146,24 @@ if args.num_steps_per_rollout is not None:
     args.global_batch_size = global_batch_size
 ```
 
-例子：`rollout_batch_size=64`、`n_samples_per_prompt=4`、`num_steps_per_rollout=2`，最终 `global_batch_size=128`。
+真正调度时，scheduler 明确把它解释为每步 rollout 数，而不是训练 Sample 行数：
+
+```python
+# 来源：slime/utils/dp_schedule.py L100-L110
+        global_batch_size: number of rollouts (NOT training samples) per
+            training step. Number of training steps =
+            ``num_rollouts // global_batch_size``; trailing rollouts whose
+            samples don't fit are dropped.
+        rollout_indices: rollout id for each sample (``samples[i].index``).
+            Samples sharing the same id are kept together in one step.
+
+    Returns:
+        ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
+        ``global_batch_sizes[s]`` = rollout count for step s (constant
+        ``global_batch_size`` for every step).
+```
+
+例子：默认路径下 `64 × 4 ÷ 2 = 128` 个 rollout execution/step。若每个 execution compact 成 3 条 sibling，训练表面上可能有 768 行，但仍是 256 个唯一 rollout id、每步 128 个 rollout；不能把 `global_batch_size` 改成 384。
 
 ## 生成插件有两层
 
@@ -182,6 +207,10 @@ with state.dp_rank_context() as _:
 ```
 
 这解释了一个常见排障点：如果你只想改“单个样本怎么调用工具/多轮生成”，用 `custom_generate_function_path`；如果你要改采样循环、filter、abort、返回对象，改 `rollout_function_path`。
+
+compact generate 返回 `list[Sample]` 时还有额外边界：siblings 必须共享 `rollout_id`；当前 fanout E2E 明确避免同时启用 `group_rm`，因为 group 路线假设返回已经是扁平 `list[Sample]`，再嵌套一层会破坏 RM 输入契约。不要从“两个功能分别可用”推导它们的组合一定可用。
+
+GRPO reward normalization 也要重新审视：默认实现只在总行数等于 `rollout_batch_size * n_samples_per_prompt` 时按固定组宽 reshape；可变 fanout 会落入非均匀 fallback，未必仍按原 prompt 分组。当前 fanout E2E 因此显式提供按 `group_index` 归一化的 custom reward postprocess。
 
 ## Reward 和 filter 是不同层级
 
@@ -351,7 +380,7 @@ def add_sglang_arguments(parser):
 
 1. 先区分参数是样本账、函数路径、算法开关还是后端透传。
 2. 对 path 参数，直接找 `load_function` 消费点。
-3. 对 batch 参数，先算 prompt group，再算 sample，再看 validate 是否改写。
+3. 对 batch 参数，依次算 prompt group、rollout execution、Sample 行、global batch 和 micro-batch，再看 validator 与 scheduler。
 4. 对算法参数，看 Megatron loss 的最终分支，不要停在 CLI help。
 5. 对后端参数，看 ownership 边界：Slime 管哪些，透传哪些。
 

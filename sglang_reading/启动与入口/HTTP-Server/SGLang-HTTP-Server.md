@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # HTTP-Server
 
@@ -21,7 +21,7 @@ HTTP Server 是 SGLang 对外服务的门面，也是启动生命周期的门禁
 2. 一个 `/generate` 或 `/v1/chat/completions` 请求为什么最后都会进入 `TokenizerManager`？
 3. `/health`、warmup、多 tokenizer worker、API key 这些部署现象应该从哪个源码分支解释？
 
-读完后，你应该能在排查“端口已开但请求不通”“warmup 失败直接退出”“多 worker 鉴权不生效”“OpenAI 路由和 native 路由行为不一致”时，快速定位到启动链、FastAPI 生命周期、路由委托或 TokenizerManager 下游。
+读完后，你应该能在排查“端口已开但请求不通”“warmup 状态与 ready 日志矛盾”“多 worker 鉴权不生效”“OpenAI 路由和 native 路由行为不一致”时，快速定位到启动链、FastAPI 生命周期、路由委托或 TokenizerManager 下游。
 
 ## 一句话模型
 
@@ -39,6 +39,7 @@ flowchart LR
  SETUP --> APP["FastAPI app + lifespan"]
  APP --> NATIVE["/generate /encode /classify"]
  APP --> OAI["/v1/* serving handlers"]
+ APP --> HEALTH["/health /health_generate"]
  NATIVE --> TM
  OAI --> TM
  TM <-->|ZMQ IPC| SCH
@@ -47,6 +48,8 @@ flowchart LR
 ```
 
 这个模型的关键边界是：HTTP 层只拿到 Python 对象和 JSON/SSE 响应，真正的请求状态、ZMQ、调度和 detokenize 回程都在 [[SGLang-TokenizerManager]] 之后。
+
+readiness 不是一个布尔开关：轻量 `/health`、深度 `/health_generate`、general warmup、custom warmup 和 `ServerStatus` 各自证明不同事实，不能互相替代。
 
 ## 阅读顺序
 
@@ -128,6 +131,7 @@ flowchart LR
 ## 读完后的复盘问题
 
 - 如果 `/health` 返回 503，是端口没监听、`ServerStatus.Starting`、graceful exit，还是深度探活没有收到后端响应？
+- 为什么轻量 `/health` 返回 200 仍不能证明 `ServerStatus.Up`，而 `/health_generate` 成功也不等于它自己的探测请求完整结束？
 - 如果 `--tokenizer-worker-num 4 --api-key <key>` 启动失败，为什么这是 HTTP worker 初始化问题，不是 OpenAI handler 问题？
 - 如果 Python `Engine().generate()` 和 HTTP `/generate` 输出不同，应该在 HTTP route 之前查，还是在 `TokenizerManager.generate_request` 之后查？
 

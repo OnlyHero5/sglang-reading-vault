@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Reward与过滤 · 排障指南
 
@@ -27,6 +27,9 @@ updated: 2026-07-10
 | rollout 很慢但 SGLang 不慢 | `generate_rollout_async` | dynamic filter drop 率高，一直补样 | 看 `rollout/dynamic_filter/drop_*` |
 | remote RM 卡住或失败 | `remote_rm` | 服务超时、HTTP 错误、返回 dict 未配置 key | 看 retry 日志和返回 JSON |
 | eval reward key 不对 | eval output | `eval_reward_key`/`reward_key` 配置错 | 看 eval 返回的 rewards |
+| `boxed_math` 明明有答案却总是 0 | `boxed_` 与 scorer 的组合 | 预抽取后 `math` 又要求 `\boxed` | 分别执行前缀和后缀 scorer |
+| custom batch RM 后部分 reward 仍是 None | reward 回填 `zip` | 返回长度小于输入长度 | 断言输入输出等长 |
+| filter 一直 drop 且永不退出 | 补样 while 循环 | 没有最大 drop/尝试门禁 | 观察 keep rate 并设置外部 watchdog |
 
 ## Q1：`math` 与 `dapo` 该选哪个？
 
@@ -34,7 +37,7 @@ updated: 2026-07-10
 |------|--------|--------|
 | 返回形状 | `0/1` | dict |
 | 错题 reward | `0` | `score=-1.0` |
-| 答案提取 | boxed answer | 默认 Minerva `Answer:`，可 strict box |
+| 答案提取 | boxed answer | 内置分发固定走默认 Minerva `Answer:`；函数级 API 才可传 strict box |
 | 长 response | 全文找 boxed | 只看最后 300 字符 |
 | 常见配置 | `--rm-type math` | `--rm-type dapo --reward-key score` |
 
@@ -57,7 +60,7 @@ def grade_answer_verl(solution_str, ground_truth):
 `dapo` 入口：
 
 ```python
-# 来源：slime/rollout/rm_hub/math_dapo_utils.py L279-L292
+# 定位骨架（据 `slime/rollout/rm_hub/math_dapo_utils.py` L279-L292 删节）：
 solution_str = solution_str[-300:]
 
 correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
@@ -75,7 +78,7 @@ return {
 测试明确锁定差异，避免以后误合并：
 
 ```python
-# 来源：tests/test_rm_math_dapo.py L205-L229
+# 定位骨架（据 `tests/test_rm_math_dapo.py` L205-L229 删节）：
 def test_compute_score_correct_returns_dict_with_reward_one():
     out = compute_score(r"\boxed{42}", "42", strict_box_verify=True)
     assert out == {"score": 1.0, "acc": True, "pred": "42"}
@@ -104,7 +107,7 @@ def get_reward_value(self, args) -> float:
 内置 dynamic filter 会把 reward values 转成 tensor：
 
 ```python
-# 来源：slime/rollout/filter_hub/dynamic_sampling_filters.py L9-L12
+# 来源：slime/rollout/filter_hub/dynamic_sampling_filters.py L9-L11
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     rewards = [sample.get_reward_value(args) for sample in samples]
     keep = torch.tensor(rewards, dtype=torch.float64).std() > 1e-6
@@ -118,16 +121,20 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
 
 remote RM 返回 dict 时同理。
 
+若希望内置 `dapo` 走 strict-box，单写 CLI `--rm-type dapo` 不够：`async_rm` 调用 `compute_score_dapo(response, label)` 时没有传 `strict_box_verify=True`。需要 custom RM 包装器显式调用函数级 API。
+
 ## Q3：`custom_rm_path` 的单条和 batch 签名怎么区分？
 
 默认单条路径调用 `async_rm(args, sample)`，custom 函数应接 `(args, sample, **kwargs)`。
 
 `group_rm=True` 或 batch custom path 调用 `batched_async_rm(args, samples)`，custom 函数应接 `(args, samples, **kwargs)`。
 
+但优先级有一个容易忽略的断点：只要设置了全局 `args.custom_rm_path`，batch 入口就直接调用它，不再逐条查看 `sample.custom_rm_path`。此外返回 list 必须与 samples 等长；调用侧的 `zip(strict=False)` 不会替你报长度不匹配。
+
 源码分支：
 
 ```python
-# 来源：slime/rollout/rm_hub/__init__.py L99-L110
+# 定位骨架（据 `slime/rollout/rm_hub/__init__.py` L99-L110 删节）：
 async def batched_async_rm(
     args,
     samples: list[Sample],
@@ -144,7 +151,7 @@ async def batched_async_rm(
 插件契约测试也按这两个签名检查：
 
 ```python
-# 来源：tests/plugin_contracts/test_plugin_path_loading_contracts.py L319-L345
+# 来源：tests/plugin_contracts/test_plugin_path_loading_contracts.py L319-L336
 def test_custom_rm_path_aligns_with_expected_format():
     path = get_contract_path("CUSTOM_RM_PATH")
     if get_contract_path("GROUP_RM") == "1":
@@ -170,10 +177,12 @@ def test_custom_rm_path_aligns_with_expected_format():
 需要整组上下文时才打开：
 
 - listwise RM 要比较同一 prompt 的多条 response。
-- 远程 RM 希望一次请求批量处理一组 response。
-- 自定义 agent rollout 返回多个相关 samples，需要统一打分。
+- 自定义远程 RM 函数希望自己把一组 response 编成一次 batch 请求；内置 `remote_rm` 仍是一条 sample 一次 HTTP POST。
+- 普通同构 `list[Sample]` 需要统一打分；若 custom generate 已产生嵌套 fan-out，当前 group RM 不能直接组合。
 
 不需要整组上下文时，不要为了“更快”盲目打开。默认 `batched_async_rm` 已经会并发单条 `async_rm`。
+
+eval 路径明确断言 `group_rm` 为 false，所以 batch/listwise RM 不能直接沿默认 eval rollout 复用。
 
 源码入口：来源：slime/rollout/sglang_rollout.py L326-L331
 
@@ -213,6 +222,8 @@ if not dynamic_filter_output.keep:
 - 调大 `--over-sampling-batch-size` 提高补样吞吐。
 - 写自定义 filter，保留一部分 zero-std groups。
 
+若 `n_samples_per_prompt=1`，内置 `torch.std()` 得到 `nan`，也会落入 drop 分支。若 filter 对所有后续 prompt 都拒绝，当前主循环没有最大补样次数，会持续请求新数据；生产运行应监控 keep rate、drop 总数和 wall-clock deadline，而不是只看进度条。
+
 ## Q6：`remote_rm` 的请求和重试策略是什么？
 
 payload 只含 prompt、response、label：
@@ -248,9 +259,11 @@ except Exception as e:
 
 如果服务返回 dict，仍要配置 `--reward-key`。
 
+单次请求 timeout 是 120 秒，最多重试 10 次，且有最高约 30 秒的退避；持续故障的总体等待可能远超 120 秒。共享 `ClientSession` 也没有在本模块暴露显式 close 生命周期。排障时要同时看单次 HTTP timeout、累计重试时间和进程退出时的 session warning。
+
 ## Q7：`boxed_math` 这类前缀怎么理解？
 
-`boxed_` 是预处理前缀，不是单独 scorer。源码先从 response 中提取 boxed answer，再把后缀当成 `rm_type`。
+`boxed_` 是局部预处理前缀，不是经过统一验证的 scorer 装饰器。源码先从 response 中提取 boxed answer，再把后缀当成 `rm_type`，但不同后缀消费输入的方式并不一致。
 
 ```python
 # 来源：slime/rollout/rm_hub/__init__.py L69-L71
@@ -259,7 +272,7 @@ if rm_type.startswith("boxed_"):
     rm_type = rm_type[len("boxed_") :]
 ```
 
-例子：`boxed_math` 表示先把 response 压成 boxed 内容，再进入 `math` 分支。
+不能把 `boxed_math` 当作正确示例：它先把 `\boxed{42}` 压成 `42`，随后 `math` 的 `grade_answer_verl` 又从输入里寻找 `\boxed`，因此得到 0。`boxed_deepscaler` 通常也因丢失分隔符/box 得到 0；`boxed_remote_rm` 则仍把原始 `sample.response` 放进 HTTP payload，预处理结果没有传给服务。使用任何 `boxed_*` 组合前都应写一个直接行为测试。
 
 ## Q8：`deepscaler` 为什么明明答案正确也给 0？
 
@@ -287,15 +300,15 @@ def get_deepscaler_rule_based_reward(response, label):
 CPU scorer 单测：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/test_rm_math_dapo.py -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/test_rm_math_dapo.py -q
 ```
 
 插件契约：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q
 ```
 
 文档证据：

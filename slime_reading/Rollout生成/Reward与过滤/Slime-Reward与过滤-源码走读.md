@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Reward与过滤 · 源码走读
 
@@ -67,7 +67,7 @@ flowchart TD
 设计选择：`generate_and_rm` 在 SGLang 生成完成后检查 `group_rm`。默认路径下，单条 sample 如果 reward 仍为 `None`，就调用 `async_rm`。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L263-L286
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L263-L286 删节）：
 # for the rm that need the whole group, we will not do the rm here
 if args.group_rm:
     return sample
@@ -106,7 +106,7 @@ return sample
 设计选择：`generate_and_rm_group` 先并发生成整组 samples；如果 `group_rm=True`，再对整组调用 `batched_async_rm` 并回填 reward。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L294-L333
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L294-L333 删节）：
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample] | list[list[Sample]]:
@@ -135,6 +135,8 @@ async def generate_and_rm_group(
 
 不变量：`group_rm=True` 不是“打开 dynamic filter”；它只改变 RM 打分时机。filter 仍由 `--dynamic-sampling-filter-path` 控制。
 
+组合边界：若 custom generate 对单个输入返回 `list[Sample]`，`asyncio.gather` 产生的 group 就会是嵌套 list。`group_rm` 随后把嵌套结构直接传给 `batched_async_rm`；默认分支中的 `async_rm` 会把内层 list 当作 `Sample` 访问属性，当前实现并不支持这种 fan-out + group RM 组合。
+
 ## 3. RM Hub 先看插件，再看内置类型
 
 系统压力：训练可以统一用 `--rm-type`，eval 数据集却可能需要 per-dataset 或 per-sample scorer。源码必须让更局部的配置覆盖全局配置。
@@ -142,7 +144,7 @@ async def generate_and_rm_group(
 设计选择：`async_rm` 的优先级是 `sample.custom_rm_path`、`args.custom_rm_path`、`metadata["rm_type"] or args.rm_type`。
 
 ```python
-# 来源：slime/rollout/rm_hub/__init__.py L55-L96
+# 定位骨架（据 `slime/rollout/rm_hub/__init__.py` L55-L96 删节）：
 async def async_rm(args, sample: Sample, **kwargs):
     if sample.custom_rm_path:
         rm_function = load_function(sample.custom_rm_path)
@@ -186,8 +188,10 @@ async def async_rm(args, sample: Sample, **kwargs):
 执行逻辑：
 
 - `metadata["rm_type"]` 可以覆盖 CLI，eval 数据集常用。
-- `boxed_*` 会先抽出 boxed answer，再把后缀当成新的 `rm_type`。
+- `boxed_*` 会先改写局部 `response`，再把后缀当成新的 `rm_type`；但后缀 scorer 是否真的消费这个局部值必须逐项检查。
 - 未指定任何 scorer 会显式报 `NotImplementedError`，不会默默给 0 分。
+
+不能把 `boxed_` 当作通用装饰器：`boxed_math` 抽成纯文本后，`grade_answer_verl` 会再次要求 `\boxed`，因而判 0；`boxed_deepscaler` 丢失分隔符和 box，通常也判 0；`boxed_remote_rm` 更直接地把原 `sample` 交给 `remote_rm`，HTTP payload 仍使用未抽取的 `sample.response`。
 
 ## 4. Batch RM 默认是并发单条 RM
 
@@ -196,7 +200,7 @@ async def async_rm(args, sample: Sample, **kwargs):
 设计选择：`batched_async_rm` 只有在 `args.custom_rm_path` 存在时才把整个 list 交给用户函数；否则并发调用 `async_rm`。
 
 ```python
-# 来源：slime/rollout/rm_hub/__init__.py L99-L110
+# 定位骨架（据 `slime/rollout/rm_hub/__init__.py` L99-L110 删节）：
 async def batched_async_rm(
     args,
     samples: list[Sample],
@@ -210,7 +214,9 @@ async def batched_async_rm(
     return rewards
 ```
 
-读者抓手：`--group-rm --custom-rm-path` 要求用户函数接收 `samples`，不是 `sample`。
+读者抓手：`--group-rm --custom-rm-path` 要求用户函数接收 `samples`，不是 `sample`。而且全局 custom path 在 batch 分支直接短路：即使某个 sample 带 `custom_rm_path`，也不会获得单条入口里的更高优先级。
+
+另一个隐式契约是返回长度。两处回填都使用 `zip(..., strict=False)`：少返回会让尾部 sample 保持 `reward=None`，多返回会静默丢弃。custom RM 应主动断言输出长度等于输入长度。
 
 ## 5. remote RM 是 HTTP scorer，不是训练侧模型调用
 
@@ -219,7 +225,7 @@ async def batched_async_rm(
 设计选择：`remote_rm` 复用共享 `aiohttp.ClientSession`，payload 固定为 prompt/response/label，失败时指数退避重试。
 
 ```python
-# 来源：slime/rollout/rm_hub/__init__.py L22-L52
+# 定位骨架（据 `slime/rollout/rm_hub/__init__.py` L22-L52 删节）：
 def _get_shared_session() -> aiohttp.ClientSession:
     global _shared_session
     if _shared_session is None or _shared_session.closed:
@@ -254,6 +260,8 @@ async def remote_rm(args, sample: Sample, max_retries: int = 10):
 
 不变量：remote RM 最终失败会 raise，不会把失败样本静默设成 0 分。
 
+时间边界也不能忽略：共享 session 的单次总 timeout 是 120 秒，最多重试 10 次，重试间还有指数退避；持续故障可能让一个 reward 请求占用很久。当前模块没有显式关闭共享 session 的公共生命周期入口，进程退出时还可能看到未关闭 session 警告。
+
 ## 6. `math` scorer 只接受可抽取的 boxed answer
 
 系统压力：数学 benchmark 需要把长 CoT 压缩成最终答案，再做等价判断。
@@ -261,7 +269,7 @@ async def remote_rm(args, sample: Sample, max_retries: int = 10):
 设计选择：`grade_answer_verl` 从 response 中抽 boxed answer；ground truth 如果也带 box，先抽；最后用 mathd 规范化或 sympy 等价判断。
 
 ```python
-# 来源：slime/rollout/rm_hub/math_utils.py L478-L493
+# 定位骨架（据 `slime/rollout/rm_hub/math_utils.py` L478-L493 删节）：
 def extract_answer(passage: str) -> str:
     if "\\boxed" in passage:
         return extract_boxed_answer(passage)
@@ -282,7 +290,7 @@ def grade_answer_verl(solution_str, ground_truth):
 sympy 路径有保护条件：分数未约分和整数/非整数类型不匹配不会被随意 simplify 成正确。
 
 ```python
-# 来源：slime/rollout/rm_hub/math_utils.py L451-L465
+# 定位骨架（据 `slime/rollout/rm_hub/math_utils.py` L451-L465 删节）：
 for ground_truth_elem, given_elem in zip(ground_truth_elems, given_elems, strict=False):
     if _is_frac(ground_truth_elem) and _is_frac(given_elem):
         is_correct = ground_truth_elem == given_elem
@@ -303,7 +311,7 @@ return is_correct
 设计选择：`compute_score` 只看 response 尾部 300 字符，调用 `verify`，再返回 `{score, acc, pred}`。
 
 ```python
-# 来源：slime/rollout/rm_hub/math_dapo_utils.py L262-L292
+# 定位骨架（据 `slime/rollout/rm_hub/math_dapo_utils.py` L262-L292 删节）：
 def compute_score(
     solution_str: str,
     ground_truth: str,
@@ -346,6 +354,8 @@ Pins the DAPO math scorer (``rm_type=dapo``). Distinct from
 
 读者抓手：用 `--rm-type dapo` 训练时，通常要配 `--reward-key score`。
 
+函数虽然支持 `strict_box_verify=True`，但 `async_rm` 的内置 `dapo` 分支只传 `response, label`，因此固定使用默认 Minerva `Answer:` 提取。strict-box 需要 custom RM 显式包装；`boxed_dapo` 把答案先压成纯文本，也不会自动切到 strict-box，通常仍判错。
+
 ## 8. DeepScaler scorer 先切 CoT 尾段
 
 系统压力：DeepScaler 格式 response 里包含 thinking 和最终作答区域，不能把整个 response 当作答案。
@@ -353,7 +363,7 @@ Pins the DAPO math scorer (``rm_type=dapo``). Distinct from
 设计选择：先按 `</think>` 或 `###Response` 切出最终段，再复用 `math_utils` 的 answer 提取与判题。
 
 ```python
-# 来源：slime/rollout/rm_hub/deepscaler.py L4-L42
+# 定位骨架（据 `slime/rollout/rm_hub/deepscaler.py` L4-L42 删节）：
 def get_deepscaler_rule_based_reward(response, label):
     if "</think>" in response:
         model_solution = response.split("</think>")[-1]
@@ -385,7 +395,7 @@ def get_deepscaler_rule_based_reward(response, label):
 设计选择：`generate_rollout_async` 等待任意 group 完成后，先放入 `all_data`，再调用 dynamic filter。drop 时不加入 `data`，并减少 `remaining_batch_size`，促使外层继续补样。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L394-L433
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L394-L433 删节）：
 dynamic_filter = (
     load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
 )
@@ -417,8 +427,9 @@ while len(data) < target_data_size:
 执行逻辑：
 
 - `data` 只保存 keep 的 groups。
-- `all_data` 保存所有完成 groups，后续 all-samples hook 可用。
+- `all_data` 保存已经从 done task 取回的 groups，包括 drop 和同批完成但目标已满后未使用的 keep group；abort 阶段才收集的 partial groups 不在其中。
 - drop 不会推进进度条，也不会占训练 batch 名额。
+- 主循环没有最大 drop 数或最低有效率门禁；filter 永远拒绝时会持续补样，不能自动 fail fast。
 
 ## 10. 内置 filter 用 reward 方差判断
 
@@ -447,6 +458,8 @@ def get_reward_value(self, args) -> float:
 
 不变量：`dapo` 或 remote RM 返回 dict 时，`--reward-key` 是 filter 与训练侧共同依赖的配置。
 
+当 `n_samples_per_prompt=1` 时，内置实现的 `torch.std()` 使用样本标准差，结果为 `nan`；`nan > 1e-6` 为 false，因此单样本 group 会被记录为 `zero_std_*` 并 drop。这个 filter 的合理使用前提是 group 至少包含两条可转成数值的 reward。
+
 ## 11. 输出阶段把 samples 和 drop metrics 一起交出去
 
 系统压力：下游需要训练样本，也需要知道动态过滤丢了多少、为什么丢。
@@ -454,7 +467,7 @@ def get_reward_value(self, args) -> float:
 设计选择：rollout 结束后 abort 未完成请求，排序 keep 的 groups，收集 filter metrics，再返回 `RolloutFnTrainOutput`。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L447-L467
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L447-L467 删节）：
 aborted_samples = await abort(args, rollout_id)
 
 assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
@@ -483,8 +496,10 @@ return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), ab
 
 设计选择：eval 构造 sample 时写入 metadata 和 `custom_rm_path`，随后仍走 `generate_and_rm`。
 
+入口边界：`eval_rollout` 首先断言 `not args.group_rm`，所以训练侧的 group/listwise RM 不能直接在默认 eval 路径启用。
+
 ```python
-# 来源：slime/rollout/sglang_rollout.py L558-L583
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L558-L583 删节）：
 tasks = []
 sample_index = 0
 for _i, prompt_sample in enumerate(dataset.samples):
@@ -512,7 +527,7 @@ for _i, prompt_sample in enumerate(dataset.samples):
 eval 输出 reward 时使用 eval 专属 key 或训练 reward key：
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L606-L614
+# 来源：slime/rollout/sglang_rollout.py L606-L615
 data.sort(key=lambda sample: sample.index)
 
 reward_key = args.eval_reward_key or args.reward_key
@@ -530,15 +545,15 @@ return {
 CPU scorer 验证：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/test_rm_math_dapo.py -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/test_rm_math_dapo.py -q
 ```
 
 插件契约验证：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -k "custom_rm or dynamic_filter" -q
 ```
 
 静态文档验证：

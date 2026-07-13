@@ -8,7 +8,7 @@ tags:
   - framework/cross-framework
   - content/guide
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # AI Infra 联合学习路径
@@ -19,16 +19,20 @@ SGLang、Slime 和 FlashAttention 分别覆盖 serving runtime、RL 后训练闭
 
 三者对应三种观察尺度：Slime 看一轮策略如何更新，SGLang 看一条请求如何服务，FlashAttention 看一次算子如何搬运 tensor。联合阅读的目标，是能在尺度之间缩放：既看得见整条闭环，也能在需要时落到一个字段、一次 collective 或一个 register accumulator。
 
-## 三层系统模型
+## 三种观察尺度与 GPU 底座
 
 ```mermaid
 flowchart TB
     RL["Slime<br/>prompt sample reward train weight"]
     SV["SGLang<br/>request schedule KV forward response"]
-    OP["Attention backend<br/>QKV metadata kernel"]
+    OP["实际 Attention backend<br/>QKV metadata kernel"]
     GPU["GPU<br/>HBM shared memory register Tensor Core"]
-    RL --> SV --> OP --> GPU
+    RL --> SV
+    SV -->|"按运行时 dispatch"| OP
+    OP --> GPU
 ```
+
+FlashAttention 提供 IO、online softmax 与 kernel 阅读主线，但 SGLang 实际运行可能选择 FlashInfer、Triton、FlashAttention 或平台专用 backend。联合阅读是尺度映射，不是静态依赖声明。
 
 ## 从零路径
 
@@ -67,6 +71,8 @@ flowchart TB
 [[SGLang服务实验]] → [[FlashAttention性能实验]] → [[Slime闭环实验]] → [[跨库一致性实验]]
 
 每次实验先记录模型、硬件、版本、workload 和单一变量，再记录预期与实际。没有 GPU 时完成静态定位；有 GPU 时补运行数据。
+
+完成路径的验证不是“链接都点过”，而是能交付三张主线图、四本身份账、一份可复现实验和一次故障推演；详见 [[课程完成标准]]。
 
 ## 导航
 

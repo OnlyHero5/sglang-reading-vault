@@ -9,13 +9,13 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 分布式 · 数据流
 
 ## 读者任务
 
-这篇把 Distributed 拆成四条容易混淆的数据流。读者读完要能在排障时快速判断：自己看到的是张量 collective、请求路由、PD CPU poll，还是 Elastic EP recovery。
+这篇把 Distributed 拆成六段对象流：坐标下发、模型 collective、请求路由、负载预算、PD 状态收敛、Elastic EP recovery。读者要能先识别流动对象，再选择源码入口。
 
 ## 总图
 
@@ -34,7 +34,7 @@ flowchart TB
 
 ## 数据流 1：rank 坐标变成 worker 快照
 
-Scheduler 子进程启动前，DP Controller 会计算每个 worker 的 GPU id、TP rank、Attention CP rank、MoE DP/EP rank、PP rank、DP rank，并把这些作为参数传给 scheduler 进程。
+Scheduler 子进程启动前，DP Controller 会计算每个 worker 的 GPU id、TP rank、Attention CP rank、MoE DP/EP rank、PP rank、DP rank，并把这些作为参数传给 scheduler 进程。普通 DP 与 DP-Attention 的启动方式不同：前者按 DP rank 启动多个 TP/PP worker 组，后者在同一 TP rank 空间里计算 attention DP 身份并复用 NCCL 初始化端口。
 
 ```python
 # 来源：python/sglang/srt/managers/data_parallel_controller.py L553-L588
@@ -89,7 +89,7 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 ```
 
-进入 `GroupCoordinator.all_reduce` 后，单卡直接返回；CPU tensor 先走 CPU 路径；GPU tensor 再按平台 communicator 和 all-reduce 策略选路。
+进入 `GroupCoordinator.all_reduce` 后，单卡直接返回；CPU tensor 先尝试 shared-memory kernel，否则仍对当前 `device_group` 调 `torch.distributed.all_reduce`；GPU tensor 再按平台 communicator、对称内存、尺寸与 graph 状态选路。这里不能把“CPU tensor”简写成“必走 `cpu_group`”。
 
 ```python
 # 来源：python/sglang/srt/distributed/parallel_state.py L594-L612
@@ -114,7 +114,7 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
             return self.npu_communicator.all_reduce(input_)
 ```
 
-排障时按这个顺序问：是否真的多卡、tensor 是否在 CPU、当前硬件 communicator 是否接管、是否进入 graph/custom all-reduce 分支。
+排障时按这个顺序问：当前 getter 返回哪个 coordinator、它是否 alias 另一语义组、是否真的多卡、tensor 在哪种设备、当前 communicator 是否接管、是否进入 graph/custom 分支。
 
 ## 数据流 3：DP 请求路由
 
@@ -152,7 +152,7 @@ DP Controller 的对象是请求。它用 `TypeBasedDispatcher` 区分普通 gen
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
 ```
 
-请求路由有一个强优先级入口：如果请求本身带 `routed_dp_rank`，Controller 直接发给目标 worker，不再走负载均衡。
+请求路由有一个强优先级入口：如果请求本身带 `routed_dp_rank`，Controller 直接发给目标 worker，不再走负载均衡。当前函数也没有在这条直接路径上检查 `status[target]` 或 rank 越界；上游必须保证目标合法且可用。
 
 ```python
 # 来源：python/sglang/srt/managers/data_parallel_controller.py L605-L610
@@ -164,7 +164,7 @@ DP Controller 的对象是请求。它用 `TypeBasedDispatcher` 区分普通 gen
         return False
 ```
 
-`FOLLOW_BOOTSTRAP_ROOM` 则要求请求必须带 `bootstrap_room`，并用 room 对 worker 数取模。这个策略服务 PD locality：同一 room 的请求稳定落到同一个 DP rank。
+`FOLLOW_BOOTSTRAP_ROOM` 则要求请求必须带 `bootstrap_room`，并用 room 对 worker 数取模。这个策略服务 PD locality：同一 room 稳定映射到同一个 DP rank。与 round-robin 不同，该分支也未跳过 inactive `status`，所以健康路由仍依赖上层 worker 对与 active-rank 管理。
 
 ```python
 # 来源：python/sglang/srt/managers/data_parallel_controller.py L628-L638
@@ -248,7 +248,7 @@ class DPBudget:
 
 ## 数据流 5：PD poll 用 CPU group 收敛状态
 
-PD 分离里的 poll 不是模型 all-reduce。它把 poll 结果变成 CPU tensor，然后在传入的 gloo group 上取 `MIN`，让所有参与方对状态达成一致。
+PD 分离里的 poll 不是模型 tensor all-reduce。它把 poll 结果变成 CPU tensor，然后在调用者传入的 coordination group 上取 `MIN`，让所有参与方对状态达成一致。普通 group 通常传 Gloo；Mooncake 模式的协调 group 可能是 `mooncake-cpu`，因此文档只应承诺“CPU status tensor + coordination group”。
 
 ```python
 # 来源：python/sglang/srt/disaggregation/utils.py L121-L140
@@ -298,7 +298,7 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return tensor_to_reduce.tolist()
 ```
 
-如果 PD poll 卡住，应该查 CPU group 和参与 ranks，不要先去调 CustomAllReduce。
+如果 PD poll 卡住，应该查传入 group 的 membership/backend、参与 ranks、metadata gate 与 staging 状态，不要先去调模型 CustomAllReduce。
 
 ## 数据流 6：Elastic EP recovery 重建 backend，而不是重跑初始化
 
@@ -343,9 +343,9 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 | 数据流 | 观察点 | 预期 |
 |--------|--------|------|
 | rank 坐标 | Scheduler 启动参数或 `ParallelState` | 同一 worker 的 TP/PP/MoE/Attention rank 可互相推出 |
-| tensor collective | `communication_op.py` helper 断点 | 进入对应 `GroupCoordinator` |
-| DP 路由 | `routed_dp_rank`、`bootstrap_room`、load budget | 请求经 ZMQ 到目标 worker |
-| PD poll | `poll_and_all_reduce` 的 CPU tensor | 组内状态取 `MIN` 后一致 |
+| tensor collective | `communication_op.py` helper 断点并记录 `unique_name`/对象 id | 进入 getter 当前返回的 coordinator；alias 时不同语义可落在同一对象 |
+| DP 路由 | `routed_dp_rank`、`bootstrap_room`、status、load budget | 请求经 ZMQ 到目标 worker；外部直达和 room 分支需额外确认目标健康 |
+| PD poll | `poll_and_all_reduce` 的 CPU tensor 与 group backend | 组内状态取 `MIN` 后一致；metadata 未到会把 Success 降为 Transferring |
 | Elastic EP | `try_recover_ranks` 返回值 | peer 未 ready 返回 `False`，ready 后恢复 WORLD 和 live groups |
 
 ## 复盘
@@ -353,5 +353,16 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 - Distributed 不是一条流，而是多条对象不同的流。
 - 模型 tensor flow 走 helper 和 `GroupCoordinator`。
 - 请求 DP flow 走 ZMQ 和 dispatch 方法。
-- PD poll flow 用 CPU group 收敛状态。
+- PD poll flow 用 CPU status tensor 与调用者提供的 coordination group 收敛状态。
 - Elastic EP flow 恢复 backend membership，并刷新 MoE EP buffer 成员。
+
+## 静态验证
+
+```powershell
+rg -n "enable_dp_attention|routed_dp_rank|bootstrap_room %|dist.ReduceOp.MIN|_apply_metadata_gate|recover_ranks" `
+  sglang/python/sglang/srt/managers/data_parallel_controller.py `
+  sglang/python/sglang/srt/disaggregation/utils.py `
+  sglang/python/sglang/srt/elastic_ep/elastic_ep.py
+```
+
+预期分别命中 DP-Attention 分支、两种强制路由、PD 状态收敛/metadata gate 与 membership recovery。它们共享 rank 信息，却传递四种不同对象。

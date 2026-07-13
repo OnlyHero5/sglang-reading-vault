@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Detokenizer · 核心概念
 
@@ -106,7 +106,7 @@ class DecodeStatus:
 
 | 字段 | 含义 | 排障关注点 |
 |------|------|------------|
-| `decode_ids` | 该 rid 当前用于 detokenize 的 token ids | 是否持续追加同一请求的新增 token |
+| `decode_ids` | 该 rid 当前累计的 detokenize 窗口；首包可含 prompt surrounding token | 是否按窗口片段连续追加，而不是误当纯生成 token delta |
 | `surr_offset` | surrounding 上下文起点 | 如果推进太早，跨 token 字符会丢上下文 |
 | `read_offset` | 已经作为 surrounding 基线的上界 | 如果不更新，后续会反复 decode 旧窗口 |
 | `sent_offset` | 已经发给 TokenizerManager 的字符串位置 | 如果错误，客户端会重复或漏文本 |
@@ -114,7 +114,7 @@ class DecodeStatus:
 
 ## 输入输出对象
 
-Detokenizer 的输入是 `BatchTokenIDOutput`。它带的不是“一个完整字符串”，而是一组请求在本轮可输出的 token 片段、read offset、finish reason 和输出元数据。
+Detokenizer 的输入是 `BatchTokenIDOutput`。它带的不是“一个完整字符串”，也不只有一种 token 增量：`decode_ids` 服务增量 detokenize，首包可包含 prompt 尾部；`output_ids` 则是 Scheduler 按客户端发送偏移切出的 output-token delta，Detokenizer只负责透传。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/io_struct.py L1194-L1206
@@ -146,7 +146,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_ids: Optional[List[array]]
 ```
 
-读者要抓住一个不变量：对 streaming 请求，`output_strs[i]` 是本轮新增文本，不是完整回复。完整回复由 TokenizerManager 的 `ReqState` 继续累加。
+读者要抓住一个不变量：对 streaming 请求，`output_strs[i]` 是本轮新增文本，不是完整回复。完整回复由 TokenizerManager 的 `ReqState` 继续累加。随后是否把这个 delta 原样交给 HTTP/SSE，取决于 `incremental_streaming_output`：开启时返回 delta，关闭时中间态保存累积状态，前台按累积语义出包。不要把 Detokenizer 契约和最终 API chunk 契约合并成一个层次。
 
 ## UTF-8 边界为什么复杂
 
@@ -156,7 +156,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
 ## 多 worker 的核心约束
 
-多 Detokenizer worker 不是随便负载均衡。`DecodeStatus` 是每个 worker 本地状态，同一个请求必须持续路由到同一个 worker，否则下一包 token 找不到上一包的 offset 状态。
+多 Detokenizer worker 不是逐包 round-robin。`DecodeStatus` 是每个 worker 本地状态，同一个请求必须持续路由到同一个 worker，否则下一包 token 找不到上一包的 offset 状态。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/multi_tokenizer_mixin.py L501-L519
@@ -181,7 +181,7 @@ class MultiDetokenizerRouter:
         return self.ipc_name_list[zlib.crc32(key.encode()) % self.num_workers]
 ```
 
-这里哈希的是 `http_worker_ipc`，不是单纯 round-robin。因为同一个 HTTP worker 发出的请求回包要能稳定回到对应的 worker，同时保持 detokenizer 侧的状态连续。
+这里哈希的是 `http_worker_ipc`，不是 rid。只要一个 rid 的 `http_worker_ipc` 生命周期内不变，它的所有包就会落到同一 Detokenizer；但亲和粒度更粗——同一个 HTTP worker 的所有请求都会被压到同一 Detokenizer worker。这保证状态连续，也意味着负载均衡取决于 HTTP worker 间流量是否均匀，不能把它描述成逐请求均匀散列。
 
 ## 两个容易混淆的边界
 

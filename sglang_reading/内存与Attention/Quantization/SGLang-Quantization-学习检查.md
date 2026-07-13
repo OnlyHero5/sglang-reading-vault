@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Quantization · 学习检查
 
@@ -18,9 +18,13 @@ updated: 2026-07-10
 - [ ] 能画出六本账：配置账、绑定账、权重账、装载账、整形账、执行账。
 - [ ] 能沿 `HF config → QuantizationConfig → quant_method → create_weights → load_weights → postprocess → forward` 复述一次生命周期。
 - [ ] 能说清 Linear、MoE、KV cache 三类消费者的输入和输出分别是什么。
-- [ ] 能解释为什么普通 GPTQ 不支持 MoE，而 AWQ MoE 可以在不支持 Marlin 时 fallback。
+- [ ] 能解释默认 `GPTQConfig` 为何拒绝 MoE，并区分 GPTQ Marlin、NPU GPTQ、CPU AMX GPTQ；同时区分普通 AWQ、AWQ Marlin、NPU AWQ、CPU AWQ，只把 Moe WNA16 fallback 归给 `AWQMarlinConfig`。
+- [ ] 能解释 GPTQ `group_size=-1` 的 scale-size 与 `g_idx` 初始化为何形成可疑契约，并设计 checkpoint 覆盖/内核消费验证。
 - [ ] 能指出 KV cache 量化为什么不应该调用 `apply`。
-- [ ] 能用一个日志、断点或配置实验验证实际 backend 或 method。
+- [ ] 能区分 FP8 backend 的选择期门禁和调用期 shape/dtype fallback，并用日志确认逐层最终 kernel。
+- [ ] 能画出原始 server arg → 初始化规范化 → selected callable → 最终 kernel 四层，并解释 SM120/MXFP8 的 auto 改写。
+- [ ] 能指出当前 HIP unrolled-x4 helper 缺少 `return` 的可疑可达性问题，并设计不预设性能方向的验证。
+- [ ] 能区分 raw `get_quant_method` 与 layer 最终 method，并解释 MoE unquant/KTEP wrapper、ROCm QKV/RowParallel 主动清空 config。
 
 ## 改代码前自查
 
@@ -40,18 +44,18 @@ updated: 2026-07-10
 |------|------------|--------------|
 | invalid quantization | 注册表 | 配置字符串未映射到 config 类 |
 | dtype 不支持 | `_get_quantization_config` | config 已创建，但 activation dtype 不合法 |
-| FP8 backend 不一致 | `fp8_utils.py` | 显式 backend 与 auto 分支语义不同 |
+| FP8 backend 不一致 | `fp8_utils.py` | 显式 backend 不走 auto，但所选 `*_with_fallback` 仍可能因逐层 shape/dtype 转 Triton |
 | GPTQ TP 报 shape | `GPTQLinearScheme.create_weights` | 分片后维度不满足 group/pack 对齐 |
-| AWQ MoE fallback | `AWQConfig.get_quant_method` | Marlin support check 失败或 layer 被跳过 |
+| AWQ MoE fallback | `AWQMarlinConfig.get_quant_method` | 先确认配置类与平台，再判断 Marlin support check、skip 或 Moe WNA16 fallback |
 | KV scale 错 | `BaseKVCacheMethod.process_weights_after_loading` | scale 没规范化成 per-tensor float |
 | unquant MoE 有 quant info | `unquant.py` | runner ABI 需要 bf16 quant info |
 
 ## 最小验证实验
 
 - [ ] 启动一个量化模型，故意给错 `--quantization`，确认错误发生在配置账。
-- [ ] 对支持 FP8 的模型切换 `--fp8-gemm-backend auto` 和一个显式 backend，观察日志或错误是否符合预期。
+- [ ] 对支持 FP8 的模型切换 `--fp8-gemm-backend auto` 和一个显式 backend，同时选择至少两个不同 shape 的 Linear，确认选择期报错与调用期 fallback 的区别。
 - [ ] 在 `LinearBase.forward` 或具体 method `apply` 加断点，确认当前 layer 的 method 类型。
-- [ ] 在 `DefaultModelLoader.load_weights_and_postprocess` 遍历 module 时加断点，确认带 `quant_method` 的 layer 都执行 postprocess。
+- [ ] 先记录实际 loader 类；Default 路线在全量加载后观察 postprocess，Layered/ModelOpt 路线在各自处理循环观察，并确认 forward 前参数已是 kernel-ready。
 - [ ] 对 KV cache 量化模型，在加载后检查 `k_scale_float/v_scale_float`。
 
 ## 核心结论

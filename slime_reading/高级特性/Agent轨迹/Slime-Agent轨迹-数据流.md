@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Agent轨迹 · 数据流
 
@@ -46,8 +46,37 @@ sequenceDiagram
 
 OpenAI wire response 需要 `tool_calls[].id` 和 JSON string arguments；manager message 则要丢掉 id，并把 arguments 保持为 dict，保证下一轮客户端重放历史时能通过 dict equality 匹配树节点。
 
+这是有意的有损转换，不是完全可逆 codec：OpenAI reply builder 只向 wire 和 manager message 保留第一个 tool call，丢弃额外并行 tool calls；manager message 不保留 reasoning，假设客户端 echo 时会丢它；tool result 又丢掉 `tool_call_id`。对依赖并行工具、reasoning echo 或精确 tool-result 关联的 agent，必须以真实 client round-trip 验证，不能只测 parser。
+
 ```python
-# 来源：slime/agent/adapters/openai.py L211-L265
+# 来源：slime/agent/adapters/openai.py L250-L272
+    wire_message: dict[str, Any] = {
+        "role": "assistant",
+        # send content=null when there are tool_calls: some OpenAI clients split
+        # a mixed text+tool_calls turn into two echoed messages otherwise, which
+        # diverges the history match against our leaf
+        "content": None if wire_tool_calls else (parsed.text or None),
+    }
+    # manager_message must match what the client echoes on the next request, or
+    # the manager's history match (dict equality) diverges and every turn forks.
+    # Differences from wire_message, each needed to match the echo:
+    #   * no reasoning_content -- some clients strip it on echo (the reasoning
+    #     token ids are still kept in the trained tokens, only the text drops)
+    #   * only the first tool_call -- some clients drop extra parallel tool_calls
+    #   * empty content when tool_calls are present -- mirrors content=null above
+    manager_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "" if wire_tool_calls else (parsed.text or ""),
+    }
+    if parsed.reasoning:
+        wire_message["reasoning_content"] = parsed.reasoning
+    if wire_tool_calls:
+        wire_message["tool_calls"] = wire_tool_calls[:1]
+        manager_message["tool_calls"] = manager_tool_calls[:1]
+```
+
+```python
+# 定位骨架（基于 `slime/agent/adapters/openai.py` L211-L265；只展示 wire/manager 双形态契约）
 def _build_reply_parts(parsed: ParsedModelOutput, finish: str) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Return (wire_message, manager_message, wire_finish).
 
@@ -64,7 +93,7 @@ def _build_reply_parts(parsed: ParsedModelOutput, finish: str) -> tuple[dict[str
 Anthropic wire 层也有类似分离：`tool_use` block 需要 wire id；manager message 用 `tool_call_dict` 去掉 id。
 
 ```python
-# 来源：slime/agent/adapters/anthropic.py L147-L190
+# 定位骨架（基于 `slime/agent/adapters/anthropic.py` L147-L190；只展示 reply 构造契约）
 def _build_reply_parts(
     parsed: ParsedModelOutput,
     finish: str,
@@ -82,7 +111,7 @@ def _build_reply_parts(
 adapter 用 sid 查 `store`、`inflight`、`closed`，manager 用 sid 查 `_trees`。SGLang 请求头也用同一个 sid 做 routing key。
 
 ```python
-# 来源：slime/agent/adapters/common.py L396-L473
+# 定位骨架（基于 `slime/agent/adapters/common.py` L396-L473；只展示 sid 解析入口）
 def sid_from_bearer(request: web.Request) -> str | None:
     """sid from the Authorization: Bearer <sid> header, or None if absent."""
     auth = request.headers.get("Authorization", "")
@@ -96,34 +125,20 @@ def sid_from_body(body: dict | None) -> str | None:
         return None
 ```
 
-官方文档也把 stable `session_id` 和 SGLang session affinity 放在一起说明。
+官方文档也把 stable `session_id` 和 SGLang session affinity 放在一起说明：在 custom generate 内创建协议 adapter，用 `open_session(session_id, sampling_defaults=...)` 注册 rollout，并让客户端之后始终回传同一 sid。定位：`docs/en/get_started/agent.md` L40-L55。
 
-```markdown
-# 来源：docs/en/get_started/agent.md L40-L55
-Instantiate the protocol-specific adapter in your custom generate function, run its `app` with aiohttp, then manage each rollout through the adapter instance:
+数据不变量：同一个 agent run 必须使用稳定且全局唯一的 sid；否则消息树被拆散，SGLang prefix cache 也难以复用。反过来，无 Bearer/body/API-key 提示的请求都落到字面量 `"default"`；多个无标识客户端会共享 store、turn cap 和 trajectory tree，这是污染而不是只损失 cache 命中。
 
-```python
-from slime.agent.adapters import AnthropicAdapter
+同 sid 也没有 per-session lock。并发 turn 可同时从相同 history 生成，按 response flush 完成顺序记录成 sibling leaves；`turn_index` 表示记录完成次序，不一定是客户端发起次序。
 
-adapter = AnthropicAdapter(
-    tokenizer=tokenizer,
-    sglang_url=sglang_url,
-    tool_parser=tool_parser,
-    reasoning_parser=reasoning_parser,
-)
-
-adapter.open_session(session_id, sampling_defaults=sampling_params)
-```
-```
-
-数据不变量：同一个 agent run 必须使用稳定 sid；否则消息树被拆散，SGLang prefix cache 也难以复用。
+Anthropic `/v1/messages/count_tokens` 不使用 tokenizer，固定返回 `{"input_tokens": 0}`。源码把它定位为 client hint 而非硬预算；但如果某个 client 用该值决定压缩或拒绝请求，就必须单独验证兼容性。
 
 ## 3. SGLang 输出到 TurnRecord 是 token 边界
 
 adapter 发给 SGLang 的是 `input_ids`，不是文本；SGLang 回来的是 `output_token_logprobs`。这一层之后，训练相关 token 事实已经确定。
 
 ```python
-# 来源：slime/agent/adapters/common.py L475-L518
+# 定位骨架（基于 `slime/agent/adapters/common.py` L475-L518；只展示 token/logprob 解析与异常入口）
         meta = data.get("meta_info") or {}
         output_token_logprobs = meta.get("output_token_logprobs") or []
         output_ids = [x[1] for x in output_token_logprobs]
@@ -135,14 +150,14 @@ adapter 发给 SGLang 的是 `input_ids`，不是文本；SGLang 回来的是 `o
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
 ```
 
-边界：`parse_model_output` 可以提取 reasoning 和 tool calls，但不能重写 `output_ids`。
+边界：`parse_model_output` 可以提取 reasoning 和 tool calls，但不能重写 `output_ids`。更具体地说，adapter 只从 `meta_info.output_token_logprobs` 的二元组抽取 token id；若 upstream 返回了文本却没返该列表，adapter 会把 output 当成空，不会退回到文本 re-tokenize。这保住了 token 真实性，也意味着 SGLang `return_logprob` 契约是硬依赖。
 
 ## 4. tree 分支由 message equality 决定
 
 `record_turn` 的 tree 层只看 message dict 的结构是否相等。token drift 在第二层 builder 处理，不影响 message tree 的匹配。
 
 ```python
-# 来源：tests/test_agent/test_trajectory_manager_branching.py L1-L32
+# 定位骨架（基于 `tests/test_agent/test_trajectory_manager_branching.py` L1-L32；只展示两层测试矩阵说明）
 """Branching-matrix tests for TrajectoryManager via record_turn / get_trajectory.
 
 This script drives the two public interfaces of
@@ -174,10 +189,10 @@ The agent workflow itself may speak in strings, chat messages, tool calls, envir
 If one prompt rollout corresponds to one training sample, return a single `Sample`. If one rollout splits into multiple trainable segments, such as subagent trajectories, main-agent continuations, or pre/post-compaction segments, return `list[Sample]` and set the same `rollout_id` on all sibling samples. slime then keeps those samples together for train-step splitting and loss aggregation instead of counting them as independent rollouts.
 ```
 
-`TrajectoryManager.get_trajectory` 也明确是每个 routing leaf 产出一个或多个 `Sample`，并把同一个 reward 赋给每个 sample。
+`TrajectoryManager.get_trajectory` 也明确是每个 routing leaf 产出一个或多个 `Sample`，并把同一个 reward 完整复制给每个 sample，不做均分。
 
 ```python
-# 来源：slime/agent/trajectory.py L307-L344
+# 定位骨架（基于 `slime/agent/trajectory.py` L307-L344；只展示 destructive read 入口）
 def get_trajectory(
     self,
     sid: str,
@@ -196,7 +211,7 @@ def get_trajectory(
 adapter 测试不是只测纯函数。它用 real aiohttp `TestServer/TestClient` 和 fake SGLang server 跑完整链路。
 
 ```python
-# 来源：tests/test_agent/test_adapters.py L1-L32
+# 定位骨架（基于 `tests/test_agent/test_adapters.py` L1-L32；只展示 HTTP 测试范围说明）
 """Unit tests for the agent HTTP adapters (Anthropic + OpenAI) and parsing.
 
 Every test drives a REAL adapter over a real aiohttp loopback
@@ -213,9 +228,12 @@ protocols plus the standalone parsing helpers in ``slime.agent.parsing``.
 - Sample 的 `tokens`、`loss_mask`、`rollout_log_probs`、`response` 是否对齐。
 - 多轮 tool call 后是否至少产生一个带训练信号的 sample。
 
+覆盖盲区也要同时读：当前 adapter 测试没有验证 OpenAI 并行 tool calls、Responses API、缺省 sid 的多客户端隔离、同 sid 并发 turn、client 真实断连、SGLang abort 失败、context cap 切入 prompt，或 `get_trajectory` 中途异常后的重试等价性。branching 测试也没有传 `max_sample_tokens`。
+
 ## 复盘
 
 - wire message 是给客户端看的；manager message 是给树匹配看的。
 - `TurnRecord` 是训练 token 事实；parse 只是结构化回复文本。
 - tree fork 和 token drift fork 是两层机制。
 - `finish_session` 是 destructive read；custom generate 应把返回 samples 缓存并交给训练流程。
+- destructive read 只在成功线性化后 pop tree，但线性化中会提前修改 `response_trained`；失败重试不具有事务等价性。

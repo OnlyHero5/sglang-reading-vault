@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 分布式权重同步 · 数据流
 
@@ -48,7 +48,7 @@ flowchart TD
 源码入口：来源：slime/ray/rollout.py L511-L540
 
 ```python
-# 来源：slime/ray/rollout.py L511-L540
+# 定位骨架（基于 slime/ray/rollout.py L511-L540；拼接 server 选择与返回字段）
 def _get_updatable_server(self) -> Any | None:
     """Return the server with ``update_weights=True``.
 
@@ -89,7 +89,7 @@ def get_updatable_engines_and_lock(self):
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L268-L314
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L281-L314
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L281-L314；省略默认 GPU count 与注释）
 if engine_gpu_counts is None:
     engine_gpu_counts = [args.rollout_num_gpus_per_engine] * len(rollout_engines)
 
@@ -137,6 +137,8 @@ world_size = 7
 
 `engine_gpu_counts` 错时，控制面看起来已经 init，但数据面会在 broadcast/recv 对不上时卡住。
 
+`engine_gpu_offsets` 与 `all_engine_actors` 虽由 actor 一并传入 updater，但 distributed updater 当前没有消费这两个参数；本路径的 group rank layout 实际只由 node-0 engine 列表和 `engine_gpu_counts` 决定。
+
 ## 权重张量的形态变化
 
 ```mermaid
@@ -170,6 +172,8 @@ flowchart LR
 | bucket | PP source | 限制单次 broadcast 峰值 |
 | metadata | engine HTTP handler | 分配 recv buffer |
 | payload | NCCL group | 实际权重字节 |
+
+这里的 bucket “限制”是软阈值：单个 HF conversion chunk 超过 buffer size 时不会再拆分，实际 bucket 仍可越过配置值。
 
 ## 非 expert 和 expert 的数据流不同
 
@@ -297,7 +301,7 @@ Slime 的 `SGLangEngine` 是 Ray actor 包装层，它把 Python 调用变成 SG
 源码入口：来源：slime/backends/megatron_utils/actor.py L601-L652
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L601-L652
+# 定位骨架（基于 slime/backends/megatron_utils/actor.py L601-L652；省略日志、CI 与备份队列）
 reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
 if reconnect_rollout_engines:
@@ -346,6 +350,8 @@ sequenceDiagram
 
 如果版本流对不上，说明控制面已经返回但至少一个 engine 版本没有进入预期状态。
 
+版本流不是两阶段提交：版本先递增，随后才 pause 和发送；失败不回滚。CI 又只随机抽一个 engine，因此“抽查通过”是弱验收，生产诊断仍需枚举全部 engine 版本。
+
 ## 数据流检查
 
 - 可更新 engine 列表来自 update_weights=True 的 server。
@@ -355,6 +361,8 @@ sequenceDiagram
 - lock 覆盖 metadata、broadcast 和 engine refs 等待全过程。
 - compressed-tensors 有 pre/post `post_process_weights`。
 - CI 模式下 `engine.get_weight_version()` 等于 updater 版本。
+- 锁释放、generation continue、量化 post-process 与 process-group 清理均无统一 finally；异常后必须逐项检查。
+- reconnect 会在保存旧 engine 列表前覆盖 `self.rollout_engines`，替换拓扑下旧 group 的销毁对象需要额外核实。
 
 ---
 

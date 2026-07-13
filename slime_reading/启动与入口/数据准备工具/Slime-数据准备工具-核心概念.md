@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据准备工具 · 核心概念
 
@@ -17,12 +17,13 @@ updated: 2026-07-10
 
 这篇先建立权重形态模型。Slime 训练同时站在两个生态里：Megatron 负责训练，SGLang 负责 rollout；它们吃的 checkpoint 形态不同。
 
-## 三种目录
+## 先分清四种目录角色
 
 | 目录 | 谁消费 | 典型参数 | 内容 |
 |------|--------|----------|------|
 | HF checkpoint | SGLang、tokenizer、AutoConfig、converter | `--hf-checkpoint`、`--origin-hf-dir` | `config.json`、tokenizer 文件、safetensors |
 | Megatron `torch_dist` checkpoint | Megatron actor/ref/critic | `--ref-load`、`--load`、`--save` | tracker、`release/` 或 `iter_xxx/`、`.metadata`、`common.pt` |
+| 具体 checkpoint 版本目录 | 离线反向 converter | `--input-dir` | 直接包含 `common.pt`、`.metadata`、分片；通常是 `release/` 或 `iter_xxx/` |
 | HF export output | HF 生态或人工检查 | `--output-dir`、`--save-hf` | 导出的 safetensors 和从原 HF 复制的 assets |
 
 关键区别：`--hf-checkpoint` 给 SGLang 初始化和 tokenizer；`--ref-load` / `--load` 给 Megatron 训练权重。训练前 actor 会把 Megatron 权重同步到 SGLang，所以 `--hf-checkpoint` 不需要是最新训练权重。
@@ -81,15 +82,13 @@ MODEL_ARGS=(
 
 quick start 也强调需要 `source scripts/models/<model>.sh`：
 
-```text
-来源：docs/en/get_started/quick_start.md L118-L131
-quick_start 要求 source `scripts/models/glm4-9B.sh` 这类模型脚本。
-这些配置是 Megatron 所需的模型超参。
-Megatron 不能直接从 checkpoint 读取全部模型配置，必须人工指定。
-文档特别提醒检查 `--rotary-base` 等参数是否和当前 HF 版本一致。
+```bash
+# 来源：docs/en/get_started/quick_start.md L121-L122
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/models/glm4-9B.sh"
 ```
 
-如果 `rotary_base`、layer 数、hidden size、head 数不对，最坏不是马上报错，而是训练/导出后质量异常。
+这段源码证据只证明 model script 会被载入；紧随其后的正文说明这些参数供 Megatron 构图，并要求核对 `--rotary-base` 等版本敏感值。如果 layer、hidden、head 或 RoPE 配错，可能在 load 时 shape mismatch，也可能在某些“形状仍兼容”的配置漂移下留下更隐蔽的语义错误。
 
 ## HF→torch_dist 是“灌进 Megatron 再保存”
 
@@ -164,7 +163,7 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 保存 HF safetensors 时，脚本会按 `model_name` 路由 converter，并生成 index：
 
 ```python
-# 来源：tools/convert_torch_dist_to_hf.py L146-L164
+# 来源：tools/convert_torch_dist_to_hf.py L146-L162
 metadata = {"metadata": {"total_size": total_size}, "weight_map": {}}
 
 num_files = len(modeltensors)
@@ -184,7 +183,7 @@ for i, tensors in enumerate(modeltensors):
     print(f"{filename} saved in {time.time() - t:.2f} sec.")
 ```
 
-## padding 是导出 HF 时最常见的坑
+## padding 有两个裁剪入口，不是一个开关
 
 Megatron 可能为了并行或性能把 vocab padding 到更大的 `padded_vocab_size`。HF embedding/output layer 不应该保留 padding 行。
 
@@ -201,11 +200,11 @@ def remove_padding(name: str, param: torch.Tensor, vocab_size: int) -> torch.Ten
     return param
 ```
 
-这意味着 `--vocab-size` 不只是“可选美化”，它决定导出的 embedding/output layer 是否裁回 HF vocab 行数。
+基础导出脚本实际上可能裁两次：`save_tensors(..., vocab_size=<CLI值>)` 先按 CLI `--vocab-size` 裁一次，随后 `convert_to_hf()` 又按 checkpoint `common.pt` 中保存的 `args.vocab_size` 裁一次。切片是幂等但只会变短，因此最终行数不会大于两者中实际生效的较小值；CLI 值不能把已经被 checkpoint 参数裁短的张量“扩回去”。排障时要同时核对 HF `config.vocab_size`、CLI 值和 `common.pt` 内 Megatron args，不能把 `--vocab-size` 当作唯一所有者。
 
 ## `origin_hf_dir` 是 assets 和 model_name 的来源
 
-导出 HF 时，如果不显式传 `--model-name`，脚本会从 `origin_hf_dir` 的 AutoConfig 推导 model name；同时把 tokenizer、config 等非权重文件复制到输出目录。
+导出 HF 时，如果不显式传 `--model-name`，脚本会从 `origin_hf_dir` 的 AutoConfig 推导 model name；同时复制原 HF 目录顶层的普通非权重文件。它不会递归复制子目录，也不会复制 `.safetensors` 或原 index。
 
 ```python
 # 来源：tools/convert_torch_dist_to_hf.py L209-L244
@@ -246,6 +245,8 @@ save_tensors(
 if args.origin_hf_dir:
     copy_assets(args.origin_hf_dir, args.output_dir)
 ```
+
+还要注意：`--force` 只绕过“目录已存在”的拒绝检查，代码没有删除输出目录，也没有清理旧分片。重跑时应优先使用全新输出目录；若必须复用，先由操作者确认并清理旧权重与 assets，不能把 `--force` 理解为原子覆盖。
 
 ## 复盘
 

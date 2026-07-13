@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # RadixAttention · 学习检查
 
@@ -18,6 +18,7 @@ updated: 2026-07-10
 - [ ] 能画出 `Req`、`RadixKey`、`TreeNode`、KV pool、`RadixAttention.forward` 五个对象和它们之间的四条边。
 - [ ] 能沿共享 2k token system prompt 的请求复述：match → 写 `prefix_indices` → lock → extend tail → attention → unfinished/finished cache。
 - [ ] 能说明 `extra_key`、`page_size`、`cache_protected_len`、`lock_ref` 各自保护什么不变量。
+- [ ] 能区分 match 刚结束时的 device-hit `prefix_indices`，与 chunk commit 后可能附带私有 tail 的 `prefix_indices`。
 - [ ] 能解释为什么 `RadixAttention.forward` 不负责 tree match。
 - [ ] 能说出 classic `RadixCache` 和 `UnifiedRadixCache` 的边界差异。
 
@@ -43,7 +44,7 @@ updated: 2026-07-10
 ## 验证实验
 
 - [ ] 用同一 system prompt 连续请求两次，记录 TTFT 和 prefill token 数。
-- [ ] 设置 `SGLANG_RADIX_FORCE_MISS=1` 重复实验，第二次请求的 prefix hit 优势应消失。
+- [ ] 设置 `SGLANG_RADIX_FORCE_MISS=1` 重复实验，先验证第二次请求的 prefix hit/extend-token 优势消失，再解释 TTFT 变化。
 - [ ] 启动时使用 `--disable-radix-cache` 做全局关闭对照。
 - [ ] 在 `match_prefix_for_req`、`prepare_for_extend`、`RadixAttention.forward` 三处断点，确认 tree match 与 attention forward 不在同一层发生。
 
@@ -51,7 +52,7 @@ updated: 2026-07-10
 
 达到通过标准时，你应该能用一句话说清本专题：
 
-> `RadixCache` 在调度侧把 token 前缀映射到可复用 KV pool indices，`ScheduleBatch` 用 `prefix_indices` 只构造未命中 tail 的 forward 输入，`RadixAttention` 再把这些 tensor 转交给 attention backend 读写 paged KV。
+> `RadixCache` 在调度侧把 token 前缀映射到可复用 KV pool indices，`ScheduleBatch` 用 `prefix_indices` 只构造尚未计算的 extend 区间，`RadixAttention` 再把这些 tensor 转交给 attention backend 读写 paged KV；tree ownership 则由 `cache_protected_len` 单独界定。
 
 ## 后续阅读
 

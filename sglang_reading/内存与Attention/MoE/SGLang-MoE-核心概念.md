@@ -9,21 +9,21 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # MoE · 核心概念
 
 ## 读者任务
 
-这篇先建立对象边界。你要把 MoE 层看成一个 token 生命周期，而不是一堆后端名字：模型层负责产生 `router_logits`，`TopK` 负责把 logits 变成 `topk_ids/topk_weights`，dispatcher 负责把 token 送到专家，`MoeRunner` 负责本地专家 GEMM，combine 负责按权重还原到原 token 顺序。
+这篇先建立对象边界。MoE 不是一条“gate 后固定生成两个 tensor”的流水线，而是一组会随 backend 改变的契约：模型层产生 logits，`TopK` 选择立即 materialize、延迟 materialize 或直接生成 kernel routing data；post-process 再处理 logical/physical ids、shared expert 与 padding；dispatcher、runner、combine 共同约定数据格式和 scaling 归属。
 
 ## 先建立模型
 
 | 类比 | 源码对象 | 失效边界 |
 |------|----------|----------|
 | 分诊台 | `gate` / `router_logits` | 不解释 expert GEMM kernel |
-| 转诊单 | `topk_ids` / `topk_weights` | 不等于最终 hidden state |
-| 转运车 | `BaseDispatcher` / `DeepEPDispatcher` | 不决定 expert 选择，只执行搬运 |
+| 转诊单 | `TopKOutput` | 可能是显式 ids/weights，也可能是 bypassed 或 Triton routing data |
+| 转运车 | `BaseDispatcher` / `DeepEPDispatcher` | 默认职责是搬运，但 hook 可改写 hidden、top-k、dispatch/combine 对象 |
 | 专科诊室 | `quant_method.apply` / MoeRunner | 不负责跨 rank all-to-all |
 | 处方合并 | `dispatcher.combine` | 不重新选择 expert |
 
@@ -77,7 +77,7 @@ DeepEP 路径多传了 `forward_batch` 和 `ExpertLocationDispatchInfo`，但核
 
 ## `TopKOutput` 是 MoE 层的路由契约
 
-标准 top-k 输出只有三个字段：权重、专家 id、原始 logits。这个小结构是后续 dispatcher、expert runner、combine 的共同输入。
+standard top-k 输出有权重、expert id、原始 logits；它只是协议的一种实现，并非所有 dispatcher、runner、combine 的共同输入。
 
 ```python
 # 来源：sglang/python/sglang/srt/layers/moe/topk.py L270-L279
@@ -123,11 +123,68 @@ class BypassedTopKOutput(NamedTuple):
         )
 ```
 
-这解释了 piecewise CUDA Graph 的常见分叉：有些路径接受 standard，有些路径接受 bypassed；格式不匹配时只能回到普通 `forward_impl`。
+协议实际有三种公开 format，另外还有保持 `STANDARD` format 的实验性 packed carrier。CUDA 路径会依据显式配置、runner backend、LoRA 与 FP4 条件决定 format，而不是等到“格式不匹配”才被动降级。
+
+```python
+# 来源：sglang/python/sglang/srt/layers/moe/topk.py L254-L257
+class TopKOutputFormat(IntEnum):
+    STANDARD = auto()
+    TRITON_KERNEL = auto()
+    BYPASSED = auto()
+```
+
+```python
+# 来源：sglang/python/sglang/srt/layers/moe/topk.py L287-L295
+class StandardTopKOutputPacked(NamedTuple):
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+    packed_topk_ids: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.STANDARD
+```
+
+```python
+# 来源：sglang/python/sglang/srt/layers/moe/topk.py L301-L310
+class TritonKernelTopKOutput(NamedTuple):
+    """Triton kernel top-k output format."""
+
+    routing_data: RoutingData
+    gather_indx: GatherIndx
+    scatter_indx: ScatterIndx
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.TRITON_KERNEL
+```
+
+```python
+# 来源：sglang/python/sglang/srt/layers/moe/topk.py L472-L475
+        if self.topk_config.output_format is not None:
+            output_format = self.topk_config.output_format
+        elif get_moe_runner_backend().is_triton_kernels():
+            output_format = TopKOutputFormat.TRITON_KERNEL
+```
+
+实验性 SGL-TRTLLM runner 在启用 LoRA 时选择 standard，否则选择 bypassed；FlashInfer TRTLLM 及特定 MXFP4 条件也会选择 bypassed：
+
+```python
+# 来源：sglang/python/sglang/srt/layers/moe/topk.py L490-L495
+        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
+            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
+        ):
+            output_format = TopKOutputFormat.BYPASSED
+        else:
+            output_format = TopKOutputFormat.STANDARD
+```
+
+因此，piecewise CUDA Graph 中其他 format 调用 `forward_impl`，只说明选择了通用执行函数；是否真的 graph break，还要结合 piecewise context 与整层 torch op 注册机制判断。
 
 ## `FusedMoE` 固定了执行骨架
 
-无论底层是 Triton、DeepGEMM、FlashInfer 还是未量化 runner，`forward_impl` 的结构都很稳定：dispatch、core、combine、必要时 all-reduce。
+无论底层 runner 如何变化，`forward_impl` 的外层结构稳定：dispatch、core、combine、必要时 all-reduce。稳定的是控制骨架，不是各阶段的 tensor ABI。
 
 ```python
 # 来源：sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py L1134-L1150
@@ -157,7 +214,7 @@ class BypassedTopKOutput(NamedTuple):
         return final_hidden_states
 ```
 
-注意 `run_moe_core` 并不自己选择 expert。它只消费 dispatch 后的 expert 分组输入。
+注意 `run_moe_core` 本身把控制权交给量化 method。某些 runner 可能内部消费 router logits 或要求特殊 top-k format，所以“选择在哪一步 materialize”与“GEMM 在哪里执行”要分开看。
 
 ```python
 # 来源：sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py L1178-L1183
@@ -171,7 +228,7 @@ class BypassedTopKOutput(NamedTuple):
 
 ## dispatcher 是 MoE 的搬运协议
 
-`BaseDispatcher` 只规定 dispatch/combine 两个抽象动作，并提供 hook。EPLB、统计、overlap 等机制都可以挂在这些 hook 上。
+`BaseDispatcher` 规定 dispatch/combine 两个抽象动作并提供 hook。hook 不只是旁路观测：pre-dispatch 可替换 `hidden_states/topk_output`，post-dispatch、pre-combine、post-combine 也能替换阶段输出；量化 method 还会向 dispatcher 写入 quant config。因此“dispatcher 默认承担搬运”是职责描述，不是不可越过的数据不变量。
 
 ```python
 # 来源：sglang/python/sglang/srt/layers/moe/token_dispatcher/base.py L279-L332
@@ -231,7 +288,7 @@ class BypassedTopKOutput(NamedTuple):
         return handle
 ```
 
-这段说明 hook 覆盖的是 dispatch/combine 入口。dispatcher 是搬运协议，不是专家选择算法。
+这段说明 hook 覆盖整个 dispatch/combine 边界。通常它不重新运行 gate，但它完全可以改写承载路由决策的 `TopKOutput`，排障时不能把 dispatcher 当成透明管道。
 
 ## DeepEP 是 dispatcher 的一种状态机
 
@@ -296,9 +353,13 @@ DeepEP 把 dispatch 拆成 A/B 两段，combine 也拆成 A/B 两段，并用 `_
         return self._get_impl().combine_b(*inner_state)
 ```
 
-## EPLB 改的是映射，不是 gate 数学
+状态机之下还有两套不同 ABI。normal dispatch 先计算 layout，再返回按 expert 聚合的 hidden、可选 scale、接收后的 ids/weights 和 `num_recv_tokens_per_expert`；low-latency dispatch 则返回 packed hidden、`masked_m`、`expected_m`，并以 event 或 recv hook 完成同步。`auto` 会按当前 batch 是 extend 还是 decode 解析到不同实现，切换到 low-latency 前还可能清理 buffer。不要把两者理解为只改一个性能参数。
 
-EPLB 的核心动作是根据统计重排 logical expert 到 physical expert 的映射；dispatch 前再把 `topk_ids` 转成 physical id。
+DeepEP 通信 dtype 也受 quant config 和硬件约束：GPU 上请求 INT8 会转 FP8，NPU 上请求 FP8 会转 INT8；low-latency 可直接让通信层输出 FP8/NVFP4 及 scale。由此可见，量化契约已经进入 dispatcher，而不是只存在于 expert GEMM。
+
+## EPLB placement 与 replica dispatch 是两层机制
+
+EPLB placement 根据统计窗口重排 logical expert 到 physical expert 的 metadata；dispatch algorithm 再决定一个 logical id 的哪份 physical replica 接收当前 token。`static` 查固定映射，`dynamic/fake` 随机选择有效 replica，`lp` 使用求解出的概率。前者不是逐 token 重算，后者却可以逐 token 选择。
 
 ```python
 # 来源：sglang/python/sglang/srt/eplb/expert_location_dispatch.py L79-L98
@@ -324,11 +385,13 @@ def topk_ids_logical_to_physical(
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 ```
 
-所以排查 expert 倾斜时，要同时看 logical 选择和 physical 放置：前者来自 gate/top-k，后者来自 EPLB metadata。
+这里还有一个源码契约漂移：`ExpertLocationDispatchInfo` 的字段注解仍是 `Literal["static", "random"]`，但 ServerArgs 与运行分支实际接受 `static/dynamic/fake/lp`。调用方应以运行分支为准，同时把这个漂移视为升级时的高风险审计点。
+
+所以排查 expert 倾斜时要分三层看：gate 选择了哪个 logical expert，placement 为它布置了哪些 physical replicas，以及 dispatch algorithm 本次选中了哪一份。
 
 ## 运行验证
 
-这篇的验证目标不是跑完整 MoE 模型，而是确认五个边界仍在源码里各自独立：模型层发起 gate，`TopK` 选择 expert，`FusedMoE` 执行专家计算，dispatcher 负责 token 搬运，EPLB 只改 logical 到 physical 的映射。
+这篇的验证目标不是只找五个类名，而是核对五份契约：TopK format、logical/physical id、dispatcher output format、quant/scaling ownership、placement/dispatch algorithm。
 
 ```powershell
 rg -n 'BailingMoE|class TopK|def select_experts|class FusedMoE|def forward_impl|class BaseDispatcher|class DeepEPDispatcher|def dispatch_a|def dispatch_b|def combine_a|def combine_b|class ExpertLocationDispatchInfo|def topk_ids_logical_to_physical' sglang/python/sglang/srt/models/bailing_moe.py sglang/python/sglang/srt/layers/moe/topk.py sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py sglang/python/sglang/srt/layers/moe/token_dispatcher/base.py sglang/python/sglang/srt/layers/moe/token_dispatcher/deepep.py sglang/python/sglang/srt/eplb/expert_location_dispatch.py

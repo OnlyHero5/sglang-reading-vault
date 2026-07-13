@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 模型初始化 · 数据流
 
@@ -26,7 +26,7 @@ updated: 2026-07-10
 | `model` | actor、forward-only、train、weight updater | DDP-wrapped model chunks |
 | `optimizer` | train/save | Megatron optimizer |
 | `opt_param_scheduler` | train/save | LR/WD scheduler |
-| `iteration` | actor init / driver | 恢复 rollout id 或 checkpoint 进度 |
+| `iteration` | actor init / driver | loader 返回的 checkpoint iteration；actor 候选起点为 `iteration+1`，但显式 `args.start_rollout_id` 优先 |
 
 源码入口：来源：slime/backends/megatron_utils/model.py L968-L1007
 
@@ -69,7 +69,7 @@ critic 训练路径会在 [[Slime-Advantage计算]] 中提供 PPO 需要的 `val
 Bridge/legacy load 规则在参数校验阶段会调整 `args.load`、`args.start_rollout_id`、`no_load_optim`、`finetune` 等字段。
 
 ```python
-# 来源：slime/utils/arguments.py L1763-L1785
+# 定位骨架（非逐行摘录）：slime/utils/arguments.py L1763-L1785
 if args.megatron_to_hf_mode == "bridge":
     if args.load is not None and os.path.exists(args.load) and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt")):
         pass
@@ -85,7 +85,9 @@ else:
         args.load = args.ref_load
 ```
 
-`load_checkpoint` 返回的 `iteration` 是 Megatron checkpoint 进度；actor init 会把它接回 Slime 的 rollout 起点。
+Megatron loader 返回 checkpoint iteration；HF Bridge loader固定返回 0，并只加载模型权重。actor init 计算候选起点 `iteration+1`，placement 层仅在 `args.start_rollout_id is None` 时采用；参数阶段显式写入的起点优先。
+
+最终 load 数据源只有 `args.load`：仓库 loader 要求它存在且非空，再按 tracker/`iter_XXXXXXX` 判断 Megatron checkpoint，否则只允许 Bridge HF 加载。`pretrained_checkpoint` 不会在这层替代 `args.load`。
 
 ## forward_only 数据流
 
@@ -119,7 +121,7 @@ sequenceDiagram
 
 源码入口：来源：slime/backends/megatron_utils/model.py L487-L505
 
-这点会影响后续 `rollout_data["log_probs"][i]` 与 `rewards[i]` 是否对齐。
+这点会影响后续 `rollout_data["log_probs"][i]` 与 `rewards[i]` 是否对齐。但恢复使用 `zip(strict=False)`，没有验证 index permutation 的长度、唯一性与范围；输入索引契约不成立时，结果可能含 `None`、覆盖旧值或静默丢尾项。
 
 ## 不变量
 
@@ -128,3 +130,5 @@ sequenceDiagram
 - freeze/only-train 规则必须在 optimizer 创建前完成。
 - `forward_only` 输出只在 pipeline last stage 聚合。
 - 初始化后的 `model[0].role` 会影响日志前缀和部分路径判断。
+- forward-only 只有成功路径才把所有 chunk 切回 train mode；异常路径没有 finally 恢复。
+- checkpoint “成功返回”不等于 shard metadata 被完整交叉验证：仓库为性能 monkey-patch 了部分 ShardedTensor 校验。

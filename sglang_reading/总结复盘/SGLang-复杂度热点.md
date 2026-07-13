@@ -9,160 +9,89 @@ tags:
   - framework/sglang
   - content/reference
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang 复杂度热点
 
-> 汇总高复杂度源码热点：解释**为何复杂** + 热点函数嵌入代码
+## 你为什么要读
 
-“复杂”在此指：**状态多、分支多、跨进程/跨语言、或与硬件/kernel 强耦合**。读这些文件前建议先完成 [[SGLang-学习路径]] 中的入口、调度与模型执行主线。
+复杂度不是“文件很长”的同义词。SGLang 真正难改的地方，是一个对象同时被多种模式、进程、资源和时间状态解释。热点文件只是这些交叉约束汇聚的地点。
 
----
+本文不再列函数名排行榜，而是给出六种复杂度来源、十个高风险交界面和一套可重复的阅读方法。
 
-## 0 · 读热点前先问三个为什么
+## 六种复杂度来源
 
-**读法：** 复杂度热点不是「行数排行榜」，而是**改一处牵动全局**的汇点。开读任何热点文件前，用下面三个问题定锚，避免陷入 4000 行线性扫描。
+| 类型 | 典型问题 | SGLang 例子 |
+|---|---|---|
+| 状态乘积 | 多个正交开关组合后，状态数成倍增长 | normal/overlap/PP × PD × spec × grammar |
+| 所有权迁移 | 对象跨进程、跨 rank 或跨服务后谁负责释放和失败收口 | Tokenizer→Scheduler、PD KV、encoder embedding |
+| 地址翻译 | 逻辑身份与物理位置不是同一对象 | request slot、KV loc、radix node、LoRA slot |
+| 时间耦合 | 当前动作依赖前一批、异步 event 或未来 consumer | overlap result、CUDA Graph、IPC pool 回收 |
+| 硬件特化 | 同一语义由不同 backend、layout、dtype 和 kernel 实现 | Attention、MoE、量化、collective |
+| 失败恢复 | partial success 后如何清理、回滚或继续 | 权重更新、PD transfer、动态 LoRA、worker watchdog |
 
-1. **为什么必须复杂？** —— 是业务需求（PD + spec + grammar 正交）还是历史累积？若前者，找特性开关与 `DisaggregationMode`/`ForwardMode` 分支；若后者，优先读调用方契约。
-2. **为什么停在这里？** —— Scheduler 停是因为 event loop 汇点；RadixCache 停是因为树突变影响全局命中。确认「汇点」后再下钻实现。
-3. **为什么现在读它？** —— 与当前 bug/优化是否同路径？KV OOM → `retract_decode`；TTFT 差 → overlap disable；PD 卡住 → metadata gate。
+评价一个模块时应问“它同时承担了几种复杂度”，而不是只看圈复杂度或行数。
 
-**要点：** 三个“为什么”答完再打开下文各节；若答不出，回到 [[SGLang-学习路径]] 补调度与 ModelRunner。
+## 热点总览
 
----
+| 交界面 | 为什么危险 | 首先跟踪的对象 | 深读入口 |
+|---|---|---|---|
+| Scheduler event loop | 多种执行拓扑各有独立 loop，仍共享请求和结果契约 | `Req`、`ScheduleBatch`、pending result | [[SGLang-Scheduler-源码走读]] |
+| SchedulePolicy / admission | prefix match、token budget、chunk、priority 与 delay 同时影响准入 | waiting req、prefix indices、budget | [[SGLang-SchedulePolicy-源码走读]] |
+| Radix / KV pool | 逻辑树会 split/evict，物理 page/slot另有生命周期 | `RadixKey`、node、KV loc | [[SGLang-RadixAttention-源码走读]]、[[SGLang-KV-Cache-数据流]] |
+| ForwardBatch / ModelRunner | 可变逻辑 batch 被物化成 backend/graph 可消费 tensor | `ForwardBatch`、metadata、runner view | [[SGLang-ModelRunner-源码走读]] |
+| Parallel state | 多维坐标与 group alias 决定 collective 范围 | global/local rank、group | [[SGLang-分布式-源码走读]] |
+| Speculative | 算法并不共享一条固定 draft/verify 协议 | `spec_info`、accept result、KV commit | [[SGLang-Speculative-源码走读]] |
+| PD disaggregation | bootstrap、prealloc、transfer、inflight 与输出形成分布式状态机 | metadata buffer、room、KV sender | [[SGLang-PD分离-源码走读]] |
+| LoRA | adapter 身份、CPU cache、GPU slot 与 running batch 引用不同步 | LoRA ref/id/uid/slot | [[SGLang-LoRA-源码走读]] |
+| 多模态 | prompt span、feature、IPC、hash 与 encoder ownership 跨层 | `MultimodalDataItem` | [[SGLang-多模态-源码走读]] |
+| CheckpointEngine | target/draft 多阶段更新缺少事务回滚，cache/版本还要一致 | method、weight version、per-worker result | [[SGLang-CheckpointEngine-源码走读]] |
 
-## 1 · module:srt（运行时核心）
+## 1. Scheduler：不是一个 loop，而是一族 loop
 
-**为何复杂：** SRT 不是单一模块，而是 `managers + mem_cache + layers + model_executor + distributed + speculative + disaggregation` 的聚合。Scheduler 单文件 4000+ 行，event loop 内嵌 PD、投机、HiCache、chunked prefill 等正交特性。
-
-**热点函数：** `event_loop_normal` / `get_next_batch_to_run` / `run_batch`
-
-**读法：** 三者构成连续批处理闭环；任何新特性几乎都要在这三处加分支。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/managers/scheduler.py L3194-L3201
-        # Place holder handling for pd-disagg decode event loop
-        if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
-
-        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
-```
-
-**要点：** `is_prebuilt()` 是 PD decode 捷径；prefill 侧则穿插 KV send——同函数内多模式共存是复杂度根源。
-
----
-
-## 2 · RadixCache / UnifiedRadixCache
-
-**为何复杂：** Radix Tree 需在**并发访问、node split、page 对齐、extra_key 命名空间、eviction、HiCache host backup** 之间保持一致性。Unified 版本还要协调 FULL/SWA/Mamba 多组件。
-
-**热点函数：** `match_prefix` / `insert` / `_split_node`
-
-**读法：** `match_prefix` 可能触发 node split（匹配落在 segment 中间），这是结构性突变，影响后续所有请求的匹配路径。
-
-**源码锚点：**
+当前入口会根据 PD mode、PP、overlap、PDMux 与 MLX 选择不同循环：
 
 ```python
-## 来源：python/sglang/srt/mem_cache/radix_cache.py L403-L412
-        value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
+# 来源：python/sglang/srt/managers/scheduler.py L4168-L4193
+    if disaggregation_mode == DisaggregationMode.NULL:
+        if scheduler.enable_pdmux:
+            scheduler.event_loop_pdmux()
+        elif server_args.pp_size > 1:
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap_mlx:
+            scheduler.event_loop_overlap_mlx()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
         else:
-            value = self._empty_match_result.device_indices
-        return MatchResult(
-            device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
-            best_match_node=last_node,
-```
-
-**要点：** 读代码时跟踪 `TreeNode` 突变时机，比背 API 更有效。
-
----
-
-## 3 · ModelRunner
-
-**为何复杂：** 单类承担 load_model、KV 池初始化、Attention backend 选择、CUDA Graph capture/replay、PP proxy、量化、MSProbe 调试等。`forward()` 是 GPU 侧所有路径的汇点。
-
-**热点函数：** `forward` / `init_cuda_graphs` / `sample`
-
-**读法：** forward 内根据 ForwardMode、speculative、PP rank 走不同分支；CUDA Graph 要求 batch 形状可预测。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/model_executor/model_runner.py L2989-L3002
-        with (
-            canary_ctx,
-            step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
-                self.forward_pass_id,
-                forward_batch,
-            ) as recorder_outputs,
-        ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-```
-
-**要点：** [[SGLang-Attention]] 拆解 Attention backend 分发；此处关注 forward 作为汇点的控制流即可。
-
----
-
-## 4 · TpModelWorker
-
-**为何复杂：** Scheduler 与 ModelRunner 之间的**唯一 execution 门面**，需处理 PP 末 rank sampling、HiCache consumer index、DLLM、speculative verify 等透传。
-
-**热点函数：** `forward_batch_generation`
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/managers/tp_worker.py L491-L510
-        if batch is not None:
-            # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(batch.hicache_consumer_index)
-
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            scheduler.event_loop_normal()
+    elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp_disagg_prefill()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
         else:
-            # FIXME(lsyin): unify the interface of forward_batch
-            assert forward_batch is not None
-
-        # Deprecated kwarg: pre-planners mark the batch themselves now.
-        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
-
-        if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch)
-
-        if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            scheduler.event_loop_normal_disagg_prefill()
+    elif disaggregation_mode == DisaggregationMode.DECODE:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp_disagg_decode()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
 ```
 
-**要点：** 非 last rank 不 sample，只传 pp_proxy_tensors。
+所以“从 `event_loop_normal` 理解 Scheduler”只适用于一个配置子集。修改前先算出最终 `ServerArgs`，确认真实 loop；再沿该 loop 跟踪 recv→schedule→run→result→output。
 
----
+### 阅读陷阱
 
-## 5 · ForwardBatch
+- 把 overlap 当成 normal loop 的简单异步版，忽略 pending batch/result 的跨迭代所有权；
+- 只改普通 loop，漏掉 PP、PD 或 MLX parity；
+- 在 `run_batch` 看到问题就下钻 kernel，实际根因可能是 batch 组装或前一拍结果尚未消费。
 
-**为何复杂：** 把逻辑层 ScheduleBatch 物化为 GPU 张量：seq_lens、kv_indices、positions、spec_info、grammar bitmask 等字段多，且 EXTEND/DECODE/MIXED 布局不同。
-
-**热点函数：** `ForwardBatch.init_new` / `ForwardMode` 判断链
-
-**源码锚点：**
+## 2. ForwardMode：prefill/decode 二分已经不够
 
 ```python
-## 来源：python/sglang/srt/model_executor/forward_batch_info.py L78-L96
+# 来源：python/sglang/srt/model_executor/forward_batch_info.py L78-L103
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -182,241 +111,50 @@ class ForwardMode(IntEnum):
     # Used in disaggregated decode worker
     # Represent a batch of requests having their KV cache ready to start decoding
     PREBUILT = auto()
+
+    # Split Prefill for PD multiplexing
+    SPLIT_PREFILL = auto()
+
+    # Used in dLLM
+    DLLM_EXTEND = auto()
 ```
 
-**要点：** 新增 ForwardMode 时需同步 Scheduler 组 batch 逻辑与 ModelRunner graph 捕获条件。
+一个新 mode 可能影响 Scheduler 组批、position、KV metadata、attention backend、CUDA Graph、sampling、PP 与结果提交。不能只在枚举和一个 `if` 中“加支持”。
 
----
-
-## 6 · gRPC 桥接（PyBridge + RuntimeHandle + SglangServiceImpl）
-
-**为何复杂：** 跨 Rust/Python 边界 + 异步流式 + 背压 + abort 传播。Rust mpsc channel 容量与 Python asyncio generator 速度不匹配时需阻塞或 drop。
-
-**热点：** Rust `PyBridge::submit_request`；Python `RuntimeHandle.generate_request`
-
-**读法：** 每个 gRPC stream 对应一个 mpsc receiver；ChunkCallback 从 Python 线程安全地 push 到 Rust channel。
-
-**源码锚点：**
+## 3. RadixCache：查找本身可能修改结构
 
 ```python
-## 来源：python/sglang/srt/entrypoints/http_server.py L797-L801（HTTP 侧同类流式模式）
-            try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
-```
+# 来源：python/sglang/srt/mem_cache/radix_cache.py L355-L390
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        """Find the longest cached prefix of ``key`` in the radix tree.
 
-**要点：** gRPC 与 HTTP 在 TokenizerManager 层汇合，差异仅在更外层 transport。
+        The logical namespace for prefix matching is determined by both the
+        token id sequence and the optional ``extra_key`` carried by ``RadixKey``.
+        Entries that share identical leading token ids but have *different*
+        ``extra_key`` values are intentionally kept disjoint and never share
+        prefix nodes. This is useful to:
 
----
+        * Isolate KV cache lines for different LoRA / adapter IDs.
+        * Separate requests that intentionally should not share state (e.g.,
+          different sampling salt, cache version, or retrieval augmentation
+          context) by supplying a distinct ``extra_key``.
 
-## 7 · 投机解码（EAGLEWorkerV2 / spec_info）
+        Args:
+            params (MatchPrefixParams): Parameters containing the lookup key
+                with a list of token ids and an optional ``extra_key`` namespace tag.
+                If ``page_size > 1`` the length is internally truncated to a multiple
+                of ``page_size`` before matching. Passing an empty key returns an
+                empty result with the root as the last node.
 
-**为何复杂：** Draft 与 Target 两个 Worker 交替 forward，CUDA Graph 需分别 capture；reject sampling 用 Triton kernel；grammar 约束需 accept/rollback。
+        Returns:
+            MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
+            the concatenated KV cache indices corresponding to the longest
+            cached prefix (may be length 0).
+            ``last_device_node`` and ``last_host_node`` (currently the same) are the tree node objects
+            representing the terminal node of the matched prefix. This method
+            may mutate internal structure by splitting an existing node if the
+            match ends inside a stored segment.
 
-**热点函数：** `EAGLEWorkerV2.forward_batch_generation`
-
-**读法：** 一次 decode step 可能触发 draft extend + target verify 两次 GPU launch。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/speculative/spec_info.py L28-L40
-class SpeculativeAlgorithm(Enum):
-    """Builtin speculative decoding algorithms. Plugin-registered ones are
-    ``CustomSpecAlgo`` instances; ``from_string`` returns either type, and
-    both expose the same ``is_*()`` / ``create_worker`` interface so callers
-    dispatch uniformly without isinstance checks.
-    """
-
-    DFLASH = auto()
-    EAGLE = auto()
-    EAGLE3 = auto()
-    FROZEN_KV_MTP = auto()
-    STANDALONE = auto()
-    NGRAM = auto()
-```
-
-**要点：** Spec V2 进一步把 planner 从 Worker 中抽出，见 [[SGLang-Speculative]]。
-
----
-
-## 8 · PD 分离（prefill.py / decode.py）
-
-**为何复杂：** 分布式队列状态机 + KV RDMA 传输 + bootstrap room 协商 + 与本地 Scheduler batch 逻辑交织。Prefill 三队列、Decode 四队列，转移失败需 rollback。
-
-**热点类：** `PrefillBootstrapQueue`、Decode 侧 transfer queue
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/disaggregation/prefill.py L104-L137
-class PrefillBootstrapQueue:
-    """
-    Store the requests in bootstrapping
-    """
-
-    def __init__(
-        self,
-        token_to_kv_pool: KVCache,
-        draft_token_to_kv_pool: Optional[KVCache],
-        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: MetadataBuffers,
-        tp_rank: int,
-        tp_size: int,
-        gpu_id: int,
-        bootstrap_port: int,
-        gloo_group: ProcessGroup,
-        max_total_num_tokens: int,
-        scheduler: Scheduler,
-        pp_rank: int,
-        pp_size: int,
-        transfer_backend: TransferBackend,
-    ):
-        self.token_to_kv_pool = token_to_kv_pool
-        self.draft_token_to_kv_pool = draft_token_to_kv_pool
-        self.is_mla_backend = is_mla_backend(token_to_kv_pool)
-        self.metadata_buffers = metadata_buffers
-        self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
-        self.gpu_id = gpu_id
-        self.bootstrap_port = bootstrap_port
-        self.queue: List[Req] = []
-```
-
-**要点：** bootstrap 完成前请求不能进入正常 prefill batch。
-
----
-
-## 9 · 分布式 parallel_state + GroupCoordinator
-
-**为何复杂：** TP/PP/EP/DP/CP 五维并行，collective 需路由到 PyNccl/CustomAllReduce/TorchSymmMem；CUDA Graph capture 期间 collective 行为受限。
-
-**热点函数：** `initialize_model_parallel` / `GroupCoordinator.all_reduce`
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/distributed/parallel_state.py L1967-L1979
-def initialize_model_parallel(
-    tensor_model_parallel_size: int = 1,
-    expert_model_parallel_size: int = 1,
-    pipeline_model_parallel_size: int = 1,
-    attention_data_parallel_size: int = 1,
-    attention_context_model_parallel_size: int = 1,
-    moe_data_model_parallel_size: int = 1,
-    decode_context_parallel_size: int = 1,
-    backend: Optional[str] = None,
-    duplicate_tp_group: bool = False,
-    enable_symm_mem: bool = False,
-    recovered_rank: bool = False,
-) -> None:
-```
-
-**要点：** decode_context_parallel_size 进一步在 TP 组内切 KV，约束更多。
-
----
-
-## 10 · 专用模型（deepseek_v2 / mllama）
-
-**为何复杂：** 在通用 Transformer 上叠加 MLA 压缩 KV、MoE 路由、Vision cross-attention 等架构特化，每层 forward 签名与 KV 布局不同。
-
-**热点：** `DeepseekV2ForCausalLM.forward`、双 RadixAttention 实例
-
-**读法：** MLA 把 KV 存为 latent 而非标准 head 布局，RadixCache 的 value 组件需对应调整。
-
----
-
-## 11 · LoRAManager
-
-**为何复杂：** 多 adapter GPU 槽位有限；CSGMV kernel 需 batch 内 per-req 索引；eviction 与 overlap loading 竞态；TP 分片下 LoRA 权重布局与 base 不同。
-
-**热点函数：** `load_lora_adapter` / `prepare_lora_batch`
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/lora/lora_manager.py L89-L99
-        self.eviction_policy = server_args.lora_eviction_policy
-        self._experts_shared_outer_override: Optional[bool] = (
-            server_args.experts_shared_outer_loras
-        )
-        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
-        self.lora_strict_loading: bool = getattr(
-            server_args, "lora_strict_loading", False
-        )
-
-        # LoRA backend for running sgemm kernels
-        logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
-```
-
-**要点：** eviction 触发时需确保 running batch 不引用被驱逐 adapter。
-
----
-
-## 12 · DefaultModelLoader
-
-**为何复杂：** 支持 HF safetensors、GGUF、Remote、Layered 等多种格式；TP 分片需按 rank 过滤 tensor；quantization 权重需 dequant 或 packed 加载。
-
-**热点：** weight iterator + `model.load_weights` 映射表
-
----
-
-## 复杂度热力图
-
-| 文件/模块 | 复杂度来源 | 建议深读专题 |
-|-----------|-----------|-------------|
-| `scheduler.py` | 多特性正交分支 | [[SGLang-Scheduler]] · [[SGLang-SchedulePolicy]] · [[SGLang-ScheduleBatch数据结构]] |
-| `radix_cache.py` | 树突变 + eviction | [[SGLang-RadixAttention]] |
-| `model_runner.py` | Graph + backend | [[SGLang-ModelRunner]] |
-| `eagle_worker_v2.py` | 双模型调度 | [[SGLang-Speculative]] |
-| `prefill.py` / `decode.py` | 分布式状态机 | [[SGLang-PD分离]] |
-| `parallel_state.py` | 多维 collective | [[SGLang-分布式]] |
-| `lora_manager.py` | 多租户资源 | [[SGLang-LoRA]] |
-
-**读法建议：** 先读热点函数的**调用方**（谁 invoke、传什么 batch），再读**被调方**实现。避免从 4000 行文件顶到底线性扫描。
-
----
-
-## 设计追问
-
-### Q1：`scheduler.py` 4000+ 行，第一刀应该切哪里？
-
-**读法：** 从 `run_scheduler_event_loop` 入口找 `event_loop_normal` / `event_loop_overlap` / `event_loop_pp` 三分支，确定你的 `--pp-size` 与 `--disable-overlap-schedule` 组合走哪条 loop。再在选定 loop 内只跟踪 `get_next_batch_to_run` → `run_batch` → `process_batch_result` 三角，忽略其余 until 需要。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/managers/scheduler.py L4168-L4178
-    if disaggregation_mode == DisaggregationMode.NULL:
-        if scheduler.enable_pdmux:
-            scheduler.event_loop_pdmux()
-        elif server_args.pp_size > 1:
-            scheduler.event_loop_pp()
-        elif scheduler.enable_overlap_mlx:
-            scheduler.event_loop_overlap_mlx()
-        elif scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
-```
-
-**要点：** PD 模式还有 `event_loop_overlap_disagg_prefill/decode`，见 §8。
-
----
-
-### Q2：RadixCache 的 node split 何时触发，为何影响「复杂度」评级？
-
-**读法：** 当 `match_prefix` 落在某 node 存储 segment 中间时，框架 split 一次暴露精确边界，后续匹配更高效。这是**读时写**的结构突变，与 eviction、HiCache write-through 并发，故列为热点。读代码跟 `_match_prefix_helper` 返回值是否触发 `_split_node`。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/mem_cache/radix_cache.py L385-L390
         Internal updates:
             * Refreshes access metadata (timestamps) used by the
                 configured eviction strategy.
@@ -425,23 +163,98 @@ def initialize_model_parallel(
                 subsequent match efficiency and does not duplicate data.
 ```
 
-**要点：** split 不复制 KV 数据，只拆树索引。
+这里同时存在 namespace、page 对齐、device/host view、访问元数据和 node split。读缓存 bug 时要同时画逻辑树和物理 KV，不要把 node 当作 tensor 本身。
 
----
+## 4. ModelRunner：控制流、tensor view 与 backend 在此会合
 
-### Q3：ModelRunner.forward 与 TpModelWorker 之间为何还要分两层？
+ModelRunner 的难点不只是模型 forward 长，而是它消费 Scheduler 已物化的 `ForwardBatch`，再把同一批对象映射到 eager/graph、prefill/decode/spec、PP、DP padding、attention metadata 与具体 kernel。
 
-**读法：** TpModelWorker 是 Scheduler 唯一 execution 门面，负责 HiCache consumer、PP 末 rank 判定、spec verify 透传；ModelRunner 专注 GPU 图执行与 CUDA Graph。分层让 Scheduler 不直接依赖 `model.forward` 细节，也便于 EAGLE draft worker 替换 Target worker。
+建议分三层读：
 
-**源码锚点：**
+1. **runner 选择层**：当前是 eager、decode graph、prefill graph 还是其他 runner；
+2. **metadata 层**：谁创建、更新、借用 attention/KV/spec metadata；
+3. **模型层**：最终 `model.forward` 如何读这些 view。
 
-```python
-## 来源：python/sglang/srt/managers/tp_worker.py L506-L510
-        if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+不要从 kernel 栈反推 Scheduler 原对象，除非先确认 view、padding 和 loc 翻译。
+
+## 5. Speculative：共同的是结果契约，不是固定流水线
+
+EAGLE、NGRAM、DFLASH 与插件算法并非都经历同一个 `eagle_sample`、同一种 tree layout 或固定“两次 GPU launch”。复杂度来自 Scheduler 需要接收共同结果，同时每种算法拥有不同候选、验收、KV commit 和 next-input 协议。
+
+阅读时先问：
+
+- 候选对象是什么；
+- target 怎样验收；
+- accept length/index 如何表达；
+- 哪些 KV 可以提交；
+- 拒绝后谁构造下一步；
+- overlap、grammar、TP/platform 分支是否支持。
+
+## 6. PD：队列名背后是完成协议
+
+Prefill bootstrap/inflight 与 Decode prealloc/transfer/retracted queue 不是为了“排队而排队”。它们分别代表 metadata、buffer、KV transfer 和可执行状态的不同完成条件。
+
+复杂点在于：
+
+- metadata ready 不等于 KV ready；
+- prealloc 成功不等于 transfer 成功；
+- optimistic prefill、cached prefix chunk、PP/overlap 会改变时序；
+- abort/timeout 必须清理 sender、buffer、queue 与 request mapping；
+- gateway 的 HTTP 成功也不能替代内部 transfer 完成。
+
+## 7. Parallel state：alias 比缩写更重要
+
+TP、PP、DP、EP、CP、DCP 只告诉你维度名；真实 collective 使用哪个 group、是否有 CPU/Gloo coordination、是否有 custom backend、local rank 如何映射，取决于 `GroupCoordinator` 与 alias。
+
+排查 hang 时至少记录：
+
+```text
+global rank / local rank
+TP、PP、DP、EP、CP、DCP 坐标
+调用的 group alias
+collective backend
+参与 rank 集合
+进入 collective 的顺序和 tensor shape
 ```
 
-**要点：** 非 last rank 只传 `pp_proxy_tensors`，不 sample logits。
+只报 `tp=8` 无法定位错误 collective。
+
+## 8. 动态资源：LoRA、多模态、权重更新
+
+这三类看似外围功能，却共同引入“运行时可变资源”：
+
+- LoRA：adapter identity→CPU cache→GPU slot→batch metadata；
+- 多模态：媒体内容→feature/embedding→IPC→hash/pad→prefix identity；
+- 权重更新：method→worker update→target/draft→cache flush→weight version。
+
+它们的共同风险是 partial success。当前实现并不都提供事务回滚；文档和运维流程必须记录逐 worker/逐阶段结果，而不是只看一个总布尔值。
+
+## 热点阅读六步法
+
+对任意热点函数，按顺序写下：
+
+1. **入口条件**：哪组最终配置和状态能到达？
+2. **主对象**：函数读写哪些对象，谁拥有生命周期？
+3. **不变量**：哪些身份、顺序、shape、资源计数必须保持？
+4. **副作用**：分配、释放、缓存突变、消息、metric、event 有哪些？
+5. **失败路径**：异常、timeout、partial success 后如何清理？
+6. **验证**：静态证据与目标环境实验分别证明什么？
+
+## 一个可复用的热点卡
+
+```text
+问题：
+可达配置：
+输入对象：
+输出对象：
+所有者变化：
+地址翻译：
+跨迭代/跨进程状态：
+失败与清理：
+观测信号：
+最小反例：
+```
+
+## 复盘
+
+SGLang 的复杂度主要来自“同一语义在不同运行模式下仍要保持一致”，而不是某几个工程师写了长文件。读热点时沿对象生命周期和不变量切片，远比从文件第一行线性读到最后一行有效。

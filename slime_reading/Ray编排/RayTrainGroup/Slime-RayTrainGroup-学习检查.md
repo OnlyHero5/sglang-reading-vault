@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RayTrainGroup · 学习检查
 
@@ -55,7 +55,7 @@ flowchart LR
 
 | API | 是否内部 `ray.get` | 原因 |
 |-----|--------------------|------|
-| `async_init` | 否 | 让 caller 组合 actor/critic 初始化 |
+| `async_init` | 否 | API 让 caller 决定等待；当前 caller 仍按 critic 后 actor 的顺序等待 |
 | `async_train` | 否 | 让 caller 组合 critic values 和 actor train |
 | `save_model` | 是 | 保存必须跨 rank 完成 |
 | `update_weights` | 是 | 下一轮 generate 前必须完成 |
@@ -83,7 +83,7 @@ flowchart LR
 
 - driver 先 `critic_model.async_train` 得到 `value_refs`。
 - 如果 actor 本轮训练，把 `value_refs` 作为 actor `external_data`。
-- actor `async_train` 返回 refs，driver `ray.get` 等待。
+- actor group 按位置把第 `i` 个 critic ref 交给第 `i` 个 actor rank，再返回 actor refs 供 driver `ray.get`。
 
 源码入口：`train.py` L72-L82、`slime/ray/actor_group.py` L131-L149。
 
@@ -124,12 +124,14 @@ flowchart LR
 轻量验证：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
 
 依赖完整时再跑：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/utils/test_megatron_role_config.py -q
 ```
 
@@ -137,6 +139,29 @@ python -m pytest tests/utils/test_megatron_role_config.py -q
 
 - 参数校验测试通过，覆盖 colocate/offload/delta 等边界。
 - role config 测试在有 `ray`、`sglang` 依赖时验证 `create_training_models` 的 actor override 路径。
+
+当前基线实测：参数校验 `14 passed`；role config 的 6 个用例在 import 阶段失败，其中 5 个缺 `sglang`、1 个缺 `ray`。
+
+缺少运行依赖时，可执行不 import 业务模块的 AST 替代检查：
+
+```powershell
+Set-Location slime
+@'
+import ast
+from pathlib import Path
+
+tree = ast.parse(Path("slime/ray/actor_group.py").read_text(encoding="utf-8"))
+group = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RayTrainGroup")
+methods = {node.name: node for node in group.body if isinstance(node, ast.FunctionDef)}
+assert "async_train" in methods and "update_weights" in methods
+assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" for node in ast.walk(methods["async_train"]))
+assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" for node in ast.walk(methods["update_weights"]))
+assert any(isinstance(node, ast.Assert) for node in ast.walk(methods["async_train"]))
+print("AST_OK")
+'@ | python -
+```
+
+预期输出：`AST_OK`。它只验证 async/sync 控制边界和 list 长度断言，不能替代有 Ray 集群时的 actor 行为测试。
 
 ## 通过标准
 

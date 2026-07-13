@@ -9,323 +9,164 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
+
 # 多模态生成 · 核心概念
 
 ## 你为什么要读
 
-多模态生成与 VLM 理解是两套不同主线：前者运行 text encoder、denoising 与 VAE decode pipeline，后者把媒体特征并入语言模型 prefill。本篇先把扩散 runtime 的进程、stage 和 latent 生命周期摆清楚，再解释它与文本 `srt` 的共享边界。
+图像/视频生成不是“把 LLM 的 token 换成像素”。它的请求载体、调度兼容性、并行维度、模型阶段和输出运输都不同。理解本专题的关键不是背 `Encoder → Denoiser → Decoder`，而是分清五种所有权：谁接协议、谁收 ZMQ、谁决定合批、谁在每个 rank 执行 pipeline、谁把大输出变成可返回对象。
 
-## 用户故事
+## 贯穿对象：一次视频生成请求
 
-### 场景角色
+把一次请求记成四次形态变化：
 
-**阿宁**，短视频平台的生成算法工程师。产品需要 Text-to-Video：用户输入文案，服务返回视频资产。DiT pipeline 运行在多 GPU 上；rank 0 接收 ZMQ 请求，并协调其他 worker 完成多步 denoise 与 decode。
+1. 外部 JSON 被 route 转成 `SamplingParams` 与内部 `Req`。
+2. `Req` 被 pickle 后经临时 ZMQ REQ socket 送到 rank0 Scheduler。
+3. Scheduler 把请求放入 FIFO queue，决定单发、动态合批或顺序 fallback；多 rank 通过 distributed object broadcast 得到相同调度输入。
+4. GPUWorker 调用 pipeline，最终把 `Req` 或 `OutputBatch` 统一为 `OutputBatch`，再按 raw frames、numpy frames、文件路径或普通 tensor 选择运输形态。
 
-### 时间线
+这条链里，父进程的 ready pipe 只证明 worker 已构造完成；它不是生成请求的数据总线。
 
-| 时刻 | 事件 |
-|------|------|
-| T0 | 客户端 POST OpenAI 兼容 `/v1/videos/generations` |
-| T1 | FastAPI → `async_scheduler_client` ZMQ REQ 到 rank0 Scheduler |
-| T2 | rank0 `GPUWorker.execute_forward` 经 Pipe 广播 TP 任务给 rank1..N |
-| T3 | `PipelineExecutor` 顺序执行 TextEncoding → Denoising（多步）→ VAE Decoding |
-| T4 | 输出 tensor 写文件 / base64；master 汇总 slave 结果返回 HTTP |
+## 1. 进程与 rank：每个 rank 都有 Scheduler
 
-### 涉及模块
-
-```mermaid
-sequenceDiagram
- participant Client as 客户端
- participant HTTP as FastAPI http_server
- participant ZMQ as SchedulerClient
- participant M0 as GPUWorker rank0
- participant M1 as GPUWorker rank1..N
- participant Pipe as mp.Pipe
- participant PE as PipelineExecutor
-
- Client->>HTTP: POST /v1/videos/generations
- HTTP->>ZMQ: forward(request_batch)
- ZMQ->>M0: event_loop 收请求
- M0->>Pipe: 分发 TP 子任务
- Pipe->>M1: slave forward
- M1-->>Pipe: 局部结果
- M0->>PE: execute(stages, batch)
- PE-->>HTTP: OutputBatch → 响应
-```
-
-**读法：** `multimodal_gen` 服务扩散式生成（非 LLM autoregressive decode）。`launch_server` 按 `num_gpus` spawn 多进程：rank0 为 master，持有 ZMQ 与 HTTP 桥接；rank>0 为 slave，仅通过 Pipe 参与 TP。全部 worker pipe 握手 `status: ready` 后 master 才对外监听 HTTP，避免半初始化集群接流量。与 srt LLM 相比，forward 走 DiT/VAE stage 编排而非 token decode loop。
-
-**源码锚点：**
+`launch_server` 为每个 GPU 启动一个 `run_scheduler_process`。每个进程都会构造 Scheduler，Scheduler 再构造本 rank 的 GPUWorker。差别在于只有 `gpu_id == 0` 创建 ZMQ ROUTER；其他 rank 的 `receiver` 为 `None`。
 
 ```python
-## 来源：python/sglang/multimodal_gen/runtime/launch_server.py L120-L156
-    for i in range(num_gpus):
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_writers.append(writer)
-        if i == 0:  # Master worker
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    i,  # rank
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_w,
-                    result_pipes_from_slaves_r,
-                ),
-                name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
+# 来源：python/sglang/multimodal_gen/runtime/managers/scheduler.py L103-L111
+        endpoint = server_args.scheduler_endpoint
+        if gpu_id == 0:
+            # router allocates identify (envelope) for each connection
+            self.receiver, actual_endpoint = get_zmq_socket(
+                self.context, zmq.ROUTER, endpoint, True
             )
-        else:  # Slave workers
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    i,  # rank
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_r[i - 1],
-                    result_pipes_from_slaves_w[i - 1],
-                ),
-                name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
-            )
+            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+        else:
+            self.receiver = None
 ```
+
+因此“rank0 有 Scheduler、slave 只有 GPUWorker”也是错误模型。更准确的说法是：所有 rank 都跑同一个调度循环形状，但外部 socket 与结果回复只属于 rank0；其他 rank 从并行组广播获得请求。
+
+父进程会等待每个 worker 通过单独 ready pipe 返回 `{"status": "ready"}`，之后才启动 HTTP。这是启动 barrier，不是运行期健康监控。worker 在运行期崩溃后，源码没有自动把剩余 rank 重组为降级集群。
+
+## 2. 四种通信不要混在一起
+
+| 通信 | 方向 | 载荷/目的 | 生命周期 |
+|---|---|---|---|
+| ready `mp.Pipe` | worker → parent | `status: ready` | 仅启动期 |
+| Scheduler ZMQ ROUTER/REQ | client ↔ rank0 | pickle 请求与 `OutputBatch` | 每次外部请求 |
+| `broadcast_pyobj` | rank0 → SP/CFG/TP ranks | Python 请求对象 | 普通生成调度 |
+| task/result `mp.Pipe` | rank0 ↔ slave | 显式 method/kwargs 与控制结果 | 专门控制路径 |
+
+普通生成的多 rank 复制由 `recv_reqs()` 完成。它会按配置依次经过 SP、CFG、TP group；某个维度为 1 时不执行对应广播。不能看到 launch 阶段创建 Pipe，就推断生成 batch 经 Pipe 分发。
+
+另一个边界是 `dp_size`：字段、`/server_info` 和若干计算式中虽然出现 DP，但当前 `_validate_parallelism` 对 `dp_size > 1` 直接抛错。这是“配置表面存在、运行能力尚未开放”的典型例子。
 
 ```python
-## 来源：python/sglang/multimodal_gen/runtime/managers/scheduler.py L953-L960
-    def event_loop(self) -> None:
-        """
-        The main event loop that listens for ZMQ requests.
-        Handles abortion
-        """
-        # Pool mode: all roles use the pool event loop
-        if self._disagg_role != RoleType.MONOLITHIC:
-            self._disagg_event_loop()
+# 来源：python/sglang/multimodal_gen/runtime/server_args.py L2037-L2041
+        if self.dp_size < 1:
+            raise ValueError("--dp-size must be a natural number")
+
+        if self.dp_size > 1:
+            raise ValueError("DP is not yet supported")
 ```
 
-**要点：**
+## 3. Scheduler 不只是转发器
 
-- slave 不直接收 HTTP/ZMQ，降低多进程竞态。
-- `ComposedPipelineBase` 由 `build_pipeline(server_args)` 构造各 stage。
-- 高级模式可 `launch_pool_disagg_server` 分离 Encoder/Denoiser/Decoder 池。
-- rank0 `event_loop` 是请求调度中枢；slave 仅响应 Pipe 上的 TP 子任务。
-- OpenAI 兼容 `video_api` 将 HTTP JSON 转为内部 `Req` + `SamplingParams`。
+Scheduler 持有 FIFO `waiting_queue`，其中每项包含 client identity、请求对象与入队时间。它会：
 
-### 如果…会怎样（调试）
-
-| 现象 | 可能原因 | 排查 |
-|------|----------|------|
-| HTTP 起不来 | 某 rank pipe 非 ready | 看 `Initialization failed` 与 worker 日志 |
-| 视频花屏 / 全黑 | denoise 步数或 CFG 配置错 | 查 `ServerArgs.pipeline_config` |
-| 单卡 OOM | TP 未启或 layerwise offload 未开 | 增 `num_gpus` 或 component residency |
-| ZMQ timeout | master event_loop 阻塞 | 查 `scheduler.py event_loop` 队列深度 |
-
----
-
-## 1. multimodal_gen 的定位
-
-**读法：** 本子系统服务 **扩散式多模态生成**（Stable Diffusion、Wan、LTX、Flux 等 pipeline），不是 LLM token 自回归。一次请求经历：文本编码 → 多步 denoise（DiT）→ VAE decode → 输出图像/视频文件或 tensor。
-
-**源码锚点：**
+- 将 ROUTER 收到的 payload 规范化为逻辑请求；
+- 应用 request-based warmup 处理；
+- 在 batching delay 内寻找兼容请求；
+- 用 `BatchAdmissionController` 判断显存/形状规则是否允许继续扩 batch；
+- 合并 prompt、seed、输出路径等字段；
+- 执行后把 batched output 安全切回每个原请求；
+- 保证 handler 异常也尽量形成 `OutputBatch(error=...)` 回复。
 
 ```python
-## 来源：python/sglang/multimodal_gen/runtime/managers/gpu_worker.py L106-L109
-class GPUWorker(GPUWorkerPostTrainingMixin):
-    """
-    A worker that executes the model on a single GPU.
-    """
+# 来源：python/sglang/multimodal_gen/runtime/managers/scheduler.py L147-L153
+        # FIFO queue entries: (identity, request, enqueue_ts_s)
+        self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
+        self._batching_max_size = server_args.batching_max_size
+        self._batching_delay_s = server_args.batching_delay_ms / 1000.0
+        self._batch_metrics_enabled = server_args.enable_batching_metrics
+        self._batch_metrics_window = BatchMetricsWindow()
+        self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
 ```
 
-**要点：**
+### 动态合批的两道门
 
-- `ComposedPipelineBase` 由 `build_pipeline(server_args)` 构造，含 transformer/vae/text_encoder 等 stage。
-- 支持 realtime video、disagg encoder/denoiser/decoder 等高级模式。
+第一道是语义兼容：warmup、realtime session、非字符串 prompt、image conditioning、不同 `return_file_paths_only` 都会拒绝；SamplingParams 除明确标记 `batch_sig_exclude` 的字段外必须一致，`extra.diffusers_kwargs` 也参与签名。
 
----
+第二道是 admission：即便签名相同，也可能因模型与分辨率规则达到有效 batch 上限。`batching_max_size` 是用户上限，不等于每种 workload 都能达到的安全上限。
 
-## 2. 进程模型：Master + Slaves
+如果多个普通 `Req` 无法合并，当前实现会顺序执行；如果已经合并的 forward 返回 error、或结果无法一一切分，则不会再重跑一遍顺序 fallback，而是为各请求构造错误结果，避免重复昂贵计算和副作用。
 
-**读法：** `launch_server` 按 `num_gpus` spawn 多个 `run_scheduler_process`。Rank 0 为 master：收 ZMQ 请求、通过 Pipe 分发 tensor parallel 任务；Rank > 0 为 slave：等待 pipe 任务并回传结果。
+## 4. GPUWorker：计算与运输的分界
 
-**源码锚点：**
+GPUWorker 构造时完成设备选择、distributed/model-parallel 初始化、pipeline 构建、parallel group 缓存与 realtime session cache 创建。它不是只包一层 `pipeline.forward`：还负责 metrics、OOM 转译、保存文件、raw RGB 打包、numpy frame 物化和大对象释放。
 
 ```python
-## 来源：python/sglang/multimodal_gen/runtime/launch_server.py L120-L139
-    for i in range(num_gpus):
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_writers.append(writer)
-        if i == 0:  # Master worker
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    i,  # rank
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_w,
-                    result_pipes_from_slaves_r,
-                ),
-                name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
-            )
+# 来源：python/sglang/multimodal_gen/runtime/managers/gpu_worker.py L472-L483
+    def _materialize_output_transport(
+        self,
+        output_batch: OutputBatch,
+        req: Req,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        if req.return_raw_frames:
+            self._materialize_raw_frame_transport(output_batch, req)
+        elif req.save_output and req.return_file_paths_only:
+            self._materialize_file_path_transport(output_batch, save_output_paths)
+        elif req.return_frames:
+            self._materialize_frame_outputs_for_return(output_batch, req)
 ```
 
-**要点：**
+三条分支互斥且有优先级：raw frames 优先，其次是“保存且只返路径”，最后才是普通 frames。HTTP 侧仍可能在收到 tensor 时调用 `save_outputs`，所以“文件保存只属于 worker”与“文件保存只属于 HTTP”都过于绝对；所有权取决于请求 transport 选项和返回内容。
 
-- 与 srt scheduler 类似用独立进程隔离 CUDA context。
-- 全部 worker ready 后 master 才启动 HTTP（pipe 握手 `status: ready`）。
+## 5. PipelineExecutor：横切策略，不等于固定 stage 表
 
----
+`PipelineExecutor` 是抽象基类。它提供 profiling、平台 inference context、stage hook、NVTX 与 component residency request 生命周期；具体 stage 序列由 pipeline 和具体 executor 决定，不能把所有模型写死成完全相同的三段流水线。
 
-## 3. PipelineExecutor 与 Stage
-
-**读法：** 每个 diffusion pipeline 拆为多个 `PipelineStage`（如 TextEncoding、Denoising、Decoding）。`PipelineExecutor` 负责顺序/并行执行 stage、管理 component residency（CPU offload 时加载/卸载权重）。
-
-**源码锚点：**
+`before_stage` 只把 residency manager 注入 stage 并委托 `manager.before_stage(...)`。真正把哪些 component 搬到哪里、何时释放，由具体 manager 和 executor 实现。CPU offload、layerwise offload、FSDP inference 也不是同一个开关：某些 stage 为保留 tensor version counter，会临时退出 inference mode，转入 `torch.inference_mode(False), torch.no_grad()`。
 
 ```python
-## 来源：python/sglang/multimodal_gen/runtime/pipelines_core/executors/pipeline_executor.py L42-L48
-class PipelineExecutor(ABC):
-    """
-    Abstract base class for all pipeline executors.
-
-    Executors orchestrate the execution of pipeline, with managing the parallel and communications required by stages
-
-    """
+# 来源：python/sglang/multimodal_gen/runtime/pipelines_core/executors/pipeline_executor.py L151-L159
+    @staticmethod
+    @contextlib.contextmanager
+    def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
+        if PipelineExecutor._stage_needs_version_counters(stage, server_args):
+            # fsdp and cpu-offload hooks need tensor version counters
+            with torch.inference_mode(False), torch.no_grad():
+                yield
+            return
+        yield
 ```
 
-**要点：**
+## 6. Warmup：两种模式、两个 gate
 
-- 具体子类实现 `execute(stages, batch, server_args)`。
-- `before_stage` / `component_residency_manager` 处理 layerwise offload。
+`warmup_mode` 最终被规范化成 `off`、`request` 或 `server`：
 
----
+- request warmup 在 Scheduler 收到真实请求后由 warmup mixin 安排；它是 benchmark/首请求路径的一部分。
+- server warmup 在 FastAPI lifespan 中后台执行。middleware 先让控制面路径通过，普通路径等待 `warmup_done`。
 
-## 4. HTTP 与 ZMQ 双通道
+server warmup 会先轮询本机 `/health`，但随后把 synthetic request 直接交给 `async_scheduler_client.forward`。因此它验证了 HTTP 进程已可探活和 scheduler/pipeline 后端可用，却没有再次验证 image/video route 的 JSON 转换全过程。
 
-**读法：** 在线服务：FastAPI 收 HTTP → `async_scheduler_client` ZMQ REQ 到 rank0 Scheduler。离线/本地：`run_zeromq_broker` 另开 REP socket 收 pickle 请求（DiffGenerator CLI）。
+非 monolithic disagg role 会在参数规范化时强制 `server_warmup=False`；不能把 monolithic 的 HTTP warmup gate套到独立 encoder/denoiser/decoder role。
 
-**源码锚点：**
+## 7. Monolithic 与 disagg 是两套事件循环
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/scheduler_client.py L16-L38
-async def run_zeromq_broker(server_args: ServerArgs):
-    """
-    This function runs as a background task in the FastAPI process.
-    It listens for TCP requests from offline clients (e.g., DiffGenerator).
-    """
-    ctx = zmq.asyncio.Context()
-    socket = ctx.socket(zmq.REP)
-    broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
-    socket.bind(broker_endpoint)
-    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
+`dispatch_launch` 按 `RoleType` 选择 monolithic、head server 或 standalone role。Scheduler 的 `event_loop()` 也会先判断 role：非 monolithic 直接进入 `_disagg_event_loop()` 并返回，不走普通 waiting queue 主循环。
 
-    while True:
-        try:
-            # 1. Receive a request from an offline client
-            payload = await socket.recv()
-            request_batch = pickle.loads(payload)
-            logger.info("Broker received an offline job from a client.")
-
-            # 2. Forward the request to the main Scheduler via the shared client
-            response_batch = await async_scheduler_client.forward(request_batch)
-
-            # 3. Send the Scheduler's reply back to the offline client
-            await socket.send(pickle.dumps(response_batch))
-```
-
-**要点：**
-
-- HTTP 与 broker 共用同一 Scheduler backend。
-- pickle 用于离线大 batch 请求（含文件路径引用 materialize）。
-
----
-
-## 5. ServerArgs 与 PipelineConfig
-
-**读法：** `ServerArgs` dataclass 聚合模型路径、GPU 数、并行策略（TP/SP/CFG ring）、disagg 角色、warmup 配置等，全局 `set_global_server_args` 供 worker 读取。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/multimodal_gen/runtime/server_args.py L9-L11
-import json
-import math
-import os
-```
-
-**要点：**
-
-- `pipeline_config` 决定 task_type（T2V、I2V 等）与 precision。
-- `DisaggServerArgsMixin` 扩展 pool disagg 的 encoder/denoiser/decoder GPU 映射。
-
----
-
-## 6. Disaggregated 扩散服务
-
-**读法：** `launch_pool_disagg_server` 按角色池启动多组 worker：Encoder 编码 prompt → Denoiser 迭代 latent → Decoder VAE 出图。`DiffusionServer` orchestrator 在角色边界 dispatch。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/multimodal_gen/runtime/launch_server.py L213-L223
-def launch_pool_disagg_server(
-    server_args: ServerArgs,
-    encoder_gpus: list[list[int]],
-    denoiser_gpus: list[list[int]],
-    decoder_gpus: list[list[int]],
-    launch_http_server: bool = True,
-):
-    """Launch a pool-based disaggregated server with N:M:K independent role instances.
-
-    DiffusionServer orchestrates the full pipeline, dispatching at every
-    role transition (Encoder → Denoiser → Decoder).
-```
-
-**要点：**
-
-- 类比 srt PD disaggregation，但角色是扩散 pipeline 阶段而非 prefill/decode。
-- 各 pool 可独立扩缩容 GPU 数。
-
----
-
-## 7. OpenAI 兼容 API
-
-**读法：** `entrypoints/openai/image_api.py`、`video_api.py` 将 OpenAI Images/Video 格式转为内部 `Req` + `SamplingParams`，经 scheduler 执行后返回 base64 或 URL。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/multimodal_gen/runtime/entrypoints/http_server.py L17-L20
-from sglang.multimodal_gen.runtime.entrypoints.openai import (
-    image_api,
-    video_api,
-)
-```
-
-**要点：**
-
-- `/health`、`/v1/models` 与 srt 风格一致便于 K8s 探针。
-- `server_warmup` 可选 synthetic 请求预热 CUDA graph。
+pool 模式的 `DiffusionServer` 在 encoder、denoiser、decoder 边界调度中间对象；每个 role instance 内仍可有多个 rank，但并行度由 role-specific override 重新计算。这里与 LLM PD 分离只有“阶段拆分”的抽象相似，传输对象、角色状态机和失败恢复都不能类推。
 
 ## 运行验证
 
-这篇可以用源码检索验证 multimodal_gen 的四个边界：入口启动、Scheduler/worker/pipeline 执行、pool disagg 角色、HTTP OpenAI 兼容层。
-
 ```powershell
-rg -n 'def launch_server|def launch_pool_disagg_server|class Scheduler|class GPUWorker|class PipelineExecutor|class AsyncSchedulerClient|class ServerArgs|pipeline_config|DiffusionServer|image_api|video_api|server_warmup' sglang/python/sglang/multimodal_gen/runtime/launch_server.py sglang/python/sglang/multimodal_gen/runtime/managers/scheduler.py sglang/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py sglang/python/sglang/multimodal_gen/runtime/pipelines_core/executors/pipeline_executor.py sglang/python/sglang/multimodal_gen/runtime/scheduler_client.py sglang/python/sglang/multimodal_gen/runtime/server_args.py sglang/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py
+rg -n 'if gpu_id == 0|receiver = None|waiting_queue|broadcast_pyobj|_broadcast_task|_try_merge_generation_reqs|_split_batched_output' sglang/python/sglang/multimodal_gen/runtime/managers/scheduler.py
+rg -n 'return_raw_frames|return_file_paths_only|return_frames|build_pipeline|maybe_init_distributed_environment_and_model_parallel' sglang/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+rg -n 'warmup_mode|server_warmup = False|DP is not yet supported|sp_degree.*ring_degree.*ulysses_degree' sglang/python/sglang/multimodal_gen/runtime/server_args.py
 ```
 
-如果输出显示 `DiffusionServer`、`AsyncSchedulerClient` 或 OpenAI router 的位置变化，优先重读 HTTP 与 broker 共用 backend 的部分；如果 `pipeline_config` 或 `launch_pool_disagg_server` 变化，则优先重读角色池和 task type 的解释。
+预期：能同时定位外部 socket 所有权、三类 distributed broadcast、独立 Pipe 控制方法、动态合批与切分、三种输出 transport，以及 DP/disagg/warmup 的配置边界。若只找到类名而不能说明对象从谁移交给谁，说明心理模型仍停留在目录层。

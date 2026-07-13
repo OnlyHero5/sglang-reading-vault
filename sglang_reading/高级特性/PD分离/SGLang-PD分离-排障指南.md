@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # PD分离 · 排障指南
 
@@ -24,6 +24,8 @@ updated: 2026-07-10
 | 请求一进来就 abort | 房间账 | `Scheduler.handle_generate_request` |
 | 直连 prefill 报 room 缺失 | 路由账 | `follow_bootstrap_room_scheduler` |
 | Prefill bootstrap 堵住 | Decode prealloc | `DecodePreallocQueue._create_receiver_and_enqueue` |
+| Decode 收到请求却迟迟不 prealloc | Prefill DP rank 解析 | `_ensure_prefill_info`、`_resolve_pending_reqs` |
+| Prefill GPU 有计算但没有 KV 发出 | optimistic retry | `handle_pending_bootstrap`、`optimistic_release_and_requeue` |
 | Prefill forward 完成但客户端没结果 | Prefill inflight | `process_disagg_prefill_inflight_queue` |
 | receiver Success 但 Decode 不进 waiting | metadata gate | `_apply_metadata_gate` |
 | Decode abort metadata mismatch | metadata slot 生命周期 | `_commit_transfer_to_req` |
@@ -76,9 +78,9 @@ Prefill DP controller 也假设 room 已经存在，并用它决定目标 worker
 - 直连调试时手动提供 `bootstrap_host`、`bootstrap_port`、`bootstrap_room`。
 - 如果只想本地验证状态机，用 fake backend，但不要把 fake 的 room 自动分配行为当作生产语义。
 
-## Q2：Prefill bootstrap 卡住时，为什么先查 Decode
+## Q2：Prefill bootstrap 卡住时，为什么默认先查 Decode
 
-Prefill 侧只有在 Decode 已经建立 receiver 并预分配 metadata/KV 后，sender bootstrap 才能收敛。Prefill 自己会启动 bootstrap server，但接收端准备好与否在 Decode。
+稳态主线中，Prefill 侧只有在 Decode 已经建立 receiver 并预分配 metadata/KV 后，sender bootstrap 才能收敛。Prefill 自己会启动 bootstrap server，但接收端准备好与否在 Decode。
 
 Prefill 进程才启动 bootstrap server：
 
@@ -159,9 +161,32 @@ Prefill sender 创建后只标记 `pending_bootstrap`，等待后续 poll：
 排查顺序：
 
 1. Decode 是否收到同 rid、同 room 的请求。
-2. `DecodePreallocQueue._create_receiver_and_enqueue` 是否执行。
-3. `decode_req.kv_receiver.send_metadata` 是否发出 page indices 和 metadata index。
-4. Prefill `PrefillBootstrapQueue.finalize_bootstrap` 是否拿到 `decode_prefix_len`。
+2. 请求是否还在 `pending_reqs` 等 Prefill parallel info；`disagg_prefill_dp_rank`、`follow_bootstrap_room` 和 query 路径哪条生效。
+3. `DecodePreallocQueue._create_receiver_and_enqueue` 是否执行。
+4. `decode_req.kv_receiver.send_metadata` 是否发出 page indices 和 metadata index。
+5. Prefill `PrefillBootstrapQueue.finalize_bootstrap` 是否拿到 `decode_prefix_len`。
+
+例外是显式开启 optimistic prefill：此时 Prefill GPU 可能在 bootstrap 未完成时先跑一轮。看到 GPU 活跃不能证明 handshake 已收敛；若 `pending_bootstrap` 仍为真，forward 后可能执行 `optimistic_release_and_requeue`，释放这轮 KV 并重排。
+
+## Q2.1：为什么 Decode 收到请求后可能还不创建 receiver
+
+非 fake backend 需要先确定对端 Prefill DP rank。Decode 的快路径依次是：使用请求携带的 `disagg_prefill_dp_rank`；使用缓存的 Prefill info，在 `follow_bootstrap_room` 下计算 `room % dp_size`。两者都不成立时，请求进入 `pending_reqs`，按 bootstrap 地址异步获取 parallel info，并可能批量 query room 对应 rank。
+
+操作与预期：
+
+1. 观察 `pending_reqs` 长度和 bootstrap 地址分组；有积压说明还没到 KV 内存预分配阶段。
+2. 检查 Prefill info ensure 的 retry/error；成功后该地址应进入 `ready_addrs`。
+3. 检查 room query 是否返回当前 room；成功后应调用 `kv_receiver.init(prefill_dp_rank)`，请求从 pending 转入正常 handshake。
+
+## Q2.2：Prefill GPU 已计算却没有发送 KV，是否说明传输坏了
+
+不一定。若 `optimistic_prefill_retries > 0`，`KVPoll.Bootstrapping` 请求可提前进入 waiting 做 speculative Prefill。forward 结束时：
+
+- poll 已进入 `WaitingForInput`：finalize sender，继续 metadata/KV 发送。
+- poll 仍为 `Bootstrapping`：释放这轮 KV、reset request、增加 `prefill_retry_count` 并 requeue。
+- retry 耗尽：回到等待真实 bootstrap 收敛的稳态路径。
+
+该开关默认是 `0`；PP、HiCache、Mamba radix cache 会把它禁用。排查时把“重复 Prefill 计算/利用率上升”与“Gateway 换 pair、换 room 的 HTTP retry”分开统计。
 
 ## Q3：为什么 `KVPoll.Success` 还不能直接进 Decode
 
@@ -503,6 +528,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 | 指标 | 倾向问题 |
 |------|----------|
 | Prefill bootstrap time | Decode prealloc 或 room 路由 |
+| Prefill retry count / 重复 forward | optimistic handshake 未及时收敛、重算成本 |
 | Prefill transfer queue time | backend 传输、metadata buffer、网络 |
 | Decode transfer queue time | receiver poll、metadata gate、staging、HiCache |
 | Running batch 空位 | Decode 执行容量 |
@@ -515,13 +541,14 @@ def dispatch_event_loop(scheduler: Scheduler):
 - 改 metadata buffer：必须保持 0 表示未写入、commit 后归零、index 不复用错。
 - 改 prealloc 容量：区分 running 上限和 in-transfer 预留槽位。
 - 改 HiCache 或 staging：必须通过现有 poll gate 接入，不能让 raw Success 直接放行。
+- 改 retry：分别验证 Gateway 的整对 HTTP 重放与 Prefill Scheduler 的 optimistic 回收；两者不能共享“只重试失败侧”的假设。
 
 ## 验证抓手
 
 这些检查不需要启动完整 PD 集群，适合在改配置、换 transfer backend 或排查 hang 之前先确认源码主线没有读偏。
 
 ```powershell
-rg -n "bootstrap_room|follow_bootstrap_room_scheduler|_create_receiver_and_enqueue|create_sender|pending_bootstrap|_apply_metadata_gate|poll_and_all_reduce_with_staging|dispatch_event_loop|handle_pd_disaggregation" `
+rg -n "bootstrap_room|follow_bootstrap_room_scheduler|pending_reqs|_resolve_pending_reqs|_create_receiver_and_enqueue|create_sender|pending_bootstrap|optimistic_release_and_requeue|_apply_metadata_gate|poll_and_all_reduce_with_staging|dispatch_event_loop|handle_pd_disaggregation" `
   sglang/python/sglang/srt/managers/scheduler.py `
   sglang/python/sglang/srt/managers/data_parallel_controller.py `
   sglang/python/sglang/srt/disaggregation/decode.py `
@@ -534,8 +561,8 @@ rg -n "bootstrap_room|follow_bootstrap_room_scheduler|_create_receiver_and_enque
 
 - `scheduler.py` 同时命中无 room 拒绝、`dispatch_event_loop` 和 disagg event loop 分派。
 - `data_parallel_controller.py` 命中 `follow_bootstrap_room_scheduler`，说明 room 参与 Prefill 目标 rank 选择。
-- `decode.py` 命中 receiver 创建、metadata commit 校验和 decode disagg loop。
-- `prefill.py` 命中 `create_sender`、`pending_bootstrap` 与 bootstrap poll 处理。
+- `decode.py` 命中 pending rank 解析、receiver 创建、metadata commit 校验和 decode disagg loop。
+- `prefill.py` 命中 `create_sender`、`pending_bootstrap`、optimistic 回收与 bootstrap poll 处理。
 - `utils.py` 命中 metadata gate 和 staging 版 all-reduce poll，说明 Success 之前还有跨 rank 与 metadata 检查。
 - `pd_disaggregation_hook.py` 命中配置互斥入口，启动失败先回到这里看错误是否是显式禁止组合。
 

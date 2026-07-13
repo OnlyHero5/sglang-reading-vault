@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Advantage计算 · 排障指南
 
@@ -27,6 +27,10 @@ updated: 2026-07-10
 | `use_rollout_logprobs` 与 TIS 冲突 | 参数互斥 | `arguments.py` L1804-L1805 | 启动前去掉其中一个配置 |
 | `reinforce_plus_plus` 启动失败 | 必须 normalize advantages | `arguments.py` L1798-L1802 | 加 `--normalize-advantages` |
 | `rollout_top_p != 1.0` 缺字段 | top-p replay token ids/offsets 未记录 | `loss.py` L40-L51 | 检查 batch 是否含 `rollout_top_p_token_ids` |
+| 跳过 old-actor forward 后 advantage 阶段报 `NoneType` | 零 KL 没有 shape 模板 | `loss.py` L700-L704 | 检查 `rollout_log_probs/log_probs/values` 是否至少一个非空 |
+| baseline + OPD 后 returns 也变化 | `returns = advantages` list 别名 | `loss.py` L748-L765 | 比较 `advantages is returns`，再看 OPD 元素替换 |
+| mask 检查正常但 baseline 无效位也有 advantage | baseline helper 未使用 `loss_masks` | `ppo_utils.py` L441-L472 | 确认下游 reducer/whitening 才应用 mask |
+| whitening 偶发 NaN | `E[x²]-E[x]²` 舍入成负方差 | `distributed_utils.py` L132-L151 | 打印 global variance 与 finite 状态 |
 
 ## 为什么 advantage 要在 backward 前整批算完？
 
@@ -51,7 +55,7 @@ updated: 2026-07-10
 配置互斥由 arguments 校验：
 
 ```python
-# 来源：slime/utils/arguments.py L1804-L1815
+# 定位骨架（基于 `slime/utils/arguments.py` L1804-L1815；省略相邻校验）
 if args.use_rollout_logprobs:
     assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
@@ -62,6 +66,8 @@ if args.get_mismatch_metrics:
             "get_mismatch_metrics is set; For metrics calculation, the log probs will still be recomputed by training engine. One more forward pass will be applied."
         )
 ```
+
+还要拆开两种“复用”：`use_rollout_logprobs` 明确选择 rollout logprob；`can_reuse_log_probs_in_loss` 则跳过 aux forward，准备在 policy loss 当前 forward 内建立 old logprob。后者发生得太晚，advantage 已经先执行。零 KL 分支虽然会回退到 `rollout_log_probs`，但自定义 rollout 若没提供该字段且无 critic values，`xs` 为 `None`，会在创建零 tensor 时失败。复用条件本身没有检查这个前提。
 
 ## GRPO、GSPO、CISPO 为什么 advantage 一样？
 
@@ -76,7 +82,7 @@ if args.get_mismatch_metrics:
 CP 会把同一条 response 拆给多个 rank。KL 是 token 级项，每个本地 token 都有；环境 reward 是整条 response 的标量，只能落一次。当前实现把它加到 `cp_rank == 0` 的本地末 token。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L726-L735
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L726-L735；省略 estimator 外层）
 old_rewards = rewards
 rewards = []
 kl_coef = -args.kl_coef
@@ -102,7 +108,7 @@ for reward, k in zip(old_rewards, kl, strict=False):
 失败路径很直接：
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L641-L646
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L641-L646；省略函数上下文）
 if student_log_probs is None:
     return
 teacher_log_probs = rollout_data.get("teacher_log_probs")
@@ -131,7 +137,7 @@ torch.cat(advantages).shape, all_masks.shape, [a.shape for a in advantages]
 如果 `all_masks.numel() == 0`，代码会跳过 whitening；如果全局 mask sum 为 0，`distributed_masked_whiten` 会抛错。
 
 ```python
-# 来源：slime/utils/distributed_utils.py L119-L154
+# 定位骨架（基于 `slime/utils/distributed_utils.py` L119-L154；省略 docstring 与返回前上下文）
 local_sum = (values * mask).sum()
 local_sum_sq = ((values**2) * mask).sum()
 local_mask_sum = mask.sum()
@@ -157,13 +163,32 @@ if global_mask_sum.item() == 0:
 - OPD 仍会继续修改你写入的 `advantages`。
 - normalization 仍会继续处理你写入的 `advantages`。
 - 如果输出不是 `list[Tensor response_chunk]`，下游 policy loss 和 whitening 会出错。
+- 当前主函数和多个 helper 使用 `zip(strict=False)`；自定义 hook 应显式断言所有 sample 列等长、tensor shape 相等、没有 `None`，不要继承静默截断行为。
+
+## REINFORCE++ baseline 为什么会同时改 returns
+
+baseline 分支先令 `returns = advantages`，二者引用同一 list。OPD 后处理不是 tensor 原地减法，而是 `advantages[i] = adv - coef * reverse_kl`；这会替换共享 list 的元素，所以 returns 也改变。之后 whitening 创建新的 advantages list，returns 才与 advantages 分离。
+
+操作与预期：
+
+- baseline + OPD：预期写回的 returns 含 OPD penalty。
+- baseline + OPD + normalize：预期 advantages 是 whitened 新 list，returns 是 OPD 后未 whiten 的旧共享 list。
+- 其他 estimator：预期 OPD 不改变 returns。
+
+源码入口：来源：slime/backends/megatron_utils/loss.py L741-L790
+
+## whitening 为何 mask sum 非零仍可能 NaN
+
+`distributed_masked_whiten` 用全局 `sum/sum_sq/count` 计算 `global_var = E[x²]-E[x]²`，再做 Bessel 修正和 `rsqrt(global_var + epsilon)`。源码只拒绝 count=0，没有 clamp 负方差，也没有 finite 断言。浮点抵消导致轻微负值时仍可能得到 NaN。
+
+验证应记录 `global_mean/global_var/global_mask_sum`，并断言 whitened output finite；不能把“不抛 zero-mask”当作数值正确。
 
 ## top-p replay 缺字段怎么判断？
 
 当 `args.rollout_top_p != 1.0`，训练侧需要 top-p nucleus 的 token ids 和 offsets，否则无法重放 rollout 分布。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L40-L51
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L40-L51；省略函数签名）
 if args.rollout_top_p == 1.0:
     return {}
 top_p_token_ids = batch.get("rollout_top_p_token_ids")

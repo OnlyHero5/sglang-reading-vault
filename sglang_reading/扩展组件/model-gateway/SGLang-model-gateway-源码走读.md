@@ -9,11 +9,11 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # model-gateway · 源码走读
 
-> 走读顺序：`server.rs` 路由表 → handler 委托 → `RouterManager` → `RouterFactory` → `http/router.rs` 选 worker 与代理 → `WorkerRegistry` 索引 → policy / health / discovery。
+> 走读顺序：`server.rs` 路由表 → handler 委托 → `RouterManager` / `RouterFactory` → Regular HTTP 单 worker 路由 → HTTP PD 双 worker 路由 → `WorkerRegistry` / `Worker` 的健康、熔断与负载生命周期。
 
 ---
 
@@ -25,11 +25,10 @@ updated: 2026-07-10
 |----------|------|--------------|
 | 首次建立 gateway 主线 | 1 到 2 | endpoint 是协议门面，真正选 worker 的逻辑从 `RouterTrait` 后面开始 |
 | 排查请求为什么没到目标 worker | 3 到 4 | 先看 model id、healthy 候选、policy，再看代理重试、headers 和 streaming 生命周期 |
+| 理解 HTTP PD 为什么不是串行两跳 | 5 | 每次 attempt 重新选一对 worker、生成 room、并行双发；KV 不经过 Gateway |
 | 判断当前 router 形态 | 2、5 | `connection_mode × routing_mode` 决定 HTTP/gRPC、Regular/PD/OpenAI/IGW 的实现组合 |
-| 排查动态 worker 注册或摘除 | 1.3、3.2、5、8 | 控制面要同时更新 registry、hash ring、service discovery 和 manager 快照 |
-| 排查健康、flush、管理端点 | 6、10 | liveness 是进程级，worker health/load/cache 操作属于集群或 worker 级 |
-| 理解解析类 API 为什么不转发 | 7 | function-call/reasoning parser 是 gateway 本地辅助能力，不需要选 worker |
-| 读 policy 和 worker 扩展点 | 9 到 10 | policy 只在 healthy 候选中选，worker 抽象封装连接池、健康、熔断和负载信息 |
+| 排查动态 worker 注册或摘除 | 1.3、3.2、6 | 控制面要同时更新 registry、hash ring 和 RouterManager 可见拓扑 |
+| 排查健康、flush、管理端点 | 7 | liveness 是进程级，worker health/load/cache 操作属于集群或 worker 级 |
 
 读的时候保持两条线分开：数据面是“请求选 worker 并代理”，控制面是“worker 拓扑和健康状态如何更新”。两条线共享 `AppContext`，但职责不要混读。
 
@@ -109,7 +108,7 @@ async fn generate(
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/server.rs L413-L420
+// 来源：sgl-model-gateway/src/server.rs L413-L421
 async fn create_worker(
     State(state): State<Arc<AppState>>,
     Json(config): Json<WorkerConfigRequest>,
@@ -144,7 +143,7 @@ async fn create_worker(
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/factory.rs L23-L42
+// 来源：sgl-model-gateway/src/routers/factory.rs L23-L37
 pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
     match ctx.router_config.connection_mode {
         ConnectionMode::Grpc { .. } => match &ctx.router_config.mode {
@@ -181,7 +180,7 @@ pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/http/router.rs L69-L79
+// 来源：sgl-model-gateway/src/routers/http/router.rs L71-L80
 pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
     Ok(Router {
         worker_registry: ctx.worker_registry.clone(),
@@ -217,7 +216,7 @@ pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/http/router.rs L140-L191
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/router.rs L140-L191
 let workers = self.worker_registry.get_workers_filtered(
     effective_model_id,
     Some(WorkerType::Regular),
@@ -260,7 +259,7 @@ let policy = match model_id {
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/core/worker_registry.rs L50-L70
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/core/worker_registry.rs L50-L70
 impl HashRing {
     pub fn new(workers: &[Arc<dyn Worker>]) -> Self {
         let mut entries: Vec<(u64, Arc<str>)> =
@@ -289,6 +288,14 @@ impl HashRing {
 
 **要点：** 一致性哈希的设计目标不是“平均轮询”，而是“稳定地把相似请求黏在 cache 更可能命中的位置”。
 
+### 3.3 Registry 更新并不是事务式 upsert
+
+**问题与约束：** 动态注册看起来像“按 URL 更新 worker”，但主表、模型 snapshot、类型索引、连接索引和 hash ring 必须一起迁移，才能真正满足 upsert 语义。
+
+**当前实现：** 同 URL 注册会复用 existing `WorkerId` 并覆盖 `workers` 主表，随后仍把 worker/id 追加到模型、类型和连接索引；它没有先从旧索引移除旧 worker。因此重复注册或改变 model/type/connection 的更新可能留下重复项、旧项和重复 virtual nodes。`remove()` 会过滤 snapshot 并重建 ring，但最后一个 worker 被删除后仍可能留下 empty snapshot/ring key，外部 `get_models()` 因过滤空项而看不到这些内部残留。
+
+**读法：** 这里要区分“代码想维护的多索引不变量”与“当前基线实际保证的原子性”。生产控制面应优先 remove 后 register，或在上游修复为先清旧索引再追加；排障时则同时检查主表、model snapshot 与 hash ring，不能只看 URL 是否存在。
+
 ---
 
 ## 4. 请求代理要同时处理重试、指标与流式生命周期
@@ -304,33 +311,43 @@ impl HashRing {
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/http/router.rs L486-L548
-async fn send_typed_request<T: serde::Serialize>(
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/router.rs L194-L247
+pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
     &self,
     headers: Option<&HeaderMap>,
     typed_req: &T,
     route: &'static str,
-    worker: &Arc<dyn Worker>,
-    is_stream: bool,
-    load_guard: Option<WorkerLoadGuard>,
+    model_id: Option<&str>,
 ) -> Response {
-    let worker_url = worker.url();
-    let api_key = worker.api_key().clone();
+    let start = Instant::now();
+    let is_stream = typed_req.is_stream();
+    let text = typed_req.extract_text_for_routing();
+    let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+    let endpoint = route_to_endpoint(route);
 
-    const DP_RANK_KEY: &str = "data_parallel_rank";
-
-    let mut request_builder = if self.dp_aware {
-        let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
-            Ok(tup) => tup,
-            Err(e) => {
-                error!("Failed to extract dp_rank: {}", e);
+    let response = RetryExecutor::execute_response_with_retry(
+        &self.retry_config,
+        |_: u32| async {
+            let res = self
+                .route_typed_request_once(
+                    headers, typed_req, route, model_id, is_stream, &text,
+                )
+                .await;
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                res.status().as_u16(),
+                extract_error_code_from_response(&res),
+            );
+            res
+        },
+        |res, _attempt| is_retryable_status(res.status()),
 ```
 
-**代码逻辑：** 函数先记录请求上下文；retry executor 每次尝试调用 `route_typed_request_once`；外层负责根据 response status 记录成功、非重试错误或耗尽指标。
+**代码逻辑：** 函数先记录请求上下文；retry executor 每次尝试调用 `route_typed_request_once`，所以 worker 过滤与 policy 选择也会重新执行；外层再按 response status 记录成功、非重试错误或耗尽指标。
 
 **为什么这样写：** retry 必须包住“选 worker + send”而不是只包住 “send”，否则第一次选中的坏 worker 会在所有 retry 中重复被打。这里把选择放入 operation 闭包，给非 sticky policy 换 worker 的机会。
 
-**不变量与失败模式：** `typed_req` 要 `Clone`，因为 retry 可能多次使用同一请求；stream 请求的真实失败可能发生在 HTTP 200 之后，所以熔断记录不能只看初始状态码。
+**不变量与失败模式：** retry 只根据 attempt 返回的初始 HTTP status 决策。`RetryConfig.max_retries` 在实现中实际是总 attempt 上限：`3` 表示最多执行三次 operation。stream 请求若已经返回 2xx，后续 body error 不会重新进入这里；否则 Gateway 无法保证新 worker 的输出与已经发送的 token 前缀一致。
 
 **要点：** 这段体现 gateway 的生产取舍：请求代理不是裸转发，而是 metrics、retry、policy 重新选择的组合。
 
@@ -345,7 +362,7 @@ async fn send_typed_request<T: serde::Serialize>(
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/http/router.rs L82-L97
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/router.rs L82-L97
 fn select_first_worker(&self) -> Result<String, String> {
     let workers = self.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
@@ -381,29 +398,45 @@ async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Respons
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/http/router.rs L194-L223
-pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/router.rs L486-L548
+async fn send_typed_request<T: serde::Serialize>(
     &self,
     headers: Option<&HeaderMap>,
     typed_req: &T,
     route: &'static str,
-    model_id: Option<&str>,
+    worker: &Arc<dyn Worker>,
+    is_stream: bool,
+    load_guard: Option<WorkerLoadGuard>,
 ) -> Response {
-    let start = Instant::now();
-    let is_stream = typed_req.is_stream();
-    let text = typed_req.extract_text_for_routing();
-    let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-    let endpoint = route_to_endpoint(route);
+    let worker_url = worker.url();
+    let api_key = worker.api_key().clone();
+    const DP_RANK_KEY: &str = "data_parallel_rank";
 
-    let response = RetryExecutor::execute_response_with_retry(
-        &self.retry_config,
-        |_: u32| async {
-            let res = self
-                .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                .await;
+    let mut request_builder = if self.dp_aware {
+        let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
+            Ok(tup) => tup,
+            Err(e) => {
+                return error::internal_error(
+                    "dp_rank_extraction_failed",
+                    format!("Failed to extract dp_rank: {}", e),
+                );
+            }
+        };
+        let mut json_val = match serde_json::to_value(typed_req) {
+            Ok(j) => j,
+            Err(e) => {
+                return error::bad_request(
+                    "serialization_failed",
+                    format!("Convert into serde_json::Value failed: {}", e),
+                );
+            }
+        };
+        if let Some(map) = json_val.as_object_mut() {
+            map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
+        }
 ```
 
-**代码逻辑：** `send_typed_request` 拿到已选中的 worker；若 `dp_aware` 为真，先解析 worker URL 中的 DP rank，再把 rank 注入 JSON body 并发往 base URL。
+**代码逻辑：** `send_typed_request` 拿到已选中的 worker；若 `dp_aware` 为真，先解析 worker URL 中的 DP rank，再把 rank 注入 JSON body，并把请求发往不带 `@rank` 后缀的 base URL。
 
 **为什么这样写：** 让 DP-aware 仍复用 typed request/retry/metrics 主路径，避免单独开一套 endpoint。DP 只是 worker URL 和 JSON body 的代理细节。
 
@@ -422,7 +455,7 @@ pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/http/router.rs L613-L648
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/router.rs L613-L648
 } else {
     let mut response_headers = header_utils::preserve_response_headers(res.headers());
     response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -458,9 +491,157 @@ pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone
 
 ---
 
-## 5. RouterManager 把单路由和 IGW 统一成同一个 trait
+## 5. HTTP PD：一次 attempt 同时管理两台 worker
 
-### 5.1 `RouterManager` 结构：DashMap 注册，ArcSwap 快照读取
+Regular 路由的原子选择单位是一台 worker；HTTP PD 的原子选择单位是一对 `(prefill, decode)`。真正理解这段代码，需要同时追踪四本账：pair、room、两侧 HTTP result、decode stream terminal。
+
+### 5.1 每次 attempt 都重选 pair，并生成新的 room
+
+**问题与约束：** 选中时 worker 已通过 `is_available()` 过滤，但它仍可能在发送阶段发生 transport failure、返回可重试状态，或在选择后状态变化；下一次尝试不能沿用旧 pair 和旧 bootstrap room。
+
+**设计选择：** `execute_dual_dispatch` 把 `select_pd_pair`、请求序列化、bootstrap 注入和双发都放进 retry operation。原始 typed request 用 `Arc` 共享，但 room 是每个 attempt 新生成的。
+
+```rust
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/pd_router.rs L389-L430
+let response = RetryExecutor::execute_response_with_retry(
+    &self.retry_config,
+    {
+        move |attempt: u32| {
+            let shared_request = Arc::clone(&shared_request);
+            let context = context.clone();
+            async move {
+                let (prefill, decode) = match self
+                    .select_pd_pair(
+                        context.request_text.as_deref(),
+                        context.model_id,
+                        context.headers.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => return Self::handle_server_selection_error(e),
+                };
+
+                let mut json_request =
+                    match serde_json::to_value(shared_request.as_ref()) {
+                        Ok(v) => v,
+                        Err(e) => return Self::handle_serialization_error(e),
+                    };
+                json_request = match Self::inject_bootstrap_into_value(
+                    json_request,
+                    prefill.as_ref(),
+                    context.batch_size,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return Self::handle_serialization_error(e),
+                };
+```
+
+**不变量：** retry 是整对重放，不是只补发失败的一侧。调整 retry 次数会同时增加 prefill 计算、decode 占位和 KV transfer 成本。
+
+### 5.2 两侧 body 共享 room，但 DP rank 含义不同
+
+**问题与约束：** Prefill 和 Decode 必须对同一个 bootstrap room 达成一致；DP-aware 部署还要分别告诉两侧“自己在哪个 DP rank”，并告诉 Decode“Prefill 来自哪个 rank”。
+
+**设计选择：** 先向共享 JSON 注入 bootstrap host/port/room；`prepare_worker_request` 再调用各自 worker 的 `prepare_request` 注入自身 `data_parallel_rank`；最后只给 decode body 增加 `disagg_prefill_dp_rank`。
+
+```rust
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/pd_router.rs L349-L363
+async fn prepare_pd_worker_requests<'a>(
+    route: &'static str,
+    json_request: &'a Value,
+    prefill: &dyn Worker,
+    decode: &dyn Worker,
+) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+    let prefill_request =
+        Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+    let decode_json_request =
+        Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+    let decode_request =
+        Self::prepare_worker_request(route, decode, decode_json_request).await?;
+    Ok((prefill_request, decode_request))
+}
+```
+
+**不变量：** `data_parallel_rank` 是目标 worker 自身 rank；`disagg_prefill_dp_rank` 是 Decode 用来识别 Prefill 来源的 rank。二者不能互换。
+
+### 5.3 HTTP 双发并行，KV 不经过 Gateway
+
+**问题与约束：** Decode 要尽早接收 bootstrap metadata 并准备接收 KV；如果 Gateway 等 Prefill HTTP 完成后才发 Decode，会把两池重新串行化。
+
+**设计选择：** 两个 request builder 先完成，然后用 `tokio::join!` 同时 poll 两个 `send()` future。Gateway 只接收两侧 HTTP response；KV tensor 在 worker 间按 transfer backend 传输。
+
+```rust
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/pd_router.rs L681-L706
+let prefill_request = self.build_post_with_headers(
+    &self.client,
+    &prepared_prefill.endpoint_url,
+    &prepared_prefill.body,
+    headers,
+    false,
+);
+let decode_request = self.build_post_with_headers(
+    &self.client,
+    &prepared_decode.endpoint_url,
+    &prepared_decode.body,
+    headers,
+    false,
+);
+
+let (prefill_result, decode_result) =
+    tokio::join!(prefill_request.send(), decode_request.send());
+```
+
+**边界：** `join!` 只证明两次 HTTP send 并发，不证明两侧 GPU 计算互不依赖。Decode 仍要等待相同 room 的 KV/metadata 可用；而 Gateway 在拿到两侧 response 后，还会先完整消费 Prefill body，再构造或返回 Decode response，所以 Decode SSE 对客户端的可见时间仍受 Prefill body 门控。
+
+### 5.4 最终 response status 不能替代分侧 breaker 归因
+
+**问题与约束：** Decode transport failure 可以让客户端看到 502，但 Prefill 可能已经正常返回；若用最终 502 同时惩罚两台 worker，会错误打开健康 Prefill 的 breaker。
+
+**设计选择：** Decode transport failure、Decode non-2xx 等 decode 驱动分支会在内层分别 `record_outcome`，再给 response 插入 `BreakerOutcomesRecorded` marker，让外层跳过按最终 status 的统一归因。streaming Decode 则交给 `BreakerTrackedStream` 在 body 结束时记录。
+
+```rust
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/http/pd_router.rs L840-L872
+Err(e) => {
+    decode.record_outcome(false);
+    let prefill_ok = match &prefill_result {
+        Ok(res) => {
+            let s = res.status();
+            s.is_success() || s.is_client_error()
+        }
+        Err(_) => false,
+    };
+    prefill.record_outcome(prefill_ok);
+
+    let mut response = error::bad_gateway(
+        "decode_server_error",
+        format!("Decode server error: {}", e),
+    );
+    response.extensions_mut().insert(BreakerOutcomesRecorded);
+    response
+}
+```
+
+**已覆盖边界与缺口：** 客户端看到的是一次请求的最终响应；breaker 理想上应记录每台 worker 的真实责任，不能用同一个布尔值粗暴替代。当前闭环主要覆盖 decode 驱动错误。若 Decode 已取得成功 response，而 `process_prefill_response()` 随后失败，内层没有插 marker：外层可能按最终 Prefill error 粗粒度归因，非流式会把两侧都记失败，流式则可能只记 Prefill 且不再给 Decode 建 wrapper。pair 选中后的 request preparation 错误也可能走统一归因。因此本文不能把“分侧 breaker”写成所有组合都成立的保证。
+
+### 5.5 流式 2xx 是自动重试的终点
+
+`create_streaming_response` 在 Decode byte stream 外包 `BreakerTrackedStream`。HTTP PD 会检查 chunk 中的 `data: [DONE]`：先 `mark_completed()`，再把该 chunk 发给客户端，随后 break。因此它不会继续观察 `[DONE]` 后的 trailing error；客户端恰在该 chunk 上断开时也仍记 success。通用 HTTP router 不识别 `[DONE]`，只有底层 stream 返回 `None` 才算 completed。wrapper 的 `mark_completed()` 也不是吸收态：若调用后继续 poll 到 error，仍会升级为 Errored。客户端在没有 clean terminal 时主动断开则保持 Active，不记结果。
+
+这条边界解释了两个生产现象：
+
+- 日志里“router 初始成功”与“decode breaker 最终失败”可以同时成立。
+- 客户端恢复必须重新发起应用级请求；Gateway 不能证明另一台 worker 会生成完全相同的剩余 token。
+
+### 5.6 `get_server_info` 的注释与调用对象冲突
+
+`PDRouter::get_server_info` 的注释写“first decode server”，但实际调用 `proxy_to_first_prefill_worker("server_info", None)`。在这条基线上只能陈述“代码实际代理到 Prefill helper”，不能依据注释断言结果来自 Decode。若两池 server info 不同，这会直接影响运维判断，也值得作为上游待澄清点。
+
+---
+
+## 6. RouterManager 把单路由和 IGW 统一成同一个 trait
+
+### 6.1 `RouterManager` 结构：DashMap 注册，ArcSwap 快照读取
 
 **问题与约束：** IGW 模式下同一进程可能同时存在 HTTP Regular、HTTP PD、gRPC Regular、gRPC PD、OpenAI router；请求热路径要快速遍历可用 router，但注册阶段又需要动态添加。
 
@@ -471,7 +652,7 @@ pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/routers/router_manager.rs L62-L78
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/routers/router_manager.rs L62-L78
 pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
@@ -498,11 +679,15 @@ impl RouterManager {
 
 **要点：** RouterManager 是 gateway 的“路由路由器”：先选哪类 router，再由具体 router 选 worker。
 
+### 6.2 IGW 选的是下游能力，不是客户端协议
+
+客户端请求始终先进入 Axum HTTP handler。给定 model 时，`get_router_for_model` 遍历该模型的 worker，并按 external > gRPC PD > HTTP PD > gRPC Regular > HTTP Regular 评分；这里的 HTTP/gRPC 描述 Gateway 到 worker 的连接。没有 model 时才遍历 `routers_snapshot`，`x-prefer-pd` 只改变 PD/Regular 偏好，并结合全局 worker distribution 排除没有对应 worker 的模式。这个选择仍是粗粒度的 router 分类，具体 router 随后必须再做 model、type、connection、health 与 breaker 过滤。
+
 ---
 
-## 6. 健康与管理端点区分存活、就绪和集群操作
+## 7. 健康与管理端点区分存活、就绪和集群操作
 
-### 6.1 `liveness`：进程活着即可
+### 7.1 `liveness`：进程活着即可
 
 **问题与约束：** Kubernetes 等编排系统会区分 liveness 和 readiness。liveness 如果依赖 worker 状态，worker 故障可能导致 gateway 进程被误杀，放大故障。
 
@@ -520,7 +705,7 @@ impl RouterManager {
 
 **要点：** 读运维相关代码时要先看语义边界。这里的“少做事”是设计选择。
 
-### 6.2 `flush_cache`：集群级操作由 WorkerManager fan-out
+### 7.2 `flush_cache`：集群级操作由 WorkerManager fan-out
 
 **问题与约束：** Gateway 后面可能有多个 worker。对外一个 `/flush_cache` 请求需要变成对所有 backend 的清理操作，而不是只清理某个被选中的 worker。
 
@@ -549,153 +734,18 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
 
 ---
 
-## 7. 解析辅助 API 留在 gateway 进程内
+## 延伸阅读：不混入请求主链的控制面
 
-### 7.1 Function call / reasoning 解析：不经过 worker 选路
+以下能力重要，但不应塞进一次 generation request 的 walkthrough：
 
-**问题与约束：** tool call / reasoning 分离属于响应后处理能力，可能只依赖 parser 配置和模型 metadata；如果每次都转发给 worker，会把轻量解析绑定到 backend 可用性。
+| 能力 | 入口 | 应去哪里读 |
+|------|------|------------|
+| function-call / reasoning 本地解析 | `server.rs::parse_function_call`、`parse_reasoning` | 协议与 parser 专题 |
+| service discovery | `start_service_discovery` | Gateway 部署与 worker 生命周期文档 |
+| round-robin、cache-aware、consistent hash | `policies/` | [[SGLang-model-gateway-核心概念]] |
+| HTTP/gRPC 健康阈值、DP-aware worker、load guard | `core/worker.rs` | [[SGLang-model-gateway-数据流]]、[[SGLang-model-gateway-排障指南]] |
 
-**设计选择：** `parse_function_call` 和 `parse_reasoning` 直接调用 `parse` 模块，传入 `AppContext` 与请求体。
-
-**读法：** 这两个 endpoint 是 gateway 本地能力，不是 inference worker 代理。
-
-**源码锚点：**
-
-```rust
-// 来源：sgl-model-gateway/src/server.rs L80-L92
-async fn parse_function_call(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ParseFunctionCallRequest>,
-) -> Response {
-    parse::parse_function_call(&state.context, &req).await
-}
-
-async fn parse_reasoning(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SeparateReasoningRequest>,
-) -> Response {
-    parse::parse_reasoning(&state.context, &req).await
-}
-```
-
-**代码逻辑：** handler 只抽取 JSON 请求和 `AppContext`，然后交给本地 parser 模块异步处理。
-
-**为什么这样写：** 解析能力跟请求转发的扩缩容目标不同。本地化可以减少网络跳数，也让 Responses API 的后处理更容易复用 tokenizer/parser registry。
-
-**不变量与失败模式：** 本地解析必须能从 context 中找到足够的 parser / model 配置；如果 metadata 未初始化或模型不可识别，应返回解析错误，而不是误走 worker proxy。
-
-**要点：** 这类 endpoint 提醒读者：gateway 不只是 L7 proxy，也承载少量协议适配和后处理能力。
-
----
-
-## 8. Service Discovery 把拓扑刷新接入启动流程
-
-### 8.1 启动后挂接 discovery 任务
-
-**问题与约束：** 静态 worker 配置适合小集群，K8s/DNS 等动态环境需要后台发现和更新 worker；发现失败不能阻塞 gateway 基础启动。
-
-**设计选择：** `startup` 在构建 `AppState` 后检查 `service_discovery_config.enabled`，启动 discovery 任务并传入 `AppContext`、mesh state 和 mesh port；启动失败记录错误并继续运行。
-
-**读法：** 这段说明 service discovery 是可选后台拓扑来源，和手工 worker 管理 API 可以并存。
-
-**源码锚点：**
-
-```rust
-// 来源：sgl-model-gateway/src/server.rs L991-L1000
-if let Some(service_discovery_config) = config.service_discovery_config {
-    if service_discovery_config.enabled {
-        let app_context_arc = Arc::clone(&app_state.context);
-
-        match start_service_discovery(
-            service_discovery_config,
-            app_context_arc,
-            mesh_cluster_state,
-            mesh_port,
-        )
-```
-
-**代码逻辑：** 启动阶段拿到配置后克隆 `AppContext`，调用 `start_service_discovery`；成功则 spawn handle，失败只记录日志。
-
-**为什么这样写：** discovery 更新的是运行时拓扑，不是 HTTP 服务能否 bind 的前置条件。让 gateway 先启动，再通过后台任务补全 worker，有利于滚动部署和控制面恢复。
-
-**不变量与失败模式：** discovery 任务写入 registry 时仍必须触发索引与 hash ring 更新；如果 discovery 挂掉，静态 worker 和 REST 注册路径应仍能工作。
-
-**要点：** Service discovery 是 `WorkerRegistry` 的输入源之一，不改变请求路由主线。
-
----
-
-## 9. Policy 示例展示可插拔负载策略接口
-
-### 9.1 `RoundRobinPolicy`：只在 healthy 候选内轮询
-
-**问题与约束：** 最基础的负载均衡策略需要无共享锁、可并发调用，并且不能选中 unhealthy worker。
-
-**设计选择：** `RoundRobinPolicy` 只持有一个 `AtomicUsize` counter；每次从传入 worker 列表里计算 healthy indices，然后用 `fetch_add` 轮询。
-
-**读法：** Round robin 是最简单 policy，也能看出 policy 的边界：它只接收候选 worker 和 `SelectWorkerInfo`，不直接访问 registry。
-
-**源码锚点：**
-
-```rust
-// 来源：sgl-model-gateway/src/policies/round_robin.rs L31-L46
-async fn select_worker(
-    &self,
-    workers: &[Arc<dyn Worker>],
-    _info: &SelectWorkerInfo<'_>,
-) -> Option<usize> {
-    let healthy_indices = get_healthy_worker_indices(workers);
-
-    if healthy_indices.is_empty() {
-        return None;
-    }
-
-    // Get and increment counter atomically
-    let count = self.counter.fetch_add(1, Ordering::Relaxed);
-    let selected_idx = count % healthy_indices.len();
-
-    Some(healthy_indices[selected_idx])
-}
-```
-
-**代码逻辑：** 先构造 healthy worker 的 index 列表；空列表返回 `None`；否则原子递增 counter，取模得到本轮目标。
-
-**为什么这样写：** `Ordering::Relaxed` 足够满足“取一个近似递增计数”的需求，不需要跨线程建立额外内存顺序。policy 自身保持轻量，复杂状态留给更高级策略。
-
-**不变量与失败模式：** 返回 index 必须指向传入的 `workers` slice；如果上层已经过滤过 `is_available()`，这里再过滤 healthy 是防御性检查，但不会感知 circuit breaker。
-
-**要点：** policy 的设计目标是可替换。Round robin 不是生产最优，但它定义了其他策略应该遵守的接口形状。
-
----
-
-## 10. Worker 抽象封装连接池、健康、熔断和负载
-
-### 10.1 `WORKER_CLIENT`：共享 HTTP client 避免每请求建连
-
-**问题与约束：** Gateway 是高并发代理，如果每个 worker 请求都新建 HTTP client，会失去连接池复用并放大 TLS/TCP 开销。
-
-**设计选择：** worker 模块提供全局 `LazyLock<reqwest::Client>`，设置默认 30s 超时，按需懒初始化。
-
-**读法：** 这段不是路由逻辑，但体现了 worker 访问的基础性能假设：HTTP client 是可复用资源。
-
-**源码锚点：**
-
-```rust
-// 来源：sgl-model-gateway/src/core/worker.rs L35-L40
-static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
-        .build()
-        .expect("Failed to create worker HTTP client")
-});
-```
-
-**代码逻辑：** 第一次访问 `WORKER_CLIENT` 时构造 `reqwest::Client`，后续复用同一个 client；构造失败直接 panic。
-
-**为什么这样写：** HTTP client 内部有连接池和配置状态，适合长生命周期共享。默认 timeout 给 worker 请求一个上界，避免连接长期占用资源。
-
-**不变量与失败模式：** client 构造失败属于进程级配置/环境错误，无法在单请求层恢复；请求级失败则应通过 router 的 retry/error 路径处理。
-
-**要点：** worker 抽象的底层资源选择会影响整个 gateway 的吞吐和尾延迟。不要把它看成普通工具变量。
+把它们移出主线不是降低重要性，而是保持 walkthrough 的对象单一：本篇只追一次请求如何从 endpoint 进入、选 router/worker、完成 Regular 或 PD 转发，并在 response 生命周期结束时归还状态。
 
 ---
 
@@ -704,14 +754,14 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 维护本文时，先用下面的命令确认 gateway 主线还在原位：
 
 ```powershell
-rg -n "create_router|RouterManager|WorkerRegistry|RoundRobinPolicy|WORKER_CLIENT|service_discovery" sglang/sgl-model-gateway/src
+rg -n "create_router|route_typed_request_once|execute_dual_dispatch|tokio::join|BreakerOutcomesRecorded|BreakerTrackedStream|RouterManager|WorkerRegistry" sglang/sgl-model-gateway/src
 ```
 
 预期信号：
 
 - `routers/factory.rs` 仍能找到 router 创建入口。
+- `routers/http/pd_router.rs` 仍能找到每次 attempt 选 pair、bootstrap 注入、并行双发和分侧 breaker 归因。
 - `routers/router_manager.rs` 仍能找到单路由与 IGW 统一管理入口。
-- `core/worker_registry.rs`、`core/worker.rs`、`policies/round_robin.rs` 仍分别承载 worker 注册、HTTP client 复用和基础负载策略。
-- `server.rs` 或 `service_discovery.rs` 仍能找到 service discovery 启动与刷新路径。
+- `core/worker_registry.rs` 仍承载 model/type/connection 索引与 hash ring。
 
 如果其中某类命中消失，不要直接沿用本文结论；先回到对应模块确认职责是迁移、合并，还是被新的控制面替代。

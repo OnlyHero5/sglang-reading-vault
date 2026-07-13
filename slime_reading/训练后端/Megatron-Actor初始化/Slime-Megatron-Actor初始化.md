@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Megatron-Actor初始化
 
@@ -67,10 +67,10 @@ flowchart LR
 | 边界 | 结论 |
 |------|------|
 | [[Slime-RayTrainGroup]] | Ray 编排与 placement group 的上游入口在 Ray 专题；本专题从 train actor 被创建后开始 |
-| [[Slime-模型初始化]] | 模型 provider、DDP chunks、optimizer、scheduler、checkpoint load 的内部细节在 18 |
-| [[Slime-训练步骤]] | `train()` 如何消费 rollout data、算 logprob/advantage/loss 在 19 |
+| [[Slime-模型初始化]] | 模型 provider、DDP chunks、optimizer、scheduler、checkpoint load 的内部细节由该专题负责 |
+| [[Slime-训练步骤]] | `train()` 如何消费 rollout data、算 logprob/advantage/loss 由训练步骤专题负责 |
 | [[Slime-上下文并行与路由重放]] | CP/routing replay 依赖这里建好的 Megatron parallel state，但不是 init 主线 |
-| [[Slime-分布式权重同步]] | 本专题只讲 updater 选型；真正推权和连接 rollout engines 在 24 |
+| [[Slime-分布式权重同步]] | 本专题只讲 updater 选型；真正推权和连接 rollout engines 见权重同步专题 |
 
 ## 首次阅读抓手
 
@@ -81,6 +81,7 @@ flowchart LR
 - `initialize_model_and_optimizer` 返回 `loaded_rollout_id`，actor init 转成 `start_rollout_id = loaded_rollout_id + 1`。
 - actor 才有 `weights_backuper` 和 `weight_updater`；critic 提前返回，不向 SGLang 推权重。
 - `offload_train` 下 init 末尾会 `sleep()`，下一次 `train()` 或某些保存/推权路径再 `wake_up()`。
+- 上述 sleep/wake 是成功路径状态机；当前 init/train/save/update 缺少统一的失败回滚，异常后通常应销毁并重建 actor，而不是原地重试。
 
 ## 相关验证
 

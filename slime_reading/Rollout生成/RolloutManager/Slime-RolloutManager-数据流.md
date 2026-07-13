@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RolloutManager · 数据流
 
@@ -60,7 +60,7 @@ flowchart TD
 | `rollout_mask_sums` | 按 rollout_id 聚合 | 是 |
 | `total_lengths` | `len(tokens)` | 否，保留全局 |
 
-`raw_reward` 和 `total_lengths` 不按 rank 切，是因为训练侧可能要用全局 sample 下标做统计或反查。
+`raw_reward` 和 `total_lengths` 在 RolloutManager 侧不按 rank 切：训练进程先用全局 `total_lengths` 记录整批序列长度，再按 `partition` 切成本 rank 长度；`raw_reward` 保持整批口径供 pass@k 等日志。它们是“延迟处理的全局列”，不是普通 rank-local 样本列。
 
 ## rollout_id 的两层含义
 
@@ -100,6 +100,7 @@ flowchart LR
 - `loss_mask is None` 时默认全 1。
 - `remove_sample=True` 时样本保留，但 loss mask 全 0。
 - `rollout_mask_sums` 是同 rollout 所有 sibling 的 mask 总和。
+- 默认 reward normalization 只有在固定 fanout 且排列满足 reshape 假设时才按 prompt group 工作；可变 fanout fallback 实际对整批做全局中心化，应改用按 `group_index` 分组的 custom hook。
 
 ## DP schedule 的输入输出
 
@@ -122,6 +123,8 @@ flowchart LR
 | `global_batch_sizes` | 每个 step 的 rollout 数 |
 
 一个常见误解是把 `micro_batch_indices` 当作全局 sample 下标。它不是；它是 rank-local 下标。全局下标在 `partition` 里。
+
+两个调度边界：unique rollout 数不能整除 `global_batch_size` 时，尾部不足一整 step 的 rollout 会被丢弃；开启 `balance_by_flops` 时，FLOPs 分 bin 不保证 token cap，需单独监控实际 micro-batch token 数。
 
 ## Ray ObjectRef 包
 
@@ -154,6 +157,8 @@ class Box:
         return self._inner
 ```
 
+custom converter 若启用，会跳过默认列式化全过程；它必须自行提供 `_split_train_data_by_dp` 至少需要的 `tokens`、`rollout_ids`，并对希望传入训练侧的字段保持等长。当前没有集中 schema 校验。
+
 ## 与训练 actor 的连接
 
 训练 actor 初始化后会把并行配置写回 RolloutManager。之后每次 `async_train` 接收 `list[Box]`，各 rank 按自己的 DP rank 取对应 ObjectRef。
@@ -175,7 +180,7 @@ RolloutManager 还承担权重更新路由点：
 
 | 数据 | 用途 |
 |------|------|
-| `engines` | 可更新 policy server 的 node-0 engines |
+| `engines` | 第一个 `update_weights=True` server 的 node-0 engines |
 | `rollout_engine_lock` | 串行化更新，避免多 source rank 并发冲突 |
 | `gpu_counts/gpu_offsets` | 训练侧解释 engine 分片 |
 | `num_new_engines` | fault tolerance 后补同步新 engine |
@@ -191,6 +196,7 @@ RolloutManager 还承担权重更新路由点：
 - 每个 rank 的 `micro_batch_indices` 展平后覆盖本 rank 本地样本。
 - Tensor 字段在 CPU 且 contiguous。
 - ObjectRef 数量等于 `dp_size`。
+- 混合来源 batch 的可选字段不能只在部分 samples 出现；多数列由 `samples[0]` 决定是否启用。
 
 ## 运行验证
 

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Advantage计算 · 核心概念
 
@@ -72,7 +72,7 @@ flowchart LR
 源码证据：`loss.py` 的分派把 `grpo/gspo/cispo` 放在同一分支，PPO 单独需要 `values`，REINFORCE++ 两个变体再分支。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L720-L764
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L720-L764；压缩 estimator helper 参数）
 elif args.advantage_estimator in ["grpo", "gspo", "cispo"]:
     rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
     returns = get_grpo_returns(rewards, kl)
@@ -101,8 +101,10 @@ KL 在本专题有两种角色：
 
 `kl_coef == 0` 时仍构造零 KL，是为了保持 list 长度、dtype、device 与 response token 对齐。
 
+这里有一个隐藏前提：零 KL 的模板按 `log_probs or rollout_log_probs or values` 选择，没有退回 `loss_masks`。默认 SGLang rollout 会请求并保存 rollout log-prob，所以常见无 critic 路径仍有模板；自定义 rollout 若不产 `rollout_log_probs`，同时又命中“在 policy loss 内复用 logprob”的窄优化，就可能在 advantage 阶段以 `xs=None` 失败，尚未进入 policy loss。
+
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L700-L713
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L700-L713；省略外层上下文）
 if args.kl_coef == 0 or not log_probs:
     xs = log_probs or rollout_log_probs or values
     kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
@@ -121,7 +123,7 @@ rollout_data["kl"] = kl
 `compute_approx_kl` 本身只看两组 logprob，不关心 reward、mask 或 PPO。
 
 ```python
-# 来源：slime/utils/ppo_utils.py L11-L51
+# 定位骨架（基于 `slime/utils/ppo_utils.py` L11-L51；省略 docstring 与 importance-ratio 收尾）
 def compute_approx_kl(log_probs, log_probs_base, kl_loss_type, importance_ratio=None):
     log_ratio = log_probs.float() - log_probs_base.float()
     if kl_loss_type == "k1":
@@ -165,7 +167,7 @@ elif args.advantage_estimator == "ppo":
 OPD 的 teacher 信号不替代 GRPO/PPO/REINFORCE++。它在 estimator 产出 `advantages` 之后，把 `student_logp - teacher_logp` 作为 reverse KL 从 advantage 中扣掉。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L620-L658
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L620-L658；省略函数入口与 device 搬运）
 teacher_log_probs = rollout_data.get("teacher_log_probs")
 if teacher_log_probs is None:
     raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
@@ -179,12 +181,20 @@ rollout_data["opd_reverse_kl"] = reverse_kls
 
 所以 OPD 的排障顺序是：先确认 `teacher_log_probs` 是否存在，再确认长度是否和 `log_probs`、`response_lengths` 对齐。
 
+还要区分 estimator 的 list 所有权：
+
+- GRPO/GSPO/CISPO 用新 list 引用 returns tensor；PPO 与 REINFORCE++ 也分别持有 advantages/returns。
+- `reinforce_plus_plus_baseline` 直接执行 `returns = advantages`，两者是同一个 list。随后 OPD 用 `advantages[i] = ...` 替换元素时，returns 也同步变成 OPD-adjusted tensor。
+- normalization 随后把 `advantages` 重新绑定到 whitening 结果的新 list，不再改变 returns。
+
+因此“OPD 只改 advantages、不改 returns”只适用于 baseline 以外的当前分支。若算法希望 baseline returns 保留 OPD 前值，需要先复制 list，而不是共享别名。
+
 ## Normalize 是全 batch 统计
 
 `normalize_advantages` 不是 micro-batch 内局部标准化。它先把本 rank 的 advantage 拼起来，再用 DP group 做 masked whitening。CP 大于 1 时，`loss_masks` 还要按本 rank 拥有的 response token 切片，否则 advantage 与 mask 形状不一致。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L775-L825
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L775-L825；省略 CP mask 重建细节）
 if args.normalize_advantages:
     all_advs = torch.cat(advantages)
     cp_size = mpu.get_context_parallel_world_size()
@@ -204,6 +214,14 @@ if args.normalize_advantages:
         chunk_lengths = [chunk.size(0) for chunk in advantages]
         advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 ```
+
+数值边界：`distributed_masked_whiten` 用 `E[x²]-E[x]²` 算方差并做 Bessel 修正，没有把轻微负方差 clamp 到 0。大幅值、低方差或跨 rank 累加舍入时，应检查 `global_var` 与输出 finite，而不是只检查 mask sum 非零。
+
+## REINFORCE++ baseline 的 mask 参数并未在 helper 内消费
+
+`get_reinforce_plus_plus_baseline_advantages` 的签名接收 `loss_masks`，但函数体只按 `zip(kl, rewards, strict=False)` 计算 `reward - kl_coef * kl`。无效 token 最终仍会被 policy reducer 的 mask 排除，normalization 也使用 mask；只是不能声称 baseline helper 自己已经执行 masked advantage 构造。
+
+这还带来两个审计点：list 长度不一致会被 `strict=False` 截断，且 helper 本身不校验每个 KL tensor 与 mask shape。自定义 estimator 应主动使用 strict 校验或显式断言。
 
 ## 三个并行边界
 

@@ -24,16 +24,21 @@ updated: 2026-07-10
 - 能说明 FA3 为什么单独放在 `hopper/`。
 - 能说明 FA4 为什么引入 `flash_attn.cute` 和 CuTeDSL/JIT。
 
-## 先建立模型：同一问题的四种工程形态
+## 先建立模型：共享算法目标，发行与实现分叉
 
 ```mermaid
-flowchart LR
+flowchart TD
     STD["标准 attention<br/>S/P 落 HBM"]
-    FA1["FA1<br/>IO-aware exact attention"]
-    FA2["FA2<br/>主包 extension + specialization"]
-    FA3["FA3<br/>Hopper beta"]
-    FA4["FA4<br/>CuTeDSL / JIT"]
-    STD --> FA1 --> FA2 --> FA3 --> FA4
+    INV["共同不变量<br/>IO-aware exact attention + online softmax"]
+    FA1["FA1<br/>算法原点"]
+    FA2["FA2 主包<br/>CUDA / ROCm CK / ROCm Triton"]
+    FA3["FA3 独立包<br/>Hopper beta"]
+    FA4["FA4 独立发行<br/>CuTeDSL / JIT"]
+    STD --> INV
+    INV --> FA1
+    INV --> FA2
+    INV --> FA3
+    INV --> FA4
 ```
 
 把四代压成一句话：
@@ -41,9 +46,9 @@ flowchart LR
 | 代际 | 读法 |
 |------|------|
 | FA1 | 算法原点：tile + online softmax 证明 exact attention 不必长期保存完整 `P` |
-| FA2 | 工程主线：把算法原点做成 Python API、C++ 参数包、CUDA specialization 和训练/推理路径 |
+| FA2 | 主包工程线：统一 Python API，并按 CUDA compiled、ROCm CK、ROCm Triton/Aiter 选择 backend |
 | FA3 | 硬件主线：为 Hopper 的执行模型和 FP8 forward 单独组织 beta 包 |
-| FA4 | 维护主线：用 CuTeDSL/JIT 管理 Hopper/Blackwell 与复杂特性组合 |
+| FA4 | DSL/JIT 组织线：用 CuTeDSL 表达 Hopper/Blackwell kernel，并以 compile key/cache 管理实例 |
 
 ## 上游证据：README 的发布边界
 
@@ -73,7 +78,7 @@ Requirements: H100 / H800 GPU, CUDA >= 12.3.
 FA4 则是另一个边界：README 明确写它是 CuTeDSL，并面向 Hopper 与 Blackwell。
 
 ```markdown
-# 来源：README.md L80-L83
+# 来源：README.md L80-L82
 ## FlashAttention-4 (CuTeDSL)
 
 FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GPUs (e.g. H100, B200).
@@ -101,7 +106,7 @@ If the inputs have the same sequence lengths in the same batch, it is simpler
 and faster to use these functions:
 ```
 
-读者抓手：`varlen` 不是简单改名，它表示“变长 token layout 是一等输入形态”。这会影响 `cu_seqlens`、packed token、LSE shape 和 backward。
+读者抓手：changelog 直接证明 API 名称从 `unpadded` 迁到 `varlen`；当前源码又把 varlen 作为独立 public/custom-op/C++ 入口。两类证据合起来才支持“变长 layout 是一等输入形态”，不能只凭一次改名推断全部实现语义。
 
 ## FA2 中期：从训练扩展到 serving decode
 
@@ -119,7 +124,7 @@ bottom right corner of the attention matrix, instead of the top-left corner.
 
 读矩阵例子时抓住一个不变量：当 `seqlen_q != seqlen_k`，mask 不再按左上角解释，而是贴到 attention matrix 右下角。这个改变会直接影响 decode 与 cross-length 场景。
 
-2.2 把小 `seqlen_q` decode 的瓶颈说清楚：重点是快速加载 KV cache，并用额外 kernel combine split 结果。
+2.2 的历史发布说明把小 `seqlen_q` decode 的优化动机写成 KV-cache load，并引入多 thread-block split 与额外 combine kernel。
 
 ```markdown
 # 来源：README.md L450-L458
@@ -134,7 +139,7 @@ See the function `flash_attn_with_kvcache` with more features for inference
 (perform rotary embedding, updating KV cache inplace).
 ```
 
-2.5 到 2.7 继续把 paged KV、softcapping 和 `torch.compile` 兼容纳入主包。
+2.5 到 2.7 的 changelog 继续记录 paged KV、softcapping 和 `torch.compile` 兼容进入主包。
 
 ```markdown
 # 来源：README.md L475-L485
@@ -151,11 +156,11 @@ Thanks to @Narsil and @lucidrains for this contribution.
 ### 2.7: Compatibility with torch compile
 ```
 
-读者抓手：FA2 的演进不是“每版多一个开关”，而是逐步覆盖训练、推理、模型结构和 PyTorch 编译生态。
+读者抓手：这里是历史“引入能力”的证据，不是当前所有调用的执行保证。当前 KV-cache 还要区分 forced split kernel、aligned single-split 与真正 multi-split+combine；当前 compile 路径还要区分 PyTorch 2.4+ custom op/fake 与旧版普通 wrapper。
 
-## FA2 的工程形态：静态 specialization
+## FA2 CUDA compiled 路线：静态 specialization
 
-`setup.py` 里 `flash_attn_2_cuda` 的源码列表展示了 FA2 的核心工程取舍：把 head_dim、dtype、causal 等组合提前拆成多个编译单元，减少 kernel 内运行时分支。
+`setup.py` 里 CUDA 分支的 `flash_attn_2_cuda` 源码列表展示了该路线的工程取舍：把 head_dim、dtype、causal、standard/split/aligned split 等组合提前拆成编译单元，减少 kernel 内运行时分支。ROCm CK 使用另一组 C++/生成源码；ROCm Triton 由 Aiter 提供，不能用这张 CUDA 卡概括整个 FA2。
 
 ```python
 # 来源：setup.py L304-L330
@@ -192,7 +197,7 @@ Thanks to @Narsil and @lucidrains for this contribution.
 
 ## FA3：Hopper 专门路径
 
-FA3 的读法是“同一个 exact attention 问题，在 Hopper 硬件能力下重新组织”。它的重点不是 API 数量，而是 H100/H800、CUDA 版本、FP8 forward、TMA/GMMA 和 scheduler metadata。
+FA3 的读法是“同一个 exact attention 问题，在 Hopper 硬件能力下重新组织”。README 能直接证明 H100/H800、CUDA 版本、FP16/BF16 forward/backward 与 FP8 forward 的发布范围；TMA/GMMA、scheduler 等内部机制应在完整阅读 `hopper/` 源码后再判断。
 
 排障时要记住：FA3 README 要求单独进入 `hopper` 安装和测试，import 形态也是 `flash_attn_3`。因此它和 FA2 主包的安装、依赖、测试和路径边界不同。
 
@@ -207,7 +212,16 @@ FA4 的 README 把定位写得更窄：CuTeDSL-based implementation for Hopper a
 FlashAttention-4 is a CuTeDSL-based implementation of FlashAttention for Hopper and Blackwell GPUs.
 ```
 
-读者抓手：FA4 的新风险不是“softmax 公式换了”，而是 JIT 首次编译、compile key、cache 命中、shape bucketing、CUDA 版本和多进程 warmup。
+读者抓手：FA4 的新边界不是“softmax 公式换了”，而是 CuTeDSL 表达、按 GPU 世代选择实现、JIT compile key/cache 与 CUDA 工具链。首次编译成本、cache 命中和多进程行为必须用实际版本与 workload 验证，不能由目录名直接推断。
+
+## 静态验收
+
+```powershell
+rg -n 'FlashAttention-3 beta|FlashAttention-4|2.0: Complete rewrite|2.2: Optimize for inference|2.7: Compatibility' flash-attn/flash-attention/README.md
+rg -n 'BUILD_TARGET|ROCM_BACKEND|name="flash_attn_2_cuda"' flash-attn/flash-attention/setup.py
+```
+
+预期同时定位历史发布声明和当前 CUDA/ROCm 构建分叉。README 证明“何时声明引入”，setup/source 证明“当前如何落地”；两者不可互相替代。
 
 ## 复盘迁移
 

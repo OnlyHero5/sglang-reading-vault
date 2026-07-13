@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang-Engine · 学习检查
 
@@ -21,11 +21,11 @@ updated: 2026-07-10
 
 - [ ] 能画出 `RolloutManager`、`ServerGroup`、`SGLangEngine`、SGLang HTTP server、`sglang_router`、Megatron updater 的关系图。
 - [ ] 能沿一次启动复述：`start_rollout_servers` 解析配置、启动 router、创建 `ServerGroup`、分配端口、创建 Ray actor、调用 `engine.init.remote`、本地启动或外部校验、注册 router。
-- [ ] 能说明 `engines` 和 `all_engines` 的区别，以及为什么 node 0 actor 是 HTTP 控制面代表。
+- [ ] 能说明 managed 模式下 `engines` 和 `all_engines` 的 node-0/all-node 区别，也能解释 external 为何只是一地址一 adapter。
 - [ ] 能区分 `port`、`nccl_port`、`dist_init_addr` 端口、权重 update `master_port` 四种端口。
 - [ ] 能沿 distributed 权重更新复述：取 updatable engines、pause、flush、init update group、HTTP metadata、NCCL broadcast、continue。
 - [ ] 能解释 tensor、disk、disk delta 三条权重路径各自适合什么场景。
-- [ ] 能说出 external engine 模式保留了哪些 Slime 控制面，移走了哪些本地生命周期职责。
+- [ ] 能说出 external engine 模式保留了哪些 Slime 控制面，移走了哪些本地生命周期职责，并知道 `shutdown()` 连 router 注销也跳过。
 
 ---
 
@@ -38,6 +38,8 @@ updated: 2026-07-10
 | distributed update hang | `engine_gpu_counts`、`world_size`、`rank_offset`、`rollout_engine_lock` |
 | 某些 engine 用旧权重 | `num_new_engines` 是否触发 reconnect、`get_weight_version` 是否匹配 |
 | external 启动失败 | external address 格式、`/server_info`、`_init_external` sanity check |
+| init 永久 initializing | `_wait_server_healthy` 无总超时、GET 无 timeout、子进程活但不健康 |
+| 第二个多节点 external 不注册 | external 地址序号被复用为 rank，`rank % nnodes` 推成非 node 0 |
 | GPU 占错或 OOM | PG `reordered_gpu_ids`、`gpu_offset`、`base_gpu_id`、`CUDA_VISIBLE_DEVICES` |
 
 ---
@@ -45,11 +47,11 @@ updated: 2026-07-10
 ## 最小口试
 
 1. 为什么 `SGLangEngine` 不是 generate 数据面的核心？
-2. 为什么 Ray actor 只申请 `0.2` GPU，SGLang 却能使用完整 TP GPU？
+2. managed ServerGroup 中，为什么 Ray actor 只申请 `0.2` GPU，SGLang 却能使用完整 TP GPU？
 3. 多节点 engine 中，为什么非 node 0 actor 的 `_make_request` 可以直接返回？
 4. 为什么 distributed 权重更新要先发 HTTP metadata，再做 NCCL broadcast？
 5. disk delta 为什么需要 `all_engine_actors`，而不是只需要 `rollout_engines`？
-6. external engine 下 `shutdown` 为什么不能 kill 进程？
+6. external engine 下 `shutdown` 为什么既不 kill 进程，也不注销 router worker？
 
 ---
 
@@ -62,7 +64,9 @@ updated: 2026-07-10
 | update 前清流量 | SGLang `/v1/loads?include=core` | pause/abort 后 request 数降到 0 |
 | 权重版本 | `engine.get_weight_version.remote()` | 与 updater `weight_version` 字符串一致 |
 | distributed rank | 打印 `engine_gpu_counts` 和 `world_size` | `world_size = sum(engine_gpu_counts) + 1` |
-| external sanity | 外部 server `/server_info` | worker type、GPU 数、PD bootstrap 信息与 Slime 推导一致 |
+| external sanity | 外部 server `/server_info` | 只对实际 check-list 字段判等；并行尺寸、地址和 overrides 另行核对 |
+
+当前 CPU 环境可先跑 `tests/test_external_sglang_engines.py`：直接 collection 缺 `httpx`，只 stub 测试未使用的 client 类型后原测试 4 passed。健康无限等待、external shutdown、check-list 构造时序、flush timeout、skip fields 与 external rank/node-rank 复用的当前源码 AST 检查 6 项通过；这些静态/隔离证据不能替代真实 Ray actor、SGLang 子进程、router 和 NCCL 更新。
 
 ---
 
@@ -73,7 +77,9 @@ updated: 2026-07-10
 - [ ] 改多节点逻辑时，明确使用 `engines` 还是 `all_engines`。
 - [ ] 改 GPU 分配时，验证 PG GPU 槽位和 SGLang `base_gpu_id` 坐标一致。
 - [ ] 改 external engine 时，确认不会引入本地进程 kill、offload 或 recover 假设。
+- [ ] 改 external 清理时，明确 router worker 由谁注销，不能把 adapter 的空 `shutdown` 当成完成。
 - [ ] 改 flush/abort 逻辑时，提供 request 数降为 0 的可观测证据。
+- [ ] 改健康等待时，同时给单次 HTTP timeout、总 deadline 和失败后的进程/actor 清理策略。
 
 ---
 

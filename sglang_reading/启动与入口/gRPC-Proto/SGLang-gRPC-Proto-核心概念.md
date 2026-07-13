@@ -9,11 +9,11 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # gRPC-Proto · 核心概念
 
-gRPC/Proto 的核心不是“多了一套 API”，而是 SGLang 在 HTTP 之外提供了一座跨语言闸门：外部看到的是稳定 Proto；Rust 负责高并发 stream、bounded channel、Tonic 传输；Python 继续持有模型运行时和调度事实。
+gRPC/Proto 的核心不是“多了一套 API”，而是仓库同时存在两种不同成熟度的 gRPC 入口：当前 `--grpc-mode` 委托外部 `smg-grpc-servicer`；Native 实现则用 Proto/Tonic、PyO3 bridge 和 Python `RuntimeHandle` 组成跨语言闸门，但尚未接入默认 HTTP 启动链。下面的 Rust channel、tokenizer fast path 和 abort guard 都只描述 Native 实现。
 
 ## 读者任务
 
@@ -24,7 +24,7 @@ gRPC/Proto 的核心不是“多了一套 API”，而是 SGLang 在 HTTP 之外
 3. `--grpc-mode` 是当前可见启动路径，但它是 legacy wrapper，不等同于 Native Rust gRPC 已接入默认 HTTP 分支。
 4. backpressure、abort、sidecar 是 gRPC 入口真正容易出错的地方。
 
-## 三层协议闸门
+## Native 实现的三层协议闸门
 
 | 层 | 负责什么 | 不负责什么 |
 |----|----------|------------|
@@ -145,7 +145,7 @@ path = "../rust/sglang-grpc/Cargo.toml"
 binding = "PyO3"
 ```
 
-这说明 Native gRPC 的运行位置是 Python 进程内扩展，而不是另起一个完全独立的 Rust 服务。Rust 负责 Tonic 服务器和 channel；Python 仍提供 runtime handle。
+这说明 Native gRPC 的实现形态是 Python 进程内扩展，而不是另起一个完全独立的 Rust 服务。Rust 负责 Tonic 服务器和 channel；Python 仍提供 runtime handle。这里证明的是“扩展可以怎样启动”，不证明默认 HTTP 分支或 `--grpc-mode` 已经调用 `start_server`。
 
 ## 当前启动模式要分清
 
@@ -235,7 +235,23 @@ pub struct PyBridge {
 }
 ```
 
-如果读者只记住一个模型，就是：Python 是 producer，Rust channel 是缓冲池，gRPC client 是 consumer。consumer 慢时，Rust 用 `Pending` 暂停 producer，而不是让 Python 无限生产 chunk。
+如果读者只记住一个模型，就是：Python 是 producer，Rust channel 是缓冲池，gRPC client 是 consumer。channel 满时，bridge 允许一个 chunk 被 parked，并用 `Pending` 要求 Python 等待 on-ready；若 producer 不遵守契约、在 parked chunk 排空前再次发送，bridge 会以 `ChannelFull` 关闭 stream 并向 Python 传播 abort。它不是“队列一满就立即取消”，也不是无限缓存。
+
+## terminal 与 abort 不是同一个动作
+
+| 事件 | Native Rust 侧动作 | 是否还要 abort Python 请求 |
+|------|--------------------|----------------------------|
+| 收到 `ResponseChunk::Finished` | disarm guard，发送 `finished=true` | 不需要，请求已正常终止 |
+| 收到 Python error chunk | disarm guard，返回 gRPC internal error | Python producer 已进入错误终态 |
+| client drop / receiver closed | guard drop 或 `ClientDisconnected` | 需要，按 `rid` 传播 abort |
+| 等待 chunk 超时 | stream 返回 timeout | typed generate 会触发 abort；OpenAI backpressure timeout 还依赖 guard/channel 生命周期收尾 |
+| 显式 `Abort` RPC | 直接按请求参数调用 bridge/runtime | 与 client drop 是不同入口 |
+
+因此“stream 结束”和“取消 Scheduler 请求”不能混为一谈。正常 terminal 必须 disarm，异常丢弃才应保留或主动触发 abort。
+
+## 安全边界
+
+Native `run_grpc_server` 当前没有接入 HTTP 的 API-key/admin-key 校验，源码仍把认证列为待接入事项。这个结论只适用于本仓库的 Native Tonic listener；legacy `smg-grpc-servicer` 的完整认证行为需要按其实际版本另行审计，不能由本文推断。
 
 ## 复盘
 

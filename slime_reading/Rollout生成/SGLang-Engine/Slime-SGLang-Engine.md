@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # SGLang-Engine
 
@@ -82,10 +82,16 @@ flowchart LR
 ## 本专题先记住的五个判断
 
 1. Slime 的 generate 请求不是由 `SGLangEngine` 发起，本专题关注 engine 生命周期和控制面；generate 主线见 [[Slime-SGLang-Rollout]]。
-2. `RolloutServer.engines` 只返回每个多节点 engine 的 node 0 actor；`all_engines` 才包含每个节点上的 adapter。
-3. 本地模式会启动 SGLang 子进程；external 模式仍创建 Ray adapter，但只校验外部 HTTP server 并注册到 router。
+2. 本地 managed `RolloutServer.engines` 只返回每个多节点 engine 的 node 0 actor，`all_engines` 才含各节点 actor；external 模式通常是一地址一 adapter，二者不能按“外部 engine 的每个节点”解释。
+3. 本地模式会启动 SGLang 子进程；external 模式仍创建 Ray adapter，但只做有限字段校验并注册到 router。通用 `sglang_*` 透传与 YAML overrides 不在这份预先固定的检查集合中。
 4. 权重同步是双通道：names、dtypes、shapes 等 metadata 走 Ray + HTTP，tensor 数据走 NCCL、IPC 或磁盘。
-5. update 前的 `pause_generation` 和 `flush_cache` 是一致性闸门，不是性能优化开关。
+5. 每种 updater 都必须定义自己的更新隔离与提交协议；distributed 路径明确使用 pause/flush/continue，full disk 与 colocated tensor 也有相似控制段，但 delta、external 和混合拓扑的覆盖范围不同，不能概括成统一闸门。distributed `flush_cache` 的 60 次循环没有 HTTP timeout，也不能简单等同“最多 60 秒”。
+
+## 生命周期的两个非对称边界
+
+- 本地 node 0 健康等待没有总超时，也没有单次 request timeout；只要子进程仍存活但永远不健康，`engine.init` 可以无限等待。
+- external `shutdown()` 在函数入口直接返回：它既不杀外部进程，也不从 Slime 启动的 router 注销 worker。外部服务和 router 的收尾必须由更上层生命周期明确负责。
+- external 每个地址只创建一个 adapter，但把地址序号作为 `rank` 传给 `_compute_server_args`；若单个外部 engine 的 GPU 数跨多节点，`rank % nnodes` 可能把后续地址 adapter 算成非 node 0，从而跳过 router 注册与 `_make_request`。多 external × 多节点组合必须显式验收。
 
 ---
 
@@ -94,7 +100,7 @@ flowchart LR
 `start_rollout_servers` 先为每个模型启动 router，再按 `ServerGroup` 创建 engine；真正的 `engine.init.remote` 在 `ServerGroup.start_engines` 中发出，最终由调用方统一 `ray.get` 等待。
 
 ```python
-# 来源：slime/ray/rollout.py L1089-L1106
+# 定位骨架（据 `slime/ray/rollout.py` L1089-L1106 删节）：
 def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
     """Start rollout servers without waiting for final engine initialization.
 
@@ -132,6 +138,8 @@ init_handles = [
 | router 是否接入 | router `/workers` 或日志 `Router launched` | 每个 node 0 worker 都有 URL，encoder 不注册到 router |
 | 权重更新是否推进 | 日志 `Update weights`、`pause_generation`、`continue_generation` | pause/flush 在 broadcast 或 reload 前后成对出现 |
 | 版本是否一致 | CI 路径中的 `get_weight_version` | engine version 等于 updater `weight_version` |
+
+当前轻量证据：empty colocated bucket 测试 2 passed；external discovery 测试直接 collection 缺 `httpx`，最小 stub 后原测试 4 passed。当前源码的 6 项 AST 检查同时钉住健康等待无 timeout、external shutdown 不清 router、有限 sanity check、flush 非 60 秒硬上限、topology skip fields，以及 external 地址 rank/node-rank 复用风险。真实启动与权重同步仍需 Ray/SGLang/GPU 环境。
 
 ---
 

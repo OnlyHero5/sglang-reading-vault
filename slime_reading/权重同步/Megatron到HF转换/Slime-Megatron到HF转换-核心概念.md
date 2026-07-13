@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Megatron到HF转换 · 核心概念
 
@@ -80,7 +80,7 @@ def save_hf_model_to_path(
 `load_checkpoint` 先确认目录存在且非空，再根据 Megatron 标记分流。它不读完整权重文件，只看 tracker 文件或 `iter_0000000` 目录名。
 
 ```python
-# 来源：slime/backends/megatron_utils/checkpoint.py L97-L126
+# 定位骨架（基于 `slime/backends/megatron_utils/checkpoint.py` L97-L126；省略两个 loader 的部分实参）
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     args = get_args()
     load_path = args.load
@@ -113,12 +113,18 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 
 不变量：HF 目录不要命名成 `iter_0000001` 这类 Megatron 迭代目录；Megatron 根目录要保留 `latest_checkpointed_iteration.txt`。
 
+这是一个“便宜的名称分类器”，不是 checkpoint 内容鉴定器。因此它有三个边界：
+
+- 非空 HF 目录如果 basename 恰好是 `iter_` 加 7 位数字，会被当成 Megatron checkpoint。
+- `_is_dir_nonempty` 直接调用 `os.scandir`；`--load` 若是普通文件，或目录无权访问，会在路径扫描处抛异常，而不是统一落入断言文案。
+- 直接指向 Megatron `iter_XXXXXXX` 子目录可以命中；指向根目录则依赖 tracker 文件。
+
 ## HF 加载只是权重初始化
 
 HF 目录没有 Megatron optimizer、scheduler、RNG 和 iteration 状态，所以 `_load_checkpoint_hf` 返回 iteration 0。半精度训练下，如果 optimizer 已存在，还要刷新 master params。
 
 ```python
-# 来源：slime/backends/megatron_utils/checkpoint.py L129-L152
+# 定位骨架（基于 `slime/backends/megatron_utils/checkpoint.py` L129-L152；省略 upstream 注释）
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
@@ -144,12 +150,16 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
 
 读者抓手：如果你想恢复训练进度，用 Megatron checkpoint；如果你只想从 HF 权重点火，用 bridge 模式加载 HF 目录。
 
+还要看到函数签名之间的不对称：统一入口收到了 `opt_param_scheduler`、`checkpointing_context` 和 `skip_load_to_model_and_opt`，HF 分支却只传递 model、optimizer、args 和 path。这意味着 HF 分支不尊重 `skip_load_to_model_and_opt`，也不恢复 scheduler 或 checkpoint context。`optimizer.reload_model_params()` 只是在 fp16/bf16 且 optimizer 已存在时，把已灌入的模型参数同步到 optimizer 主参数；它不等于恢复 optimizer state。
+
+`AutoBridge.from_hf_pretrained(..., trust_remote_code=True)` 会允许本地 HF 仓库中的自定义 Python 代码被加载。所以 `--load` 和 `--hf-checkpoint` 应当视为可信代码边界，不只是数据路径。
+
 ## raw 转换的三步
 
 raw 模式把每个 Megatron 参数先裁掉 vocab padding，再按模型族转换命名和形状，最后做量化后处理。
 
 ```python
-# 来源：slime/backends/megatron_utils/megatron_to_hf/__init__.py L25-L66
+# 定位骨架（基于 `slime/backends/megatron_utils/megatron_to_hf/__init__.py` L25-L66；只展示路由前半段）
 def convert_to_hf(args, model_name, name, param, quantization_config=None):
     param = remove_padding(name, param, args.vocab_size)
 
@@ -179,7 +189,7 @@ def _convert_to_hf_core(args, model_name, name, param):
 Megatron 侧把 Q/K/V 融合成 `linear_qkv`，HF Qwen2 需要 `q_proj`、`k_proj`、`v_proj`。GQA 下 Q 的数量和 K/V 数量不同，所以 converter 先按 query group reshape，再按 `[Q, K, V]` 语义拆分。
 
 ```python
-# 来源：slime/backends/megatron_utils/megatron_to_hf/qwen2.py L5-L36
+# 定位骨架（基于 `slime/backends/megatron_utils/megatron_to_hf/qwen2.py` L5-L36；截至 QKV split）
 def convert_qwen2_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
@@ -208,7 +218,7 @@ def convert_qwen2_to_hf(args, name, param):
 同一文件还处理 QKV bias、SwiGLU `gate/up` 拆分、norm 改名，并在未知参数名时直接失败。
 
 ```python
-# 来源：slime/backends/megatron_utils/megatron_to_hf/qwen2.py L37-L71
+# 定位骨架（基于 `slime/backends/megatron_utils/megatron_to_hf/qwen2.py` L37-L71；省略后续 norm 分支）
         elif rest == "self_attention.linear_qkv.bias":
             param = param.view(args.num_query_groups, -1)
             q_bias, k_bias, v_bias = torch.split(
@@ -233,3 +243,11 @@ def convert_qwen2_to_hf(args, name, param):
 ```
 
 读者抓手：新增模型族时，先找 fused 参数和 HF 目标命名是否一一对应，再决定是拆分、拼接、转置还是直接改名。
+
+## 不要被“导出成功”四个字骗了
+
+raw saver 是直接在最终输出目录中清旧权重、复制资产、写临时 shard、逐个 `os.replace` 重命名，最后写 index。它没有“整目录 staging → 原子 rename”事务。中途失败时，最终目录可能同时存在新资产、已重命名 shard、未重命名 shard，或缺失 index。
+
+`_copy_hf_assets` 只遍历模板目录顶层的普通文件：子目录不递归复制，目录 symlink 也不会作为文件资产处理。输出目录与模板目录只检查 resolve 后“完全相等”，没防止二者是父子目录；部署时应把模板与输出放到相互独立的目录树。
+
+Qwen2 converter 使用整数除法计算 `num_attention_heads // num_query_groups`，没有先显式断言整除。配置错误通常会在 `view`/`split` 处以 shape 异常暴露，因此排查时应先验证 GQA 算术契约，不要只盯最后一条 PyTorch 报错。

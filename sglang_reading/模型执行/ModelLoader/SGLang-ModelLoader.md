@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ModelLoader
 
@@ -20,7 +20,7 @@ updated: 2026-07-10
 1. `ServerArgs.load_format` 如何被编译成 `LoadConfig`。
 2. `get_model_loader` 为什么有很多分叉，但普通 HF checkpoint 最终落到 `DefaultModelLoader`。
 3. `DefaultModelLoader` 为什么用 iterator 逐个 yield `(name, tensor)`，而不是一次性读完整模型。
-4. TP 切片为什么发生在参数自己的 `weight_loader`，不是文件选择阶段。
+4. 典型 HF 全量 tensor 为什么在参数协议里切 TP，以及 presharded、BitsAndBytes、ShardedState、remote/direct 路径为何不遵守这条简化。
 5. 量化、GGUF、remote instance、layered load、dummy load 分别改变哪一段主线。
 
 ## 首次阅读路径
@@ -43,9 +43,13 @@ flowchart LR
   C --> D[DefaultModelLoader 或特殊 loader]
   D --> E[checkpoint files]
   E --> F[weight iterator]
-  F --> G[model.load_weights]
-  G --> H[param.weight_loader]
-  H --> I[this TP rank parameter]
+  F --> G{写入协议}
+  G --> H[model.load_weights<br/>名字映射/融合]
+  H --> I[param.weight_loader<br/>典型全量 tensor 切片]
+  G --> J[rank-local iterator / state_dict<br/>direct copy / address transfer]
+  I --> K[this rank parameter]
+  J --> K
+  K --> L[quant process + model post-load fixup]
 ```
 
 这条线里有三本账：
@@ -54,7 +58,8 @@ flowchart LR
 |------|----------|----------|
 | 配置账 | `LoadConfig` | 记录格式、下载目录、TP rank、remote backend、ModelOpt、draft model |
 | 文件账 | `_prepare_weights` / `_get_weights_iterator` | 找到哪些 shard，选 safetensors/PT/NPCACHE，决定 mmap、多线程、prefetch |
-| 参数账 | `model.load_weights` / `param.weight_loader` | 名字 remap、跳过无用 tensor、融合 QKV、TP narrow、shape 校验、copy |
+| 写入账 | model/parameter loader、state dict、remote transfer | 名字 remap、融合、rank 选择、direct copy、地址传输与 shape 校验 |
+| 完成账 | quant process、`post_load_weights` | 把已填参数变成可执行 layout，并执行模型级加载后修补 |
 
 ## 核心源码证据
 
@@ -124,7 +129,7 @@ ModelRunner 在启动时把 server args 编译成 `LoadConfig`，然后在权重
 | `python/sglang/srt/model_loader/loader.py` | loader factory、默认 loader、特殊 loader、量化后处理 |
 | `python/sglang/srt/model_loader/weight_utils.py` | HF 下载、safetensors/PT iterator、prefetch、量化配置 |
 | `python/sglang/srt/models/llama.py` | 典型模型类如何按 name 灌权重 |
-| `python/sglang/srt/layers/linear.py` | TP rank narrow 和参数 copy 的真正位置 |
+| `python/sglang/srt/layers/linear.py` | 典型参数切片、presharded/quant/GGUF 例外与最终 copy |
 
 ## 与相邻专题的关系
 
@@ -139,6 +144,8 @@ ModelRunner 在启动时把 server args 编译成 `LoadConfig`，然后在权重
 ## 读完后的判断标准
 
 - 看到 `Cannot find any model weights`，知道先查 `_prepare_weights` 的 allow patterns 和路径。
-- 看到某个 rank OOM，知道 loader iterator 不等于 TP 分片，真正切片要看 `param.weight_loader`。
+- 看到某个 rank OOM，先判断当前路线读的是全量 tensor、rank-local shard 还是预切片量化 tensor，再定位 iterator、parameter loader 或 direct-copy 阶段。
 - 看到 shape mismatch，知道先追 `model.load_weights` 的名字 remap，再追 `RowParallelLinear` 或 QKV loader。
-- 看到量化加载后输出异常，知道要看 `quant_method.process_weights_after_loading` 和 KV scale 处理。
+- 看到量化加载后输出异常，知道区分量化 module process、模型 `post_load_weights` 与 KV scale 三类完成动作。
+
+基线心智模型适用于 `DefaultModelLoader + 普通 HF checkpoint`，不是所有 loader 的共同内部实现。ModelLoader 真正统一的是输入配置与最终交付 `nn.Module`，中间可以走 generator、rank-local state dict、量化 iterator、NCCL broadcast 或按地址 RDMA。

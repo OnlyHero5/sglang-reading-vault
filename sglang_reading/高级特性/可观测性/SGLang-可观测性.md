@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 可观测性
 
@@ -47,7 +47,7 @@ flowchart TB
 | 责任 | 源码入口 |
 |------|----------|
 | CLI 开关、bucket、label 配置 | `python/sglang/srt/server_args.py` |
-| `/metrics` 暴露、HTTP response middleware | `python/sglang/srt/utils/common.py`、`python/sglang/srt/entrypoints/http_server.py` |
+| `/metrics` 暴露、HTTP response middleware | `python/sglang/srt/utils/common.py`、`python/sglang/srt/entrypoints/http_server.py`、`python/sglang/srt/entrypoints/grpc_server.py` |
 | Scheduler aggregate stats | `python/sglang/srt/managers/scheduler.py`、`python/sglang/srt/managers/scheduler_components/metrics_reporter.py` |
 | Prometheus collector 类 | `python/sglang/srt/observability/metrics_collector.py` |
 | 单请求时间账与 trace 切片 | `python/sglang/srt/observability/req_time_stats.py`、`python/sglang/srt/observability/trace.py` |
@@ -83,7 +83,7 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 ```
 
-所以排障时第一步不是问“哪个指标没写”，而是确认 scrape 入口是否存在、Prometheus multiprocess 目录是否在 import 前设置、相关 worker 是否真的写入了指标。
+所以排障时第一步不是问“哪个指标没写”，而是确认 scrape 入口是否存在、Prometheus multiprocess 目录是否在 import 前设置、相关 worker 是否真的写入了指标。还要先分清服务模式：HTTP 模式由 FastAPI 挂载 ASGI `/metrics`；gRPC 模式由独立 aiohttp sidecar 暴露 `/metrics`，端口和依赖兼容性都是额外故障面。
 
 ## 阅读顺序
 

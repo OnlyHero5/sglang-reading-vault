@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 其他Rollout路径 · 源码走读
 
@@ -136,7 +136,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
 设计选择：模块级 `_global_worker` 被锁保护；首次调用或线程死亡时创建 `AsyncRolloutWorker`，并用 `atexit` 做兜底停止。
 
 ```python
-# 来源：slime/rollout/fully_async_rollout.py L48-L73
+# 定位骨架（非逐行摘录）：slime/rollout/fully_async_rollout.py L48-L73
 # Global worker, shared across rollout calls so the queue stays warm.
 _global_worker: AsyncRolloutWorker | None = None
 _worker_lock = threading.Lock()
@@ -167,7 +167,7 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
 设计选择：worker 在 daemon thread 里 `asyncio.run(self._loop())`，完成 group 进入 `queue.Queue`。
 
 ```python
-# 来源：slime/rollout/fully_async_rollout.py L76-L111
+# 定位骨架（非逐行摘录）：slime/rollout/fully_async_rollout.py L76-L111
 class AsyncRolloutWorker:
     """Background thread + asyncio loop that continuously consumes groups
     from ``data_buffer`` and runs :func:`generate_and_rm_group` on each."""
@@ -199,6 +199,8 @@ class AsyncRolloutWorker:
 - `output_queue` 只是完成队列，不是 dynamic filter。
 - worker stop 只等线程 join，不负责训练语义上的 flush。
 - 如果后台 task 崩溃，只记录日志并继续，调用方可能表现为队列长期不增长。
+- `stop()` 只 join 5 秒，而 `_loop` 退出后允许 active tasks 再等 30 秒；调用方可把全局引用清空时旧 daemon thread 仍活着，形成短暂 orphan worker。
+- done callback 使用有界队列的阻塞 `put`；队列达到 1000 且前台未 drain 时，callback 会阻塞后台 event-loop 线程。
 
 ## 步骤五：worker 持续 top-up，不等 rollout step
 
@@ -207,7 +209,7 @@ class AsyncRolloutWorker:
 设计选择：`_loop` 持续清理 done tasks，再从 DataSource 每次取一个 group 补到 `max_concurrent`。
 
 ```python
-# 来源：slime/rollout/fully_async_rollout.py L118-L152
+# 定位骨架（非逐行摘录）：slime/rollout/fully_async_rollout.py L118-L152
     async def _loop(self) -> None:
         active_tasks: set[asyncio.Task] = set()
         max_concurrent = self.concurrency
@@ -243,7 +245,7 @@ class AsyncRolloutWorker:
                         )
 ```
 
-这段证明 fully-async 仍复用默认 `generate_and_rm_group`：custom generate、sample RM、group RM 还在同一条内层链路里。
+这段证明 fully-async 仍复用默认 `generate_and_rm_group`：custom generate、sample RM、group RM 还在同一条内层链路里。但“复用内层函数”不等于复用默认外层控制面；dynamic filter、drop metrics、all-samples hook、最大补样策略都没有进入这条 worker loop。并发若因 engine 数为 0 算成 0，top-up 永远不创建 task，前台也没有 deadline。
 
 ## 步骤六：ABORTED group 回灌，不进训练
 
@@ -278,6 +280,8 @@ class AsyncRolloutWorker:
 
 不变量：fully-async 的回灌逻辑和默认 `sglang_rollout.abort` 的 partial 收集不是同一个路径。这里是 worker callback 级别的 ABORTED 重入队。
 
+失败语义要说得更严谨：task 抛异常、结果不是 list、`add_samples` 抛异常时，原 group 都没有可靠回收；日志是诊断证据，不是交付保证。
+
 ## 步骤七：rollout function 只 drain 到目标数量
 
 系统压力：外部 RolloutManager 仍希望一次调用返回一个训练 batch。
@@ -285,7 +289,7 @@ class AsyncRolloutWorker:
 设计选择：`_generate_rollout_async` 从 worker output queue drain group，直到收集到 `rollout_batch_size`，再按 `sample.index` 排序后返回。
 
 ```python
-# 来源：slime/rollout/fully_async_rollout.py L194-L256
+# 定位骨架（非逐行摘录）：slime/rollout/fully_async_rollout.py L194-L256
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[list[Sample]]:
     assert args.rollout_global_dataset
     worker = _get_global_worker(args, data_buffer)
@@ -324,7 +328,7 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
     return run(_generate_rollout_async(args, rollout_id, data_buffer))
 ```
 
-失败边界：如果 DataSource 枯竭或 worker task 全部报错，调用会一直等队列；排障时看 `fully-async rollout <id>: collected` 日志和 worker crash warning。
+失败边界：如果 DataSource 枯竭、并发为 0 或 worker task 全部报错，调用会一直等队列；排障时看 `fully-async rollout <id>: collected` 日志和 worker crash warning。还有一个更隐蔽的数据丢失点：`get_completed_groups()` 每次把队列全部取空，若一次 drain 后 `collected` 超过 target，末尾 `[:target]` 只返回目标数量，多出的 group 不会放回队列，下一 step 永久看不到它们。
 
 ## 对照一：streaming 只替换内层 `/generate`
 
@@ -358,7 +362,7 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
 ```
 
 ```python
-# 来源：slime/rollout/sglang_streaming_rollout.py L136-L165
+# 定位骨架（非逐行摘录）：slime/rollout/sglang_streaming_rollout.py L136-L165
                 # Surface partial state on the sample immediately. If the
                 # outer abort path cuts us, whatever we've written so far is
                 # what survives — no /abort_request round-trip needed.
@@ -384,6 +388,8 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
 ```
 
 读者抓手：streaming 的正确性仍然落在 `Sample.append_response_tokens`，不是落在 SSE 本身。
+
+它同时依赖两个 wire-level 前提：chunk 是本次调用的累计输出，且 `meta_info.output_token_logprobs` 与 text 同步出现。前者被 incremental streaming 破坏；后者缺失时 `call_tokens=[]`、`call_text` 却可能增长，Sample 的文本、token、response length 会失去同一性。
 
 ## 对照二：SFT rollout 直接填训练字段
 
@@ -424,6 +430,8 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         sample.reward = 0
         sample.loss_mask = loss_mask[-response_length:]
 ```
+
+这里必须补一个零长度门禁：当 `response_length=0` 时，`[-0:]` 返回完整 mask。当前 Gemma4 测试只覆盖含 assistant answer 的正长度输入，没有覆盖纯 user/system 样本。
 
 ## 对照三：OPD 把 teacher logprob 接入训练
 
@@ -476,6 +484,8 @@ async def reward_func(args, sample, **kwargs):
     return scalar_rewards, scalar_rewards
 ```
 
+当前后处理没有验证 `len(teacher_log_probs)==response_length`；`response_length=0` 又会因 `[-0:]` 保留整段输入 logprob。teacher 响应 schema、首 token `[1:]` 约定和长度对齐都属于插件调用方必须验证的契约。
+
 ## 对照四：forge load 保留服务栈但样本来自磁盘
 
 系统压力：长上下文显存测试需要 SGLang server、router、权重更新、offload/onload 都启动，但不想被实时生成质量和耗时干扰。
@@ -483,7 +493,7 @@ async def reward_func(args, sample, **kwargs):
 设计选择：rollout function 从 `.pt` dump 反序列化 Sample；train path 缺当前 rollout 文件时可 fallback 到 `0.pt`；eval 没有训练 fallback。
 
 ```python
-# 来源：slime/rollout/forge_load.py L52-L67
+# 定位骨架（非逐行摘录）：slime/rollout/forge_load.py L52-L67
     if evaluation and "{rollout_id}" not in tpl:
         return None
     rid_str = ("eval_" if evaluation else "") + str(rollout_id)
@@ -522,6 +532,8 @@ async def reward_func(args, sample, **kwargs):
 ```
 
 这段有一个文档写作上的反直觉点：不要把 forge load 解释成 debug data 的同义词。它的价值恰恰是“不跳过 serving 生命周期”。
+
+补充两个数据边界：`.pt` 使用 `torch.load(..., weights_only=False)`，只能加载可信 dump；空 `samples` 会在 RolloutManager 后续读取 `data[0]` 时失败。literal path 的 eval 则无条件返回空结果，不会复用同一个训练 dump。
 
 ## 运行验证
 

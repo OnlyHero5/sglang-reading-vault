@@ -9,160 +9,190 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 多模态 · 排障指南
 
 ## 你为什么要读
 
-多模态报错经常离根因很远：模型 forward 报 shape mismatch，问题可能早在 processor 选择、placeholder 展开或 `grid_thw` 对齐时就出现。本文按“架构注册、媒体处理、token 对齐、特征搬运、模型执行”逐层缩小范围。
+多模态故障的报错点经常晚于根因。最有效的办法不是从 CUDA 栈向上猜，而是逐站检查四个不变量：媒体数量、prompt 顺序、placeholder span、feature/embedding 身份。
 
-## Q1：如何为新 VLM 添加 Processor？
+## 先做五分钟分层
 
-**读法：** 新建 `processors/my_vl.py`，继承 `BaseMultimodalProcessor`，声明 `models = [MyVLForConditionalGeneration]`，实现 `process()`。启动时自动 `import_processors` 注册。
+| 现象 | 第一入口 | 先确认 |
+|---|---|---|
+| 启动时报 unsupported processor/model | `multimodal_processor.py`、`server_args.py` | 架构名、model backend、encoder disaggregation 支持表 |
+| 下载/解码失败 | 模型专用 processor、媒体 loader | URL/Base64、格式、超时、像素/帧预算 |
+| shape、grid、position mismatch | `base_processor.py`、`qwen_vl.py` | 占位符顺序、grid、offset、展开 token 数 |
+| Scheduler 反序列化或显存异常 | `schedule_batch.py`、CUDA IPC utils | transport mode、pool、驻留策略、重建 device |
+| 结果偶发错误但长度相同 | ViT CUDA Graph runner | 同 `S` 是否有不同分段 metadata |
+| encoder-only 超时或 embedding 丢失 | `encode_server.py` | backend、URL 注册、DP 映射、`/send` 生命周期 |
 
-**源码锚点：**
+## 症状 1：找不到 Processor 或 Transformers backend 不兼容
 
-```python
-## 来源：python/sglang/srt/managers/multimodal_processor.py L34-L41
-                assert hasattr(cls, "models")
-                for arch in getattr(cls, "models"):
-                    if overwrite:
-                        for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-                            if model_cls.__name__ == arch.__name__:
-                                del PROCESSOR_MAPPING[model_cls]
-                                break
-                    PROCESSOR_MAPPING[arch] = cls
-```
+**可能原因**
 
-**要点：** 确保 model class 已在 `srt/models/` 注册且 `architectures` 名称一致。
+- `hf_config.architectures` 没有匹配已注册模型类名；
+- 外部 processor 包没有导入，或覆盖注册失败；
+- `model_impl=transformers`，但 processor 没声明 `supports_transformers_backend`；
+- encoder disaggregation 使用了不在当前支持表中的架构。
 
----
+**源码入口**
 
-## Q2：image token 数量不对导致错位？
+- `managers/multimodal_processor.py::get_mm_processor`
+- `managers/tokenizer_manager.py::init_tokenizer_and_processor`
+- `server_args.py::_handle_encoder_disaggregation`
 
-**读法：** placeholder 展开数量必须与实际 ViT output token 数一致；Qwen 用 smart_resize + grid 计算。
-
-**源码锚点（正确流程）：**
-
-```python
-## 来源：python/sglang/srt/multimodal/processors/qwen_vl.py L41-L44
-IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
-MAX_RATIO = 200
-```
-
-**源码锚点（反模式）：**
-
-```python
-# 错误：固定写死 256 个 image token，与真实 grid 不符
-input_text = input_text.replace("<image>", "<|image_pad|>" * 256)
-```
-
-**要点：** 症状为乱码或重复短语；检查 Processor 输出的 `input_ids` 长度与 vision forward 的 seq len。
-
----
-
-## Q3：何时用 TransformersAutoMultimodalProcessor？
-
-**读法：** `model_impl=transformers` 且无原生 Processor，或 Processor 标记 `supports_transformers_backend=True`。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/managers/multimodal_processor.py L64-L66
-        if not uses_transformers_backend or getattr(
-            processor_cls, "supports_transformers_backend", False
-        ):
-```
-
-**要点：** 原生 SGLang 模型实现 + 专用 Processor 性能更优。
-
----
-
-## Q4：多图 / 多视频顺序
-
-**读法：** `organize_results()` 按 images → videos → audios 顺序；placeholder 在文本中的出现顺序必须与此一致。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/multimodal/processors/base_processor.py L72-L81
-    def organize_results(self) -> List[Tuple[Modality, Any]]:
-        """
-
-        :return: a list of results, with their corresponding modalities
-        """
-        return (
-            [(Modality.IMAGE, data) for data in self.images]
-            + [(Modality.VIDEO, data) for data in self.videos]
-            + [(Modality.AUDIO, data) for data in self.audios]
-        )
-```
-
-**要点：** 交错模态的 prompt 需在 process 内按文本顺序重排 mm_items。
-
----
-
-## Q5：ViT CUDA Graph 不生效？
-
-**读法：** Graph 要求固定 shape；动态分辨率 batch 可能回退 eager。检查 `vit_cuda_graph_runner` capture 条件与 batch padding。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/multimodal/vit_cuda_graph_runner.py L115-L117, L246-L249, L371-L379
-    def _get_graph_key(self, x_3d: torch.Tensor) -> int:
-        # x_3d: [S, B, H], B=1, S as graph_key
-        return x_3d.shape[0]
-```
-
-**要点：** 与 LLM decode cuda graph 独立配置。
-
----
-
-## Q6：AMX CPU 预处理
-
-**读法：** Qwen2-VL 在支持 AMX 的 CPU 上可 hack HF ImageProcessor 走 fast_preprocess_cpu。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/multimodal/processors/qwen_vl.py L65-L72
-if _is_cpu and _is_cpu_amx_available:
-    try:
-        import transformers
-
-        from sglang.srt.layers.amx_utils import fast_preprocess_cpu
-
-        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
-            fast_preprocess_cpu
-```
-
-**要点：** 仅 CPU 推理路径；GPU 部署可忽略。
-
----
-
-## 验证抓手
-
-FAQ 的排查顺序可以用一条静态命令先校准。它不验证模型输出质量，但能确认六个问题分别落在正确源码边界。
+**操作**
 
 ```powershell
-rg -n "PROCESSOR_MAPPING|supports_transformers_backend|IMAGE_FACTOR|organize_results|_get_graph_key|fast_preprocess_cpu" `
-  sglang/python/sglang/srt/managers/multimodal_processor.py `
-  sglang/python/sglang/srt/multimodal/processors/base_processor.py `
-  sglang/python/sglang/srt/multimodal/processors/qwen_vl.py `
-  sglang/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
+rg -n "class .*Processor|models =|supports_transformers_backend" sglang/python/sglang/srt/multimodal/processors
+rg -n "architectures|PROCESSOR_MAPPING|get_mm_processor" sglang/python/sglang/srt/managers/multimodal_processor.py
 ```
 
-预期现象：
+**预期**：模型架构类名能唯一命中 processor；若走 Transformers 模型实现，该 processor 明确允许该 backend。
 
-- 新 VLM 注册问题应命中 `PROCESSOR_MAPPING`。
-- Transformers fallback 问题应命中 `supports_transformers_backend`。
-- image token 数量问题应先命中 Qwen 的 `IMAGE_FACTOR`，再回到 grid/token 展开路径。
-- 多图多视频顺序问题应命中 `organize_results`。
-- ViT CUDA Graph 问题应命中 `_get_graph_key`。
-- AMX CPU 预处理问题应命中 `fast_preprocess_cpu`。
+## 症状 2：媒体数量正确，但 token 或 embedding 仍错位
 
-如果运行期症状与这些入口对不上，例如 token 错位却只改 HTTP 层，说明排查方向已经偏离：应先回到 processor 输出的 `input_ids`、`mm_items` 和视觉 grid 对齐关系。
+**可能原因**
+
+- prompt 的 image/video/audio 顺序与调用方拼接媒体的假设不同；
+- 把 `organize_results()` 的 IMAGE→VIDEO→AUDIO 分组误当成 prompt 必须分组；
+- `grid_thw`、audio length 或 spatial merge 计算错；
+- offset 指向的是展开前位置或被后续截断破坏。
+
+**操作**
+
+1. 打印 tokenize 后的特殊 token 位置。
+2. 分别打印 image、video、audio item 数量与每项 grid/长度。
+3. 逐个 span 计算 `end - start`，与该项预期视觉/音频 token 数比较。
+4. 暂停 `allow_auto_truncate`，复现一次。
+
+**预期**：prompt 扫描顺序保持不变；每种 modality 的独立游标都刚好消费完；所有 span 与 item 一一对应。
+
+## 症状 3：开启自动截断后才出现 shape mismatch
+
+**根因线索**
+
+当前 `_validate_one_request()` 只执行：
+
+```python
+# 来源：python/sglang/srt/managers/tokenizer_manager.py L958-L966
+        if input_token_num >= self.context_len:
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens). "
+                    "Truncating the input."
+                )
+                del input_ids[_max_req_len:]
+                input_token_num = len(input_ids)
+```
+
+它没有同步修改 `mm_inputs`。
+
+**操作**
+
+- 关闭 auto truncate；
+- 在 API 层按文本 token + 视觉 token 预算提前拒绝；
+- 若业务必须截断，只在 processor 前截文本，并确保不切断媒体标记结构。
+
+**预期**：禁用后错位消失；超长请求得到明确的长度错误，而不是晚到的模型 shape 错误。
+
+## 症状 4：开启 CUDA IPC 后显存反而上升
+
+**可能原因**
+
+- 每 tokenizer worker 的 pool 最少 128 MiB，总额可能超过配置预算；
+- consumer 会再分配 target tensor 并 device copy，峰值同时包含共享 slice 与目标 tensor；
+- TP consumer 尚未全部完成，producer chunk 不能回收；
+- `keep_mm_feature_on_device=true` 让 fallback tensor 继续驻留 GPU。
+
+**操作**
+
+1. 记录 `tokenizer_worker_num` 与日志中的 per-worker pool MiB。
+2. 对比关闭 IPC、关闭 `keep_mm_feature_on_device` 的峰值。
+3. 检查 consumer 是否都递增共享完成计数。
+4. 区分稳态占用与大请求瞬时峰值。
+
+**预期**：实际池总额按 `worker_num × max(total/worker_num, 128MiB)` 估算；consumer copy 完成后 chunk 才逐步可回收。
+
+## 症状 5：IPC pool 满后行为与预期不一致
+
+不要假设“必回 CPU”。先核对 `keep_mm_feature_on_device`：
+
+- false：普通路径会倾向把 feature 搬到 CPU；
+- true：feature 可继续留在 CUDA tensor，即使没有装进 pool；
+- Scheduler 侧若启用 hash buffer，还可能短暂上 GPU 后再回 CPU。
+
+**预期**：日志、tensor device 与配置相符；同一请求的身份/hash 不因 transport fallback 改变。
+
+## 症状 6：ViT CUDA Graph 只在某些多图组合下给错结果
+
+**高概率原因**
+
+graph key 只有总 `S`。单图 1024 token 与两图 512+512 token 可能命中同一个 key，但 `cu_seqlens`、window 分段不同。
+
+**操作**
+
+1. 构造总 `S` 相同、分段不同的两个请求。
+2. 分别跑 eager 与 graph。
+3. 比较 embedding 的 max/mean error 和最终 logits。
+4. 若不一致，禁用 ViT graph 或扩展 graph key，使其包含足以区分布局的 metadata。
+
+**预期**：同一请求 eager/graph 一致；不同布局不会静默复用错误 metadata。
+
+## 症状 7：hash 命中异常或相同图片不能复用前缀
+
+**可能原因**
+
+- 外部 `mm_hashes` 数量与 item 数不一致；
+- hash 字符串不是合法十六进制；
+- 路由器与 SGLang 对媒体规范化方式不同；
+- 把 pad value 当成 image token id 使用；
+- `SGLANG_MM_SKIP_COMPUTE_HASH` 导致每次使用随机 UUID。
+
+**操作**
+
+- 记录规范化后 item 数、hash 与 pad value；
+- 对同一内容重复请求，确认 hash 稳定；
+- 对字节不同但视觉相同的输入，明确你需要“字节身份”还是“语义身份”。
+
+**预期**：路由器计算的内容身份与 SGLang prefix key 一致；pad 位于普通词表之外，仅服务缓存寻址。
+
+## 症状 8：encoder-only / language-only 请求挂住
+
+**检查顺序**
+
+1. `encoder_only` 与 `language_only` 是否误同时开启；
+2. transfer backend 是 `zmq_to_tokenizer`、`zmq_to_scheduler` 还是 Mooncake；
+3. 静态 `encoder_urls` 是否为空；若为空，bootstrap 注册是否成功；
+4. DP 模式是否满足 encoder 的 `dp_size > 1, tp_size == 1` 约束；
+5. `zmq_to_scheduler` 的 DP 模式是否显式提供 embedding port；
+6. Mooncake `/encode` 是否已返回 metadata，但 `/send` 尚在等 ready event；
+7. `req_id → dp_rank` 映射是否过期或 worker 已被 watchdog 判死。
+
+**预期**：encode 与后续 send 落在同一 DP worker；超时会清理 stale mapping，而不是无限等待。
+
+## 症状 9：健康检查通过，但业务请求仍失败
+
+非 DP encoder 在 `embedding_to_send` 非空时直接认为“繁忙即存活”，不会再跑 dummy encode。DP worker 忙时也可能只报告健康，不占用 GPU 做探针。
+
+**结论**：`/health_generate` 是服务存活信号，不是每次都覆盖 processor→ViT→传输→LLM 的端到端验证。
+
+**操作**：另设低频合成业务探针，覆盖真实 modality、真实 transfer backend 和完整生成链路。
+
+## 故障记录模板
+
+```text
+症状：
+请求形态：text / image / video / audio 数量与顺序
+模型与 baseline：
+关键参数：transport、worker_num、keep_on_device、auto_truncate、ViT graph、EPD backend
+最后一个正确边界：
+第一个错误边界：
+源码入口：
+操作：
+预期：
+结果：
+```

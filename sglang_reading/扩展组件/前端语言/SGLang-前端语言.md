@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 前端语言
 
@@ -21,12 +21,12 @@ updated: 2026-07-10
 
 ## 1. 本模块目标
 
-专题读法：SGL（Structured Generation Language）是 SGLang 的**前端 DSL**：用户用 Python 函数编写 prompt 程序，通过 `@sgl.function` 装饰器定义 IR，由 `StreamExecutor` 解释执行并调用 Backend（RuntimeEndpoint / OpenAI / Anthropic 等）完成实际推理。本模块覆盖从 `gen()` API 到 HTTP 调 srt 的完整链路。
+专题读法：SGL（Structured Generation Language）是 SGLang 的前端 DSL。`@sgl.function` 只把 Python 函数包装成 `SglFunction` 并检查首参/记录参数名；真正运行函数时，`gen/select/role/image` 等 API 才创建 IR 节点，`ProgramState.__iadd__` 将节点提交给 `StreamExecutor` 立即或排队解释。后端可以是连接既有服务的 `RuntimeEndpoint`、会自行 spawn HTTP server 的 `Runtime` wrapper，或 OpenAI 等 `BaseBackend` 实现。
 
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/api.py L23-L32
+# 来源：python/sglang/lang/api.py L23-L32
 def function(
     func: Optional[Callable] = None, num_api_spec_tokens: Optional[int] = None
 ):
@@ -41,8 +41,8 @@ def function(
 
 读法：
 
-- `@sgl.function` 将普通 Python 函数包装为 `SglFunction`，首参必须是 `s`（ProgramState）。
-- `num_api_spec_tokens` 启用 API 级投机执行（lazy commit）。
+- `@sgl.function` 不会在装饰时执行函数或生成完整 IR 图；完整依赖图只在 tracing 路径显式记录。
+- `num_api_spec_tokens` 是 API 级投机参数：OpenAI chat backend 会积累格式后在 role end 合并请求；completion backend 走超前生成并在前端切片。它与 fork 的 `SglCommitLazy` 不是同一机制，也不能无条件用于 `RuntimeEndpoint`。
 
 ---
 
@@ -52,7 +52,7 @@ def function(
 用户程序 @sgl.function
  │
  ▼
-api.py (gen, select, Runtime) → ir.py (SglGen, SglExpr)
+api.py (gen, select, Runtime/Engine 延迟入口) → ir.py (SglFunction / SglGen / SglExpr)
  │
  ▼
 interpreter.py (StreamExecutor, ProgramState)
@@ -66,7 +66,7 @@ srt HTTP server（或 OpenAI 等外部 API）
 
 | 模块 | 职责 |
 |------|------|
-| `api.py` | 公开 API：`gen`、`Runtime`、`Engine` |
+| `api.py` | 公开 DSL 与延迟构造入口；`Engine()` 本身不是 SGL `BaseBackend` |
 | `ir.py` | 中间表示：`SglGen`、`SglFunction`、`SglSamplingParams` |
 | `interpreter.py` | 解释执行、fork/join、batch |
 | `tracer.py` | 静态 trace 提取 prefix |
@@ -78,7 +78,7 @@ srt HTTP server（或 OpenAI 等外部 API）
 
 - [ ] 能写出一个最小 `@sgl.function` 并说明 `s += gen()` 如何变成 HTTP 请求
 - [ ] 能解释 `StreamExecutor.submit` → `_execute_gen` → `backend.generate` 调用链
-- [ ] 能说明 `RuntimeEndpoint` 与 `Engine` 的区别
+- [ ] 能区分 `RuntimeEndpoint`（连接既有 HTTP 服务）、`Runtime`（spawn HTTP server + endpoint）与 `Engine`（直接 IPC 驱动 SRT、非 SGL Backend）
 - [ ] 能运行或静态追踪一个最小 `@sgl.function`，证明 `gen()` 如何经过解释器和 backend 形成真实请求
 
 → [[SGLang-前端语言-核心概念]] · [[SGLang-前端语言-源码走读]]

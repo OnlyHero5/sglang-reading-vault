@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RayTrainGroup
 
@@ -36,7 +36,7 @@ flowchart LR
     RN["rank 1..N<br/>复用 master"]
     INIT["async_init<br/>dist init + model init"]
     TRAIN["async_train<br/>返回 refs"]
-    SYNC["update/save/onload/offload<br/>group 内同步"]
+    SYNC["publish/save/onload/offload<br/>group 内同步"]
 
     PG --> GROUP --> ENV --> R0 --> RN
     GROUP --> INIT
@@ -75,17 +75,18 @@ flowchart LR
 | 不变量 | 为什么重要 |
 |--------|------------|
 | `world_size = num_nodes * num_gpus_per_node` | 决定创建多少 rank actor |
-| 每个 rank 用 `reordered_bundle_indices[rank]` 调度 | 保持 06 的 logical order |
+| 每个 rank 用 `reordered_bundle_indices[rank]` 调度 | 保持 [[Slime-PlacementGroup]] 计算出的 logical order |
 | rank 0 先创建并返回 master addr/port | 其他 rank 才能写入同一个 distributed rendezvous |
-| `async_*` 返回 refs，不在 group 内等待 | driver 可组合 actor/critic 或异步 pipeline |
-| `update_weights`、save、onload/offload 在 group 内等待 | 生命周期和权重一致性不能悬空 |
-| `TrainRayActor.init` 才初始化 torch distributed | Ray actor 创建成功不代表 Megatron 就绪 |
+| `async_*` 返回 refs，不在 group 内等待 | API 允许 caller 组织依赖；当前 `create_training_models` 仍先等待 critic init，再等待 actor init |
+| `update_weights`、save、onload/offload 在 group 内等待 | 生命周期和训练侧向 rollout 发布权重的完成状态不能悬空 |
+| `TrainRayActor.init` 才初始化 torch distributed | Ray actor 创建成功不代表 distributed 已就绪；Megatron 模型由子类 `init` 继续初始化 |
 
 ## 运行验证入口
 
 轻量环境常缺 `ray` 和 `sglang`，所以本专题能跑的测试取决于依赖。先尝试：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/utils/test_megatron_role_config.py -q
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
@@ -95,7 +96,7 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 - role config 测试需要 `ray` 和 `sglang` 可 import。
 - argument validation 测试在轻量环境通常可跑，能覆盖 colocate/offload/delta 的边界。
 
-如果缺 `ray` 或 `sglang`，记录依赖缺失，不要把 import failure 解释成源码行为错误。
+当前基线实测：参数校验 `14 passed`；role config 的 6 个用例在 import 阶段失败，其中 5 个缺 `sglang`、1 个缺 `ray`。这是环境覆盖限制，不是断言失败。
 
 ## 衔接
 

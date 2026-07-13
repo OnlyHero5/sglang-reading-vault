@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练与Rollout参数 · 排障指南
 
@@ -104,7 +104,7 @@ if args.eval_function_path is None:
 
 ## `global_batch_size` 为什么和我写的不一致
 
-先看是否传了 `--num-steps-per-rollout`。只要传了，它会用 rollout 样本账反推 `global_batch_size`，并要求显式值一致。
+先看是否传了 `--num-steps-per-rollout`。只要传了，validator 会用默认路径的 rollout execution 规模反推 `global_batch_size`，并要求显式值一致。
 
 ```python
 # 来源：slime/utils/arguments.py L1911-L1919
@@ -119,7 +119,7 @@ if args.num_steps_per_rollout is not None:
     args.global_batch_size = global_batch_size
 ```
 
-例子：`rollout_batch_size=64`、`n_samples_per_prompt=4`、`num_steps_per_rollout=2`，就应该是 `global_batch_size=128`。如果你显式传 256，会在 validate 阶段失败。
+例子：默认路径下 `64 × 4 ÷ 2 = 128` 个 rollout execution/step。如果你显式传 256，会在 validate 阶段失败。若 compact rollout 把一个 execution 展成多条 sibling Sample，仍按共享的 `rollout_id` 计一次；不要拿展开行数覆盖 128。
 
 ## dynamic filter 和 sample filter 为什么表现不同
 
@@ -141,7 +141,7 @@ if len(data) < target_data_size:
 ```
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L456-L461
+# 来源：slime/rollout/sglang_rollout.py L456-L460
 # reset the global state to prevent effects on the next rollout or eval.
 state.reset()
 if args.rollout_sample_filter_path is not None:
@@ -153,6 +153,12 @@ if args.rollout_sample_filter_path is not None:
 
 - dynamic filter drop 后会继续补样，直到保留 `rollout_batch_size` 个 group。
 - sample filter 不补样，它只改变后续 loss 参与。
+
+## compact generate 为什么和 `group_rm` 一起崩
+
+当前 fanout E2E 的注释明确记录：per-sample custom generate 可以返回 sibling `list[Sample]`，非 group RM 路线会对扁平 sibling 列表调用 batched RM；`group_rm` 路线本身又按 group 组织，组合后可能形成 `list[list[Sample]]` 并把 list 当 Sample 访问。处理方式是先保持 `group_rm=False`，或为该嵌套形态实现完整的 custom rollout/RM 协议，不要只叠两个 flag。
+
+同一场景若使用 GRPO 类 reward normalization，还要检查分组：可变 sibling 数不再满足固定 `n_samples_per_prompt` reshape，默认 fallback 可能把更大范围当成一组。应像当前 fanout E2E 一样，按保留下来的 `group_index`/业务身份实现 `custom_reward_post_process_path`，并验证每组均值与标准差。
 
 ## custom RM 在 group mode 下签名为什么变了
 
@@ -203,6 +209,12 @@ def test_custom_rm_path_aligns_with_expected_format():
         )
         assert isinstance(reward, (int, float))
 ```
+
+这张测试只覆盖普通单 Sample/扁平 samples 签名，不覆盖 compact generate 与 group RM 的嵌套组合。
+
+## custom converter 为什么 contract test 过了，训练仍报 `rollout_ids`
+
+当前 runtime hook contract 只检查 converter 返回 tokens、reward、mask 等旧字段；实际 `_split_train_data_by_dp()` 已无条件用 `rollout_ids` 做按 execution 分步。完全替换 converter 时应至少保留默认转换产生的调度身份与训练字段，并对照 `_split_train_data_by_dp()` 的读取清单。现有 contract 通过只证明 hook 可加载和被调用，不证明返回字典足以完成训练。
 
 ## `loss_type=custom_loss` 为什么还在跑默认逻辑
 
@@ -332,7 +344,7 @@ skipped_args = [
 Slime 会拿 `--hf-checkpoint` 的 config 对齐 Megatron 结构字段，例如 hidden size、head 数、layer 数、FFN/MoE、embedding tying、norm eps、rope theta。
 
 ```python
-# 来源：slime/backends/megatron_utils/arguments.py L128-L144
+# 定位骨架（据 `slime/backends/megatron_utils/arguments.py` L128-L144 删节）：
 if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
     if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
         errors.append(
@@ -358,9 +370,12 @@ if len(errors) > 0:
 
 | 修改内容 | 优先测试 |
 |----------|----------|
-| path 插件 | `python -m pytest tests/plugin_contracts -q` |
-| batch/validate 逻辑 | `python -m pytest tests/test_megatron_argument_validation.py -q` |
-| SGLang 参数透传 | `python -m pytest tests/test_external_sglang_engines.py -q`，若环境有 `httpx` |
-| 权重同步模式 | `tests/test_megatron_argument_validation.py` 加对应断言，或读 WeightSync 专题测试 |
+| path 插件 | `python -m pytest slime/tests/plugin_contracts -q` |
+| rollout/global/micro-batch 调度 | `python -m pytest slime/tests/test_dp_schedule.py -q` |
+| 参数校验 | `python -m pytest slime/tests/test_megatron_argument_validation.py -q` |
+| SGLang 参数透传 | `python -m pytest slime/tests/test_external_sglang_engines.py -q`，若环境有 `httpx` |
+| 权重同步模式 | `slime/tests/test_megatron_argument_validation.py` 加对应断言，或读 WeightSync 专题测试 |
+
+若 batch 数量异常，再补查 `slime/utils/dp_schedule.py`：`global_batch_size` 是每步 rollout 数，`rollout_indices` 相同的 sibling 必须留在同一步。只看参数公式无法解释 compact/subagent 行数。
 
 下一篇 [[Slime-训练与Rollout参数-学习检查]] 用推导题检查这些边界。

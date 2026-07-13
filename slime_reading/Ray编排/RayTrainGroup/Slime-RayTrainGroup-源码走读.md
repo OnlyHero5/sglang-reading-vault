@@ -9,11 +9,11 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RayTrainGroup · 源码走读
 
-这篇追踪一条真实路径：`create_training_models` 拿到 `pgs["actor"]` 后，构造 RayTrainGroup；RayTrainGroup 创建每个 rank actor；rank 0 选 master addr/port；`async_init` 真正初始化 distributed；主循环用 `async_train` 发训练，用 `update_weights` 做同步闸门。
+这篇追踪一条真实路径：`create_training_models` 拿到 `pgs["actor"]` 后，构造 RayTrainGroup；RayTrainGroup 创建每个 rank actor；rank 0 选 master addr/port；`async_init` 触发 actor 子类初始化，其中基类建立 distributed、Megatron 子类继续建模型；主循环用 `async_train` 发训练，用 `update_weights` 做“训练侧向 rollout 发布权重”的同步闸门。
 
 ## 长文读法
 
@@ -53,7 +53,7 @@ def train(args):
 `create_training_models` 内部通过 `allocate_train_group` 创建 RayTrainGroup：
 
 ```python
-# 来源：slime/ray/placement_group.py L140-L168
+# 来源：slime/ray/placement_group.py L140-L149
 def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor", actor_cls=None):
     return RayTrainGroup(
         args=args,
@@ -103,7 +103,7 @@ def __init__(
 设计选择：先计算 world size，解包 PG 三元组，再构造 NCCL、TransformerEngine、visible-devices、用户 train env、offload preload、routing replay env。
 
 ```python
-# 来源：slime/ray/actor_group.py L48-L89
+# 来源：slime/ray/actor_group.py L48-L88
 def _allocate_gpus_for_actor(self, pg, num_gpus_per_actor):
     world_size = self._num_nodes * self._num_gpus_per_node
 
@@ -184,7 +184,7 @@ TrainRayActor = ray.remote(**actor_options)(actor_impl)
 
 系统压力：所有 rank 要加入同一个 process group，因此必须共享 rank 0 的 master addr/port。
 
-设计选择：按 rank 顺序创建 actor；rank 0 的构造参数里 master 为空，它自己选端口；driver 立刻取回 master，再传给后续 rank。
+设计选择：按 rank 顺序发起 actor 创建；rank 0 的构造参数里 master 为空，它以 20000–21000 的随机值为起点向上寻找空闲端口；driver 立刻取回 master，再传给后续 rank。后续 rank 的 `.remote()` 不逐个 `ray.get`，因此“按 rank 发起”不等于“逐个等待其完全初始化”。
 
 ```python
 # 来源：slime/ray/actor_group.py L105-L119
@@ -219,7 +219,7 @@ for rank in range(world_size):
 设计选择：rank 0 自选地址，其他 rank 用传入地址；`LOCAL_RANK` 通过 `get_local_gpu_id` 映射。
 
 ```python
-# 来源：slime/ray/train_actor.py L28-L49
+# 来源：slime/ray/train_actor.py L28-L48
 class TrainRayActor(RayActor):
     def __init__(self, world_size, rank, master_addr, master_port):
         configure_logger()
@@ -255,14 +255,16 @@ def get_local_gpu_id():
         return cvd.split(",").index(str(ray.get_gpu_ids()[0]))
 ```
 
+若 CVD 已存在却找不到 Ray 返回的 GPU id，`.index(...)` 会抛 `ValueError`；这通常意味着 Ray 资源视图与 actor 进程可见设备列表不一致。
+
 ## 步骤六：`init` 才真正初始化 distributed
 
-系统压力：actor 创建只是进程启动；模型、optimizer、process group 初始化要由 driver 明确触发，并且可能与 critic init 组合等待。
+系统压力：actor 创建只是进程启动；模型、optimizer、process group 初始化要由 driver 明确触发。API 返回 refs，具备组合空间，但当前 `create_training_models` 会先 `ray.get` critic init，再发起并等待 actor init，实际调用路径不是 actor/critic 同时初始化。
 
 设计选择：`async_init` 返回 refs，actor 内 `init` 设置 CUDA device、初始化 process group、初始化 Gloo group、写回 args rank/world_size，并尝试设置 NUMA affinity。
 
 ```python
-# 来源：slime/ray/train_actor.py L50-L92
+# 定位骨架（据 `slime/ray/train_actor.py` L50-L92 删节）：
 def init(self, args, role, with_ref=False, with_opd_teacher=False):
     self.args = args
     self.role = role
@@ -293,6 +295,31 @@ def init(self, args, role, with_ref=False, with_opd_teacher=False):
             import pynvml
 ```
 
+默认子类把这段基础初始化接到 Megatron 初始化上：
+
+```python
+# 来源：slime/backends/megatron_utils/actor.py L46-L62
+class MegatronTrainRayActor(TrainRayActor):
+    @with_defer(lambda: Timer().start("train_wait"))
+    def init(
+        self,
+        args: Namespace,
+        role: str,
+        with_ref: bool = False,
+        with_opd_teacher: bool = False,
+    ) -> int | None:
+        if args.debug_rollout_only:
+            self.args = args
+            return 0
+
+        monkey_patch_torch_dist()
+        super().init(args, role, with_ref, with_opd_teacher)
+
+        init(args)
+```
+
+该子类在模型与恢复状态初始化结束后才 `return start_rollout_id`；因此 group 收到的恢复 ID 来自默认子类协议，不是基类 distributed bootstrap 的返回值。
+
 ```python
 # 来源：slime/utils/distributed_utils.py L20-L33
 def init_gloo_group():
@@ -317,10 +344,10 @@ def get_gloo_group():
 
 系统压力：driver 需要组合 actor/critic 结果。例如 PPO 中 critic 先返回 values refs，再作为 actor 训练的 external data。
 
-设计选择：`async_init`、`async_train` 都返回 ObjectRef 列表，不在 group 内等待。下面只截取 `async_train` 的控制分支，不摘录文档字符串。
+设计选择：`async_init`、`async_train` 都返回 ObjectRef 列表，不在 group 内等待。下面是删去 `async_train` docstring 和广播分支的定位骨架，不是连续逐行摘录。
 
 ```python
-# 来源：slime/ray/actor_group.py L121-L149
+# 定位骨架（据 `slime/ray/actor_group.py` L121-L149 删节）：
 def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
     """
     Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.
@@ -344,7 +371,7 @@ def async_train(self, rollout_id, rollout_data_ref, external_data=None):
 主循环消费这个边界：
 
 ```python
-# 来源：train.py L72-L82
+# 来源：train.py L72-L81
 actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
 
 if args.use_critic:
@@ -357,13 +384,13 @@ else:
     ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 ```
 
-读者抓手：critic values 本身就是 refs；actor `external_data=value_refs` 允许 actor rank 在自己的 train 中消费这些远程结果。
+读者抓手：critic group 返回一份“每 critic rank 一个 ref”的列表；actor group 先断言列表长度等于 actor 数，再按位置把第 `i` 个 ref 交给第 `i` 个 actor。它不是把一个 values dict 广播给所有 actor。`rollout_data_ref` 才是同一个 ObjectRef 传给所有 ranks。
 
 ## 步骤八：update/save/offload 这类操作在 group 内同步
 
 系统压力：权重同步、保存、onload/offload 都是生命周期闸门。下一轮 generate 或训练不能在它们还没完成时继续。
 
-设计选择：group 方法内部直接 `ray.get` 所有 actor 的远程调用。
+设计选择：group 方法内部直接 `ray.get` 所有 actor 的远程调用。这里引用到的 `update_weights` docstring 已经漂移：当前 group 只做“全 rank 调用 + 等待”，默认 Megatron actor 才负责连接 rollout engines 并通过 `weight_updater.update_weights()` 发布权重。
 
 ```python
 # 来源：slime/ray/actor_group.py L151-L169
@@ -407,7 +434,7 @@ if args.offload_rollout:
 异步训练里也会在 update 前 drain 预取的 generate：
 
 ```python
-# 来源：train_async.py L65-L70
+# 来源：train_async.py L65-L69
 if (rollout_id + 1) % args.update_weights_interval == 0:
     # sync generate before update weights to prevent update weight in the middle of generation
     rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
@@ -453,19 +480,23 @@ def set_rollout_manager(self, rollout_manager):
         ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))
 ```
 
-`set_rollout_manager` 是基类实现，因为它只需要 rank 0 上报训练并行配置。
+`set_rollout_manager` 是基类实现。group 会对所有 ranks 调用，所以所有 ranks 都保存 manager handle；仅 rank 0 额外同步上报训练并行配置。
+
+这里还有一处扩展接口漂移：抽象声明是 `sleep(self, tags)` / `wake_up(self, tags)`，但 group 当前无参调用，默认 `MegatronTrainRayActor.sleep()` / `wake_up()` 也采用无参签名。默认路径能运行；实现新后端时应以实际 group 调用约定为准，并把这处签名差异视为待上游收口的问题。
 
 ## 运行验证
 
 轻量测试：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
 
 若环境具备 `ray` 和 `sglang`，再跑：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/utils/test_megatron_role_config.py -q
 ```
 
@@ -473,6 +504,7 @@ python -m pytest tests/utils/test_megatron_role_config.py -q
 
 - role config 测试会覆盖 `create_training_models` 使用 actor override 的路径。
 - 缺 `ray` 或 `sglang` 时会在 import 阶段失败，不代表 RayTrainGroup 文档行为错误。
+- 当前基线实测参数校验为 `14 passed`；role config 为 6 个 import 失败（5 个缺 `sglang`，1 个缺 `ray`）。
 
 ## 复盘迁移
 

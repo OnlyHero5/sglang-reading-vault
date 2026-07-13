@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ScheduleBatch数据结构 · 核心概念
 
@@ -28,7 +28,7 @@ updated: 2026-07-10
 
 ---
 
-## 四层形态
+## 五层形态
 
 | 层 | 对象 | 读法 |
 |----|------|------|
@@ -44,7 +44,7 @@ flowchart TB
     T["TokenizedGenerateReqInput<br/>可序列化请求"]
     R["Req<br/>可变生命周期"]
     S["ScheduleBatch<br/>批次工作台"]
-    F["ForwardBatch<br/>执行快照"]
+    F["ForwardBatch<br/>本轮执行视图"]
     O["BatchTokenIDOutput / BatchStrOutput<br/>输出契约"]
 
     G --> T --> R --> S --> F
@@ -156,7 +156,7 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
 
 ## `ScheduleBatch` 是 Scheduler 的批次工作台
 
-`ScheduleBatch` 的字段分三类：请求列表和共享资源、Scheduler 内部状态、会被 `ForwardBatch` 消费的张量。看字段时先分组，再看字段名。
+`ScheduleBatch` 的字段分三类：请求列表和共享资源、Scheduler 内部状态、会被 `ForwardBatch` 消费的张量。看字段时先分组，再看字段名。它的寿命也不能一概压缩成“一次 forward”：新 prefill、idle、prebuilt 批次可以按轮构造，但进入 `running_batch` 后，同一个对象会跨多个 decode iteration 原地过滤、合并、重新准备张量。
 
 ```python
 # 来源：python/sglang/srt/managers/schedule_batch.py L1673-L1698
@@ -188,13 +188,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
 ```
 
-把它叫“工作台”比“数据结构”更准确：Scheduler 会在上面组包、过滤、合并、分配 KV slot、准备 prefill/decode，然后才把其中一部分张量交给 ModelRunner。
+把它叫“工作台”比“数据结构”更准确：Scheduler 会在上面组包、过滤、合并、分配 KV slot、准备 prefill/decode，然后才把其中一部分张量交给 ModelRunner。开启 overlap 时，执行中的原对象还会继续向下一轮演化，因此结果队列保存的是 `batch.copy()` 生成的“结果处理快照”；这个 copy 只复制结果处理需要的字段和 `reqs` 列表外壳，并不是深拷贝整棵请求状态。
 
 ---
 
-## `ForwardBatch` 是执行快照
+## `ForwardBatch` 是本轮执行视图，也是 one-shot 消费点
 
-`ForwardBatch.init_new` 从 `ScheduleBatch` 抽取 forward 所需字段。它会消费一次性 override、处理 decode/extend 差异、把 host 侧长度转为 device tensor。
+`ForwardBatch.init_new` 从 `ScheduleBatch` 抽取 forward 所需字段。它会消费一次性 override、处理 decode/extend 差异、把 host 侧长度转为 device tensor。源码甚至把部分 GPU tensor 标成 borrowed/aliased：所以“快照”只适合表达语义边界，不能误解成所有张量都已深拷贝、后续绝不共享底层存储。
+
+```python
+# 来源：python/sglang/srt/model_executor/forward_batch_info.py L618-L626
+        # Consume one-shot per-forward overrides from SB; reset to defaults so
+        # the next forward on the same SB starts clean. See SB field comment
+        # for the contract.
+        capture_hidden_mode = batch.capture_hidden_mode
+        batch.capture_hidden_mode = None
+        seq_lens_cpu_cache = batch.seq_lens_cpu_cache
+        batch.seq_lens_cpu_cache = None
+        return_hidden_states_before_norm = batch.return_hidden_states_before_norm
+        batch.return_hidden_states_before_norm = False
+```
+
+这三项的共同特征是“只对下一次 forward 生效”。构造 `ForwardBatch` 后立即复位，避免同一个 running batch 在下一轮 decode 误继承旧覆盖。反过来，如果调用方希望下一轮仍生效，就必须显式重新设置；把它们当成 batch 长期配置会制造极难定位的跨轮泄漏或意外失效。
 
 ```python
 # 来源：python/sglang/srt/model_executor/forward_batch_info.py L675-L710
@@ -236,7 +251,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
 ```
 
-因此 ModelRunner 不应该理解 HTTP 请求，也不应该维护 `Req.output_ids`。它消费的是当次 forward 的张量快照。
+因此 ModelRunner 不应该理解 HTTP 请求，也不应该维护 `Req.output_ids`。它消费的是当次 forward 的执行视图；这个视图既借用部分已准备张量，也派生 positions 等执行字段，还会清空 Scheduler 工作台上的 one-shot 覆盖。
 
 ---
 
@@ -259,7 +274,44 @@ class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     data: bytes
 ```
 
-判断一个字段需不需要包 pickle，先问它是不是 msgspec 能表达的结构化类型；如果是多模态处理结果、time stats、customized info 这类 opaque 载荷，就应该显式 wrap。
+判断一个字段需不需要包 pickle，先问它是不是 msgspec 能表达的结构化类型。当前协议有两种兜底，不能混成一句“复杂字段都 wrap”：优先使用字段级 `wrap_pickle_fields()` / `PickleWrapper`，只把多模态结果、time stats、customized info 等具体 opaque 载荷包起来；少数列入 `_REQ_TYPES_WITH_OPAQUE_FIELDS` 的 request struct 会在顶层 `_maybe_wrap_pickle` 整体回退。新增字段时应先给出精确 msgspec 类型或字段级 wrapper，整体回退需要审计理由。
+
+---
+
+## 三种“增量”不能混用
+
+生成回程里同时出现三种看似相近、用途完全不同的数据：
+
+| 字段 | 真正语义 | 消费者 |
+|------|----------|--------|
+| `BatchTokenIDOutput.decode_ids` | Detokenizer 的 token 窗口片段；首包可包含 prompt 尾部的 surrounding context | `DetokenizerManager` |
+| `BatchTokenIDOutput.output_ids` | 经过 stop 边界裁切、按 `send_token_offset` 切出的客户端 output-token 增量 | skip-tokenizer 路径及上层元信息 |
+| `BatchStrOutput.output_strs` | Detokenizer 用 surrounding/read 窗口解码后得到的文本增量 | TokenizerManager / API |
+
+```python
+# 来源：python/sglang/srt/managers/scheduler_components/output_streamer.py L354-L372
+        send_token_offset = req.send_token_offset
+        send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+        self.rids.append(req.rid)
+        self.http_worker_ipcs.append(req.http_worker_ipc)
+        self.finished_reasons.append(
+            req.finished_reason.to_json() if req.finished_reason else None
+        )
+        self.decoded_texts.append(req.decoded_text)
+        decode_ids, read_offset = req.init_incremental_detokenize()
+
+        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+
+        # Exclude the tokens after stop condition
+        output_ids_ = req.output_ids_through_stop
+
+        req.send_decode_id_offset = len(decode_ids)
+        self.read_offsets.append(read_offset)
+        self.output_ids.append(output_ids_[send_token_offset:])
+        req.send_token_offset = len(output_ids_)
+```
+
+`decode_ids` 的“增量”是相对于 `send_decode_id_offset` 的窗口传输增量，不等于“本次新生成了几个 token”。Detokenizer 必须保留足够上下文，才能处理 tokenizer 合并、UTF-8 未完成字符和 stop trimming；这就是首包可能夹带 prompt surrounding token 的原因。
 
 ---
 
@@ -314,12 +366,13 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
 - `TokenizedGenerateReqInput` 是跨进程输入契约。
 - `Req` 是 Scheduler 内部单请求生命周期。
 - `ScheduleBatch` 是一批 `Req` 的调度工作台。
-- `ForwardBatch` 是 ModelRunner 执行快照。
+- `ForwardBatch` 是本轮执行视图和 one-shot override 消费点。
 - 所有 per-request 列表、张量、输出字段必须按同一请求顺序对齐。
+- `decode_ids`、`output_ids`、`output_strs` 是三种不同契约，不能都叫“输出增量”。
 
 ## 运行验证
 
-维护这篇时，先用源码检索确认对象边界没有漂移：跨进程输入在 `io_struct.py`，调度态在 `schedule_batch.py`，执行快照在 `forward_batch_info.py`，定点 embedding 替换在 `embed_types.py`。
+维护这篇时，先用源码检索确认对象边界没有漂移：跨进程输入在 `io_struct.py`，调度态在 `schedule_batch.py`，本轮执行视图在 `forward_batch_info.py`，定点 embedding 替换在 `embed_types.py`。
 
 ```powershell
 rg -n 'class TokenizedGenerateReqInput|class Req|class ScheduleBatch|def prepare_for_extend|def prepare_for_decode|class ForwardBatch|class PickleWrapper|class PositionalEmbeds|out_cache_loc|extend_seq_lens' sglang/python/sglang/srt/managers/io_struct.py sglang/python/sglang/srt/managers/schedule_batch.py sglang/python/sglang/srt/model_executor/forward_batch_info.py sglang/python/sglang/srt/managers/embed_types.py

@@ -9,25 +9,25 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 前端语言 · 源码走读
 
 > 走读顺序：`api.py` → `ir.py` → `run_program` → `StreamExecutor` → `RuntimeEndpoint` → `run_program_batch`
 
-Frontend Language 的设计目标是让用户写普通 Python 控制流，同时把 `gen/select/role/fork/image` 这些操作转成可解释执行的 IR。它不是一个静态 DSL 编译器，而是一个运行时解释器：API 构造 IR，`ProgramState += expr` 把 IR 送入 `StreamExecutor`，executor 维护文本、消息、变量、图片和 fork 状态，后端把最终 prompt 变成 `/generate` 请求。
+Frontend Language 的设计目标是让用户写普通 Python 控制流，同时把 `gen/select/role/fork/image` 这些操作转成可解释执行的 IR。它不是一个静态 DSL 编译器，而是一个运行时解释器：API 构造 IR，`ProgramState += expr` 把 IR 送入 `StreamExecutor`，executor 维护文本、消息、变量、图片和 fork 状态，具体 backend 再把这些状态变成生成、选择、缓存提交或 KV 拼接调用。
 
 ---
 
 ## 长文读法
 
-这篇按“用户 Python 语法如何变成一次 `/generate`”来读：`api.py` 把 `gen/select/role/image` 变成 IR，`ir.py` 的 `SglFunction.run/__call__` 决定普通执行还是 tracing，`StreamExecutor` 维护文本、变量、消息、图片和 fork 状态，`RuntimeEndpoint` 最后把状态转成后端 HTTP 请求。它不是静态编译器，而是运行时解释器。
+这篇按“用户 Python 语法如何变成一组后端调用”来读：`api.py` 把 `gen/select/role/image` 变成 IR，`ir.py` 的 `SglFunction.run/__call__` 决定普通执行还是 tracing，`StreamExecutor` 维护文本、变量、消息、图片和 fork 状态，`RuntimeEndpoint` 最后把状态转成 `/generate`、`/concate_and_append_request` 等 HTTP 请求。它不是静态编译器，而是运行时解释器。
 
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
 | 第一次建立 frontend 主线 | 1 到 2 | API 只构造 IR，真正执行发生在 `run_program` 创建的 `StreamExecutor` 里 |
 | 判断 `gen`、`select` 为什么分叉 | 1.1、2.4、3.3 | `choices` 会变成 `SglSelect`，自由生成才是 `SglGen`，两者走不同 backend 方法 |
-| 排查 tracing / cache prefix 行为 | 1.3、4.4、4.5、5 | tracing 复用同一个函数调用外观，但目的在提取公共前缀和 lazy commit |
+| 排查 tracing / cache prefix 行为 | 1.3、4.4、5 | tracing 复用同一个函数调用外观来记录节点或提取公共前缀；lazy commit 是普通 executor/backend 的另一条运行时路径 |
 | 理解 streaming 变量如何更新 | 2.3、2.5、3.1 | IR 入队后由 executor 更新文本、变量事件和 stream event，用户读变量时可能需要等待 |
 | 排查 role / chat template / image | 3.1、4.1、4.2 | role context 和多模态输入先留在 executor 状态，HTTP payload 由 RuntimeEndpoint 统一组装 |
 | 理解 dtype、regex、json 约束 | 1.1、4.2、4.3 | API 先保存约束意图，dtype 到 regex 的落地发生在后端入口 |
@@ -48,7 +48,7 @@ Frontend Language 的设计目标是让用户写普通 Python 控制流，同时
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/api.py L102-L139
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/api.py L102-L139
 if choices:
     return SglSelect(
         name,
@@ -82,7 +82,7 @@ return SglGen(name, max_tokens, min_tokens, n, stop, stop_token_ids, stop_regex,
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/ir.py L212-L221
+# 来源：python/sglang/lang/ir.py L212-L221
 backend = backend or global_config.default_backend
 return run_program(
     self,
@@ -97,11 +97,13 @@ return run_program(
 
 **代码逻辑：** `run()` 合并调用参数与默认采样参数；backend 为空时用全局默认；最终返回 `ProgramState`。
 
-**为什么这样写：** 用户函数可能被本地 Runtime、远程 RuntimeEndpoint、OpenAI-like backend 或 tracer 执行；`run_program` 统一了承载这些 backend 的入口。
+**为什么这样写：** 用户函数可以由 `Runtime.endpoint`、显式 `RuntimeEndpoint`、OpenAI-like backend 或 tracer 执行；`run_program` 会自动解包带 `.endpoint` 的 Runtime wrapper。当前 `Engine` 没有这套 backend 契约，不能列入这一组。
 
 **不变量与失败模式：** backend 必须最终非空；如果没有设置 default backend 且调用时未传 backend，解释器会 assert。
 
 **要点：** `bind(**kwargs)` 的参数会在 `run_program` 里合并到 `func_kwargs`，这让函数可以预绑定部分输入。
+
+**基线缺口：** `SglFunction.bind()` 返回 `SglFunction(self.func, bind_arguments=new_bind_dict)`，没有把原对象的 `num_api_spec_tokens` 传入新对象；因此启用 API speculative 的函数在 `.bind()` 后会静默丢失该配置。
 
 ### 1.3 __call__ 在 tracing scope 内改走 trace
 
@@ -114,7 +116,7 @@ return run_program(
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/ir.py L316-L324
+# 来源：python/sglang/lang/ir.py L316-L324
 def __call__(self, *args, **kwargs):
     from sglang.lang.tracer import TracingScope
 
@@ -149,7 +151,7 @@ def __call__(self, *args, **kwargs):
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L57-L90
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L57-L90
 if hasattr(backend, "endpoint"):
     backend = backend.endpoint
 assert backend is not None, "Please specify a backend"
@@ -170,7 +172,7 @@ else:
 
 **为什么这样写：** streaming 需要用户能边生成边消费 `state.text_iter()`；因此主线程必须尽早拿到 state，而执行继续在后台推进。
 
-**不变量与失败模式：** 用户函数第一参数必须是 state；如果 stream 后台线程出错，错误会记录在 executor，消费端需要检查。
+**不变量与失败模式：** 用户函数第一参数必须是 state。stream 用户线程或 executor worker 都可能出错；设计上消费端可查 `error()`，但当前 queue 异常清理的二次 `ValueError` 可能阻断 `error_` 写入，不能保证所有异常都可从该接口取回。
 
 **要点：** 这里的线程是 frontend runtime 线程，不是 SRT 后端 worker 线程。
 
@@ -185,7 +187,7 @@ else:
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L321-L332
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L321-L332
 self.use_thread = use_thread
 if self.use_thread:
     self.queue = queue.Queue()
@@ -201,11 +203,15 @@ if self.use_thread:
 
 **代码逻辑：** executor 根据 `use_thread` 决定是否启用 queue；启用时启动后台 worker，worker 会不断从 queue 取 IR 节点执行。
 
-**为什么这样写：** 生成请求可能阻塞；队列线程让前端语法可以继续组织 stream/fork 等控制流，同时保留顺序执行语义。
+**为什么这样写：** 生成请求可能阻塞；队列线程把已提交 expr 的后端执行移出调用线程，并保留队列内顺序。用户代码仍可组织后续控制流，但读取变量、显式 `sync()`，以及需要复制一致状态的 fork 都会形成同步点，不能把它理解成整段程序完全非阻塞。
 
-**不变量与失败模式：** 同一个 executor 的 IR 节点仍按 queue 顺序执行；worker 出错会设置 error 并唤醒变量事件，避免调用方永久等待。
+**不变量与失败模式：** 同一个 executor 的 IR 节点按 queue 顺序执行。设计意图是在 worker 出错后清空队列、唤醒变量事件并设置 `error_`；但当前清理循环的顺序是先 `queue.task_done()`、再 `queue.get_nowait()`。处理完最后一个 pending item 后，下一轮可能在空队列上多调用一次 `task_done()` 并抛 `ValueError`，而异常捕获只覆盖 `queue.Empty`，因此二次异常可能阻断后续 event 唤醒和 `error_` 写入。这是基线缺陷，不能把错误传播写成无条件保证。
 
 **要点：** `contextvars.copy_context()` 用来把当前上下文传播到 worker，避免 tracing/logging 等上下文丢失。
+
+### 2.2.1 异常清理存在 unfinished-task 计数风险
+
+当 `_execute(expr)` 抛错时，该 expr 尚未执行正常路径的 `task_done()`。清理循环试图用一次 `task_done()` 抵消失败项，再逐项取出剩余队列；但循环体把 decrement 放在 dequeue 之前，终止条件因而晚一拍。可靠修复应把 `get_nowait()` 与对应 `task_done()` 成对，单独处理当前失败项，或用 `finally` 保证每个成功 `get()` 恰好对应一次 `task_done()`。在修复前，线上出现 `queue.task_done() called too many times` 时，应先按前端 worker 二次异常处理，而不是归咎于 SRT。
 
 ### 2.3 submit 是 IR 入队边界
 
@@ -218,7 +224,7 @@ if self.use_thread:
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L342-L348
+# 来源：python/sglang/lang/interpreter.py L342-L348
 def submit(self, expr: SglExpr):
     self._init_var_event(expr)
 
@@ -247,7 +253,7 @@ def submit(self, expr: SglExpr):
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L461-L503
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L461-L503
 if isinstance(other, SglConstantText):
     self._execute_fill(other.value)
 elif isinstance(other, SglGen):
@@ -285,7 +291,7 @@ else:
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L593-L625
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L593-L625
 def _execute_gen(self, expr: SglGen):
     sampling_params = self._resolve_sampling_params(expr.sampling_params)
     name = expr.name
@@ -320,7 +326,7 @@ def _execute_gen(self, expr: SglGen):
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L858-L871
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L858-L871
 def _role_common(self, name: str, expr: Optional[SglExpr] = None):
     if expr is not None:
         role_expr = SglExprList([SglRoleBegin(name), expr, SglRoleEnd(name)])
@@ -349,12 +355,12 @@ def _role_common(self, name: str, expr: Optional[SglExpr] = None):
 
 **设计选择：** `StreamExecutor.fork` 在必要时先提交 `SglCommitLazy` 并 `sync`，然后创建多个新 executor，复制变量、文本、messages、role 和 images。
 
-**读法：** fork 是状态复制，不是重新运行前缀。支持 KV cache append 时，后续 join 还能让后端复用 fork 前缓存。
+**读法：** fork 在 Python 侧复制状态，不会重新执行用户函数的 prefix 语句；但子分支发请求时仍携带完整 `text_`，后端是否避免重复 prefill 取决于 cache 命中。KV concatenate 分支虽然存在，当前 executor sid 到服务端 rid 的身份建立链仍有缺口。
 
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L370-L402
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L370-L402
 def fork(self, size: int = 1, position_ids_offset: Optional[List[int]] = None):
     if size > 1 and str(self.text_):
         self.submit(SglCommitLazy())
@@ -376,7 +382,7 @@ def fork(self, size: int = 1, position_ids_offset: Optional[List[int]] = None):
 
 **不变量与失败模式：** fork 出来的分支共享 backend，但拥有独立 executor 状态；如果分支没有正确 end，worker 线程可能滞留。
 
-**要点：** `position_ids_offset` 参数目前传入但未在复制逻辑中使用，读代码时不要假设它已经生效。
+**要点：** `position_ids_offset` 参数目前传入但未在复制逻辑中使用，`BaseBackend.fork_program` 也未从这条路径调用；子 executor 构造时还没有继承父 executor 的 `num_api_spec_tokens`，源码留有 `TODO: handle API speculative execution`。读代码时不要假设带位置偏移或 speculative 配置已跨 fork 生效。
 
 ### 3.3 select 把决策和 meta 都写回变量
 
@@ -389,7 +395,7 @@ def fork(self, size: int = 1, position_ids_offset: Optional[List[int]] = None):
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L647-L655
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L647-L655
 choices_decision = self.backend.select(
     self, expr.choices, expr.temperature, expr.choices_method
 )
@@ -408,6 +414,8 @@ if expr.name is not None:
 
 **要点：** `choices_method` 抽象让不同选择归一化策略可插拔。
 
+**请求数边界：** 对 RuntimeEndpoint，select 先用零 token请求获取 `prompt_tokens`，再把所有 `text + choice` 作为 batch 请求 logprob；若 `choices_method.requires_unconditional_logprobs`，还会按 input ids 发第三次请求。OpenAI backend 则是逐 token 受限选择的另一套算法，chat model 明确不支持 select。
+
 ---
 
 ## 4. RuntimeEndpoint：把前端状态转成后端 HTTP
@@ -423,7 +431,7 @@ if expr.name is not None:
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/backend/runtime_endpoint.py L27-L54
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/backend/runtime_endpoint.py L27-L54
 self.base_url = base_url
 self.api_key = api_key
 self.verify = verify
@@ -457,7 +465,7 @@ else:
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/backend/runtime_endpoint.py L159-L196
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/backend/runtime_endpoint.py L159-L196
 self._handle_dtype_to_regex(sampling_params)
 data = {
     "text": s.text_,
@@ -481,7 +489,9 @@ return obj["text"], obj["meta_info"]
 
 **不变量与失败模式：** `s.text_` 必须已经包含 prompt 前缀；HTTP 非 200 会通过 `_assert_success` 抛 RuntimeError。
 
-**要点：** 图片由 `_add_images` 插入，说明 multimodal 输入也被作为 executor 状态携带到后端请求。
+**要点：** 图片由 `_add_images` 插入，但当前 RuntimeEndpoint 只允许 `images_` 中恰有一项；interpreter 能收集多个对象不等于 HTTP backend 已支持多图。
+
+**tracing 边界：** `SglImage` 与 `SglVideo` 的构造函数没有调用 `SglExpr.__init__()`，对象缺少普通 IR 节点初始化出的 `node_id/prev_node/pid`。普通解释器可以处理它们，但 tracer 或 `print_graph_dfs` 若访问 `node_id` 可能报属性错误；不要把“运行时能编码图片”推广为“多模态 IR 图完整可视化”。
 
 ### 4.3 dtype 在后端入口转 regex
 
@@ -494,7 +504,7 @@ return obj["text"], obj["meta_info"]
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/backend/runtime_endpoint.py L127-L157
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/backend/runtime_endpoint.py L127-L157
 if sampling_params.dtype is None:
     return
 
@@ -530,7 +540,7 @@ sampling_params.regex = dtype_regex
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/backend/runtime_endpoint.py L80-L87
+# 来源：python/sglang/lang/backend/runtime_endpoint.py L80-L87
 def cache_prefix(self, prefix_str: str):
     res = http_request(
         self.base_url + "/generate",
@@ -541,7 +551,7 @@ def cache_prefix(self, prefix_str: str):
     self._assert_success(res)
 ```
 
-**代码逻辑：** 请求 text=prefix；采样参数设置生成 0 token；成功即认为后端缓存可复用。
+**代码逻辑：** 请求 text=prefix；采样参数设置生成 0 token；HTTP 成功只说明后端接受并处理了这次预填请求。后续是否真正命中、保留多久以及能否跨请求复用，仍取决于服务端缓存策略与运行观测。
 
 **为什么这样写：** 复用现有 `/generate` API 比新增一个专门 cache endpoint 更简单，也能走同一套 tokenizer/prefix 处理。
 
@@ -551,7 +561,7 @@ def cache_prefix(self, prefix_str: str):
 
 ### 4.5 lazy commit 用同一条 /generate 路径
 
-**问题与约束：** fork 前需要把当前文本状态提交到后端 KV cache，否则多个分支无法安全复用前缀。
+**问题与约束：** 对 `size>1` 且已有文本的 fork，当前实现先用 lazy commit 预填当前 prefix，意图为后续分支复用后端缓存创造条件；这是一条性能路径，不是 Python 文本分支保持正确语义的必要条件。
 
 **设计选择：** `commit_lazy_operations` 也发送 `max_new_tokens: 0` 的 `/generate`，并把当前 executor 的 images 加入请求。
 
@@ -560,7 +570,7 @@ def cache_prefix(self, prefix_str: str):
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/backend/runtime_endpoint.py L105-L114
+# 来源：python/sglang/lang/backend/runtime_endpoint.py L105-L114
 def commit_lazy_operations(self, s: StreamExecutor):
     data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
     self._add_images(s, data)
@@ -577,9 +587,13 @@ def commit_lazy_operations(self, s: StreamExecutor):
 
 **为什么这样写：** fork/join 的 KV cache 语义不应该重新实现一套后端协议；零 token generate 已经能触发相同 prefill/caching 路径。
 
-**不变量与失败模式：** 如果 backend 不支持 concate-and-append，解释器会 fallback 到纯文本拼接路径。
+**不变量与失败模式：** 如果 backend 不支持 concate-and-append，解释器会 fallback 到纯文本拼接路径。即使 capability 为 true，协议也要求 src/dst id 与服务端已存在请求一一对应；当前 RuntimeEndpoint 的 generate/commit payload 未发送 `s.sid`/`rid`，却在 join 时发送 executor sid，因而存在身份不一致风险。
 
-**要点：** 这段配合 `_execute_concatenate_and_append_kv_cache` 使用，属于高性能分支，不影响普通文本语义。
+**要点：** 这段配合 `_execute_concatenate_and_append_kv_cache` 使用，属于可选高性能分支。身份协议不闭环会使 KV 拼接优化失败；backend capability 为 false 时的纯文本拼接 fallback 仍保留普通文本语义。
+
+### 4.6 KV concatenate 的 request identity 未闭环
+
+`StreamExecutor` 为每个分支生成本地 UUID `sid`，`_execute_concatenate_and_append_kv_cache` 最终把子 sid 和主 sid 传给 backend；但 RuntimeEndpoint 的 `generate`、`generate_stream`、`commit_lazy_operations` 与 `_generate_http_request` 都没有在 JSON 中设置 `rid: s.sid`。因此从当前文件集合无法证明 SRT 已按这些 sid 建立 KV 请求。排障时应同时抓取 `/generate` payload 与 `/concate_and_append_request` 参数；如果前者没有对应 rid，后者失败或找不到 request 不是 cache 容量问题，而是身份协议未建立。
 
 ---
 
@@ -596,7 +610,7 @@ def commit_lazy_operations(self, s: StreamExecutor):
 **源码锚点：**
 
 ```python
-## 来源：python/sglang/lang/interpreter.py L105-L114
+# 定位骨架（非逐行摘录）：来源 python/sglang/lang/interpreter.py L105-L114
 if global_config.enable_precache_with_tracing and len(batch_arguments) > 1:
     cache_program(program, backend)
 
@@ -626,10 +640,17 @@ Frontend Language 的执行链可以概括为：
 2. `SglFunction.run` 选择 backend 和默认采样参数。
 3. `run_program` 创建 `ProgramState` 与 `StreamExecutor`。
 4. `ProgramState.__iadd__` 提交 IR，`StreamExecutor._execute` 解释执行。
-5. `RuntimeEndpoint` 把 executor 当前状态转成 `/generate` 或选择请求。
+5. 具体 backend 把 executor 当前状态转成生成、选择、缓存提交等调用；RuntimeEndpoint 主要通过 HTTP 接到既有服务。
 6. 变量、meta_info、stream event 再回到 `ProgramState`，供用户 Python 控制流继续使用。
 
 这套设计的关键取舍是：让 Python 保留控制流表达力，让 IR 只承载可被后端解释的副作用节点。理解这一点后，`fork`、lazy commit、tracing precache、dtype regex 和 streaming 变量事件都不再是零散功能，而是同一个运行时解释器模型下的不同优化与语法层。
+
+### 当前基线的入口边界
+
+- `RuntimeEndpoint(url)`：连接既有 HTTP 服务，是 `BaseBackend` 实现。
+- `Runtime(**server_args)`：spawn HTTP server，随后持有 `.endpoint`；`run_program` 会解包它。
+- `Engine(**server_args)`：直接以 TokenizerManager + IPC/ZMQ 调用 SRT，接口面向离线生成，不是当前 SGL backend。
+- `num_api_spec_tokens`：OpenAI backend 有 chat-format lazy 与 completion lookahead 两条实现；不要与 `SglCommitLazy` 或 SRT draft-model speculative decoding 混为一谈。
 
 ---
 
@@ -638,7 +659,8 @@ Frontend Language 的执行链可以概括为：
 维护本文时，先用下面的命令确认前端语言主线还在原位：
 
 ```powershell
-rg -n "def gen\\(|class SglFunction|def run_program_batch|def fork\\(|class ProgramState|class RuntimeEndpoint|def commit_lazy_operations" sglang/python/sglang/lang
+rg -n "def gen\\(|class SglFunction|def run_program_batch|def fork\\(|class ProgramState|class RuntimeEndpoint|def commit_lazy_operations|self.sid|src_rids|dst_rid|\"rid\"" sglang/python/sglang/lang
+rg -n "class Engine\\(|class OpenAI|def generate_stream|def select\\(|num_api_spec_tokens" sglang/python/sglang/srt/entrypoints/engine.py sglang/python/sglang/lang/backend/openai.py sglang/python/sglang/lang
 ```
 
 预期信号：
@@ -647,5 +669,7 @@ rg -n "def gen\\(|class SglFunction|def run_program_batch|def fork\\(|class Prog
 - `ir.py` 仍能找到 `SglFunction`，说明函数装饰与 IR 边界还在。
 - `interpreter.py` 仍能找到 batch 执行、`ProgramState` 与 fork 相关入口。
 - `backend/runtime_endpoint.py` 仍能找到后端 HTTP endpoint 和 lazy commit。
+- executor sid、RuntimeEndpoint payload 与 concatenate 的 rid 参数仍需逐项对照，不能只看方法存在。
+- `Engine` 与 OpenAI backend 的接口和 API speculative 路径仍需分开解释。
 
 如果 API、IR、解释器、backend endpoint 任何一层被拆分，应先更新本文主线图，再更新具体源码锚点。

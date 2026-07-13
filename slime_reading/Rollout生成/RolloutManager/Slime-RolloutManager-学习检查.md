@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RolloutManager · 学习检查
 
@@ -21,6 +21,7 @@ updated: 2026-07-10
 - [ ] 能说出 `tokens/rewards/loss_masks/rollout_ids/rollout_mask_sums/partition/micro_batch_indices` 的来源和用途。
 - [ ] 能说明 `raw_reward/total_lengths` 为什么保留全局列。
 - [ ] 能解释 `get_updatable_engines_and_lock` 为什么排除 frozen 模型。
+- [ ] 能说明可变 fanout 默认 normalization、尾部 rollout 取整和 `balance_by_flops` token cap 三个边界。
 
 ## 源码定位验收
 
@@ -47,6 +48,7 @@ updated: 2026-07-10
 - [ ] `debug_rollout_only` 下训练没有数据：能解释这是预期提前返回。
 - [ ] 权重更新拿不到 engine：能检查是否存在 `update_weights=True` 的 server。
 - [ ] 训练侧字段 dtype 异常：能回到 `_tensorize_rollout_data_for_training` 检查字段是否列在 dtype map 中。
+- [ ] custom converter 缺 `tokens/rollout_ids` 或混合可选字段：能解释为何当前错误会延迟到 split/训练侧。
 
 ## 运行或观测验收
 
@@ -56,21 +58,25 @@ updated: 2026-07-10
 - [ ] 用 `load_debug_rollout_data` 复放一份样本，确认跳过 SGLang 请求但仍进入 convert/split。
 - [ ] 构造一个最小 compact nested output，验证 sibling `rollout_id` 缺失时会失败，共享 id 后通过。
 - [ ] 跑 `tests/test_dp_schedule.py`，确认 partitions 和 micro-batch indices 满足 invariants。
+- [ ] 构造 5 个 rollout、`global_batch_size=2`，确认最后一个 rollout 不进入 partition；再解释这不是“最后一步自动缩 batch”。
 
-## 维护检查
+## 最小静态与单元检查
 
 完成学习后执行：
 
 ```powershell
-node maintenance\audit_source_evidence.mjs --note 'slime_reading\Rollout生成\RolloutManager\Slime-RolloutManager-源码走读.md'
-node maintenance\audit_source_evidence.mjs
-node maintenance\audit_wikilinks.mjs
-git diff --check
+rg -n 'def generate\(|_get_rollout_data|_validate_rollout_id_annotated|_convert_samples_to_train_data|_split_train_data_by_dp|get_updatable_engines_and_lock' slime/slime/ray/rollout.py
+Push-Location slime
+python -m pytest tests/test_dp_schedule.py -q
+Pop-Location
 ```
 
 通过标准：
 
-- 源码引用文件存在，行号在当前 upstream 范围内。
-- 双链无断链。
+- 静态结果能串出 generate、debug replay、rollout id 校验、train_data 转换与 DP split。
+- DP schedule 单测通过；缺 Ray/Megatron 不影响该纯调度测试时，才可把失败归入实现。
+- 当前基线预期为 `9 passed`；测试覆盖静态/动态/VPP/oversize/rollout grouping/trailing trim，但不覆盖 `balance_by_flops` 超 token cap 的 OOM 风险。
+- 当前环境实测 `9 passed`。插件 runtime-hook contracts 因缺 `httpx` 在 collection 阶段失败，并伴随 Torch/NumPy ABI 警告；这属于环境覆盖限制。
+- 当前 reward 方法 AST 实测确认：固定 fanout 按 reshape 后的行中心化；可变 fanout fallback 只做整批中心化。GPU fanout E2E 仍需完整 SGLang/Megatron 环境。
 - 能用源码入口和运行现象证明关键判断。
 - 读者能沿一个 `rollout_id` 复述样本生产线，并能定位至少 4 类失败模式。

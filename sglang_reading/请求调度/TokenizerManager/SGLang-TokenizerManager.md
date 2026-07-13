@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # TokenizerManager
 
@@ -62,6 +62,10 @@ TokenizerManager 的关键不是“会分词”，而是同时维护三条边界
 | 后端输出到 HTTP | 按 `rid` 找 `ReqState`、累加文本/token ids、设置 event、yield chunk | 不负责 token id 到字符串的增量 decode，除非 skip tokenizer bypass |
 | 数据面到控制面 | 数据面按 `rid` 多路复用；控制面用 communicator 等待 Scheduler rank 回复 | 不把权重更新、flush cache 当作普通 generate 请求 |
 
+在这三条边界之前还有一道容易被忽略的“请求整形”：`normalize_batch_and_arguments()` 会判断 single/batch、生成或扩展 `rid`、补默认参数，并把 `sampling_params.n > 1` 改写成 parallel-sampling 路径。因此 API 传入的 `GenerateReqInput` 不是只读 DTO；进入 `ReqState` 前，它的对象形态已经可能发生变化。
+
+当前基线还有一个值得带着问题意识阅读的边界：parallel sampling 会先按 `B×N` 个规范化 rid 建立 `ReqState`，随后只按原始 batch size `B` 取 prompt、预热前缀并重新生成实际 sample rid。正常展开末尾只显式删除前 `B` 个规范化 state；当 `N>1` 时，其余 `B×(N-1)` 个 placeholder state 没有在这条路径上看到对应删除。本文把它作为已由静态调用链确认、仍需 live 压测量化影响的生命周期风险，而不是把所有规范化 rid 都称为“实际请求”。
+
 ## 阅读顺序
 
 | 顺序 | 文档 | 读者目标 |
@@ -90,4 +94,4 @@ TokenizerManager 的关键不是“会分词”，而是同时维护三条边界
 |--------|--------|--------|
 | [[SGLang-OpenAI-API]] 把 OpenAI/Ollama/HTTP 请求转成内部 input object | TokenizerManager 注册状态、分词、发送、等待输出 | [[SGLang-ScheduleBatch数据结构]] 和 [[SGLang-Detokenizer]] 解释请求进入 Scheduler 后的对象形态和回程 |
 
-如果只想先跑通请求链路，读 `01 -> 02 -> 05` 即可；如果在排查生产流式输出或多 worker 问题，直接读 `03 -> 04`。
+如果只想先跑通请求链路，先读核心概念、源码走读和学习检查；如果在排查生产流式输出或多 worker 问题，直接进入数据流和排障指南。

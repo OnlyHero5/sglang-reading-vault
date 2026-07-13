@@ -8,7 +8,7 @@ tags:
   - framework/sglang
   - content/dashboard
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # SGLang 专题看板
@@ -32,3 +32,4 @@ updated: 2026-07-10
 
 按 `topic` 分组浏览；同一主题内优先读入口图和核心概念，需要改代码再进入源码走读与数据流，出现故障时直接打开排障指南。
 
+看板中的模块关系是阅读路由，不表示固定进程数或唯一 worker loop；普通/overlap、PP、PD、DP 和平台路径应回到对应专题确认。

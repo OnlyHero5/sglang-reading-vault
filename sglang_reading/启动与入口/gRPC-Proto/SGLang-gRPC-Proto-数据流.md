@@ -9,13 +9,13 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # gRPC-Proto · 数据流
 
 ## 你为什么要读
 
-这篇只回答一个问题：一条 gRPC 请求在每个边界变成什么对象、谁持有状态、下一跳是谁。
+这篇只回答一个问题：Native Rust gRPC 实现中的一条请求在每个边界变成什么对象、谁持有状态、下一跳是谁。当前 `--grpc-mode` 的 legacy servicer 不经过这里列出的 `PyBridge` 对象链。
 
 ## 对象生命周期
 
@@ -161,7 +161,7 @@ pub(crate) fn json_map_to_pydict<'py>(
             )
 ```
 
-对象形态到这里已经和 HTTP 入口接近：HTTP 是 JSON body 进 `GenerateReqInput`，gRPC 是 Proto 进 dict 再进 `GenerateReqInput`。
+对象形态到这里已经和内部 HTTP native 入口接近：typed gRPC 是 Proto 进 dict 再进 `GenerateReqInput`。这句话不适用于 OpenAI pass-through；后者先复用 OpenAI serving handler，才在 handler 内部完成协议转换。
 
 ## 4. 输出侧统一成 ResponseChunk
 
@@ -221,7 +221,7 @@ fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
 }
 ```
 
-客户端如果直接把 `meta_info["completion_tokens"]` 当普通数字读，会踩坑；正确方式是按 JSON 字符串解码。
+客户端如果直接把 `meta_info["completion_tokens"]` 当普通数字读，会踩坑；正确方式是对每个 value 统一做 JSON decode。即使 Python 原值本来就是字符串，编码结果也带 JSON 引号，不能只对“看起来像数字”的字段解码。
 
 ## 6. Tokenize/Detokenize 不一定进入 Scheduler
 
@@ -334,7 +334,7 @@ impl RustTokenizer {
 
 ## 7. OpenAI pass-through 走 bytes，不走 typed dict
 
-OpenAI-compatible RPC 的数据流不是 `GenerateReqInput` typed dict，而是 JSON bytes 进入 Python OpenAI serving class，再以 bytes 回到 Rust。
+OpenAI-compatible RPC 的入口数据流不是 `GenerateReqInput` typed dict，而是 JSON bytes 进入 Python OpenAI serving class。流式响应在 Python 侧从 SSE `data:` 行拆出 JSON payload，再以 raw bytes 回到 Rust；因此它复用 serving 语义，却不会把 SSE framing 原样暴露给 gRPC client。
 
 ```rust
 # 来源：rust/sglang-grpc/src/bridge.rs L697-L783
@@ -427,14 +427,14 @@ impl JsonChunkCallback {
 }
 ```
 
-这说明 typed generate 和 OpenAI pass-through 共享 stream/backpressure，但数据 payload 形态不同。
+这说明 typed generate 和 OpenAI pass-through 共享 per-rid channel/backpressure 机制，但请求转换、payload 和超时收尾并不相同。typed generate 在 backpressure timeout 时传入 `timeout_abort_rid`；OpenAI `_send_with_backpressure` 没有这个参数，超时先关闭 producer，后续取消还依赖 Rust guard 或 channel 生命周期传播。
 
 ## 8. Legacy sidecar 是运维旁路
 
-当前 `--grpc-mode` wrapper 会在 request manager ready 后挂 sidecar。sidecar 承担 `/metrics`、`/start_profile`、`/stop_profile` 这类 HTTP 运维端点，不是业务生成路径。
+当前 `--grpc-mode` wrapper 会在外部 servicer 支持 `on_request_manager_ready` hook 时挂 sidecar。sidecar 承担 `/metrics`、`/start_profile`、`/stop_profile` 这类 HTTP 运维端点，不是业务生成路径；默认端口是 `--port + 1`，也可由 `--grpc-http-sidecar-port` 覆盖。
 
 ```python
-# 来源：python/sglang/srt/entrypoints/grpc_server.py L194-L223
+# 来源：python/sglang/srt/entrypoints/grpc_server.py L194-L222
     async def _on_request_manager_ready(request_manager, srv_args, sched_info):
         nonlocal sidecar_runner
         try:
@@ -472,9 +472,9 @@ impl JsonChunkCallback {
 
 gRPC/Proto 的对象迁移可以记成四次换壳：
 
-1. Proto request 换成 JSON map。
+1. typed Proto request 换成 JSON map；OpenAI RPC 则保持 JSON bytes。
 2. JSON map 换成 Python `GenerateReqInput` 或 `EmbeddingReqInput`。
 3. Python chunk 换成 Rust `ResponseChunk`。
 4. `ResponseChunk` 换成 Proto response 或 JSON bytes response。
 
-每次换壳都保留同一个 `rid`，这就是排查请求泄漏、断连和 backpressure 的主线。
+Native bridge 的每次换壳都围绕同一个 `rid` 建立 channel、callback 与 abort 关联，这就是排查请求泄漏、断连和 backpressure 的主线。legacy sidecar 只提供运维 HTTP 旁路，不属于这四次换壳。

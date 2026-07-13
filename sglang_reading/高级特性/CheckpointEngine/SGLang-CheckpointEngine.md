@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # CheckpointEngine
 
@@ -19,7 +19,7 @@ updated: 2026-07-10
 
 读完要能做四件事：
 
-- 区分 HTTP `/ping` 可达、初始权重 ready、warmup 完成、业务可服务这四种状态。
+- 区分 HTTP `/ping` 可达、`initial_weights_loaded` 状态位、warmup 完成、业务可服务这四种状态，并知道等待超时并不会 fail closed。
 - 沿 `/update_weights_from_ipc` 追到 TokenizerManager、Scheduler、WeightUpdater、TPWorker、ModelRunner 和 checkpoint-engine worker extension。
 - 解释为什么 IPC 请求只传 `zmq_handles`，不把 tensor 放进 HTTP body。
 - 排查热更新失败：缺 checkpoint-engine 包、GPU UUID 不匹配、DP 约束不满足、cache flush 后命中率下降、draft worker 更新失败。
@@ -35,11 +35,11 @@ flowchart TB
   TM --> SCHED["Scheduler 执行门<br/>WeightUpdater"]
   SCHED --> RUNNER["ModelRunner 适配门<br/>checkpoint-engine worker"]
   RUNNER --> MODEL["model.load_weights<br/>post_hook"]
-  SCHED --> CACHE["flush radix cache<br/>barrier"]
+  SCHED --> CACHE["按请求 flush cache<br/>TP barrier / duration"]
   HTTP --> READY["initial_weights_loaded=True"]
 ```
 
-这张图的读法是：外部脚本先等 HTTP 可连接，再 POST IPC handles；SGLang 内部只有在更新成功后才释放初始权重 ready；热更新完成后必须处理 cache 与各 rank 同步。
+这张图的读法是：外部脚本先等 HTTP 可连接，再 POST IPC handles；HTTP endpoint 依据 TokenizerManager 返回的 success 翻转初始权重状态。这个状态是“有界等待”的条件，不是永久硬门：超时只记 error，随后仍会继续 warmup。cache 只在 `flush_cache=True` 且主 target worker 成功时刷新；duration 即使失败也会在 `finally` 更新。
 
 ## 源码范围
 
@@ -49,11 +49,11 @@ flowchart TB
 | HTTP update endpoint | `python/sglang/srt/entrypoints/http_server.py` |
 | 权重 ready 状态、锁、communicator | `python/sglang/srt/managers/tokenizer_manager.py`、`python/sglang/srt/managers/tokenizer_control_mixin.py` |
 | Scheduler 控制消息路由 | `python/sglang/srt/managers/scheduler.py` |
-| pause、metrics、flush、barrier | `python/sglang/srt/managers/scheduler_components/weight_updater.py` |
+| 并发锁、paused 分支、DP 结果处理 | `python/sglang/srt/managers/tokenizer_control_mixin.py`、`python/sglang/srt/managers/communicator.py` |
+| metrics、条件 flush、barrier | `python/sglang/srt/managers/scheduler_components/weight_updater.py` |
 | rank 侧执行与模型加载适配 | `python/sglang/srt/managers/tp_worker.py`、`python/sglang/srt/model_executor/model_runner.py` |
 | checkpoint-engine worker extension | `python/sglang/srt/checkpoint_engine/checkpoint_engine_worker.py` |
 | 外部 torchrun 更新脚本 | `python/sglang/srt/checkpoint_engine/update.py` |
-| 扁平 bucket 通用结构 | `python/sglang/srt/weight_sync/tensor_bucket.py` |
 
 ## 最小源码证据
 
@@ -107,7 +107,7 @@ async def update_weights_from_ipc(
         )
 ```
 
-所以排障时不要把 SGLang 文档读成“它实现了 ParameterServer”。SGLang 实现的是 serving 侧适配：接 HTTP 控制请求、串行化更新、暂停调度、调用本 rank loader、刷新 cache、释放 ready 状态。
+所以排障时不要把 SGLang 文档读成“它实现了 ParameterServer”。SGLang 实现的是 serving 侧适配：接 HTTP 控制请求、在非 paused 路径用 writer lock 排除推理 reader、调用本 rank loader、按请求刷新 cache，并返回控制面结果。它不提供事务回滚；paused 路径也不会再次获取 writer lock。
 
 ## 阅读顺序
 
@@ -122,7 +122,7 @@ async def update_weights_from_ipc(
 ## 关联专题
 
 - 冷启动和其他权重加载路径见 [[SGLang-ModelLoader]]。
-- 热更新期间的 `weight_load_duration_seconds`、`num_paused_reqs`、`cache_hit_rate` 见 [[SGLang-可观测性]]。
+- 热更新期间的 `weight_load_duration_seconds`、`cache_hit_rate` 与 HTTP 结果见 [[SGLang-可观测性]]；当前基线的 `num_paused_reqs` 未找到递增写入，不能拿来量化 IPC 影响。
 - base model 与 LoRA adapter 的边界见 [[SGLang-LoRA]]。
 - Slime 侧训练到 rollout 权重推送见 [[Slime-分布式权重同步]]、[[Slime-RL训练全链路]]。
 

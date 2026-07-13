@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 训练与Rollout参数
 
@@ -23,7 +23,7 @@ updated: 2026-07-10
 |--------------|------------------|
 | 自定义 rollout 函数没生效 | 看 `rollout_function_path` 在 RolloutManager 初始化时如何被 `load_function` 加载 |
 | `eval_function_path` 没传却有值 | 看 validate 如何继承 `rollout_function_path` |
-| `global_batch_size` 和 rollout 数对不上 | 用 `rollout_batch_size * n_samples_per_prompt // num_steps_per_rollout` 推导 |
+| `global_batch_size` 和训练数据行数对不上 | 先区分默认 rollout execution 数与 compact/subagent 展开的 Sample 行，再看 DP scheduler 按 `rollout_id` 分步 |
 | custom generate、dynamic filter、sample filter 混淆 | 区分 per-sample 生成钩子、组级采样过滤、loss 参与过滤 |
 | custom loss / advantage 不生效 | 看 Megatron loss 中的 `load_function` 消费点 |
 | disk/delta 权重同步启动失败 | 看 validate 对 shared dir、transport、colocate、本地 checkpoint 的约束 |
@@ -87,19 +87,21 @@ flowchart LR
 | path 参数都必须是 `module.attr` | `load_function` 只做 `rpartition(".")` 后 import module 再取 attribute |
 | `rollout_function_path` 替换整条 rollout 函数 | 它返回 `RolloutFnTrainOutput` 或 eval 输出，不只是单 sample generate |
 | `custom_generate_function_path` 只替换默认 rollout 内部的 per-sample generate | 它不接管 dynamic filter、abort、sample filter 等外层循环 |
-| `rollout_batch_size` 是 prompt group 数 | 训练样本数通常还要乘 `n_samples_per_prompt` |
-| `num_steps_per_rollout` 会反推 `global_batch_size` | 显式给错会在 validate 阶段 assert |
+| 默认 SGLang 路径中 `rollout_batch_size` 是有效 prompt group 目标 | 每组先发起 `n_samples_per_prompt` 个默认 rollout execution；full custom rollout 必须自行满足返回契约 |
+| 当前 `global_batch_size` 的调度单位是唯一 `rollout_id`，不是展开后的 Sample 行 | compact/subagent 的多个 sibling 共享一个 id；`num_steps_per_rollout` 公式推导的是每步 rollout execution 数 |
+| `update_weights_interval` 只被 `train_async.py` 消费 | 同步 `train.py` 当前每轮都发布，不能把 interval 套到同步入口 |
 | `loss_type=custom_loss` 必须配 `custom_loss_function_path` | 实际 loss 选择发生在 Megatron loss 函数里 |
 
 ## 运行验证入口
 
-优先跑 contract tests，它们专门固定这些 path 参数的签名和调用点：
+优先跑 DP schedule、contract 与参数测试：
 
 ```powershell
-python -m pytest tests/plugin_contracts -q
-python -m pytest tests/test_megatron_argument_validation.py -q
+python -m pytest slime/tests/test_dp_schedule.py -q
+python -m pytest slime/tests/plugin_contracts -q
+python -m pytest slime/tests/test_megatron_argument_validation.py -q
 ```
 
-如果环境缺少训练依赖，至少运行相关静态审计和可 import 的 contract tests；失败原因要区分“依赖收集失败”和“契约断言失败”。
+当前轻量环境中 DP schedule 9 项、argument validation 14 项通过；plugin contracts 因缺 `httpx` 在 collection 阶段失败。注意 argument validation 当前不覆盖 global-batch 推导或 eval path 继承，runtime hook contract 也未覆盖 custom converter 新增的 `rollout_ids` 调度字段，不能把测试覆盖写得比实际更大。
 
 下一篇先读 [[Slime-训练与Rollout参数-核心概念]]。

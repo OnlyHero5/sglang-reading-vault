@@ -9,107 +9,163 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 请求调度
 
-> **你只需阅读本目录，不必打开 `sglang/` 源码。** 
-> 内嵌代码对应 sglang Git commit `70df09b`。
+> 本目录解释一个请求如何从前台输入变成可执行批次，再如何把执行结果变成客户端可消费的增量输出。重点是对象所有权与交接，不是背一张固定进程图。
 
----
+## 你为什么要读
 
-## 本目录解决什么问题
+“连续批处理”常被画成 Tokenizer→Scheduler→GPU→Detokenizer 的单箭头，但真实系统还要处理：多 tokenizer/detokenizer worker、DP controller、TP/PP rank、overlap 的跨迭代结果、PD 独立 loop、embedding/abort 等绕过普通 detokenize 的输出，以及 skip-tokenizer 输入。
 
-启动与入口部分讲清了请求如何从 HTTP/gRPC 进来。本目录回答：**进来之后，SGLang 如何把文本变成 GPU batch、跑 forward、再把 token 变回文本推给客户端？**
+读完后你应能回答：
 
-五个专题覆盖调度子系统全链路：
+- 请求在每一站是什么对象？
+- 谁拥有 waiting/running、KV 准入和 batch 生命周期？
+- `ScheduleBatch` 何时被物化为 `ForwardBatch`？
+- token id、文本 delta、abort 和管理响应分别走哪条回程？
 
-| 模块 | 模块 | 一句话 |
-|------|------|--------|
-| [[SGLang-TokenizerManager]] | 前台进程 | 文本 ↔ token id，ZMQ 与 Scheduler/Detokenizer 通信 |
-| [[SGLang-Scheduler]] | GPU 子进程核心 | continuous batching、prefill/decode 调度、OOM retract |
-| [[SGLang-SchedulePolicy]] | 调度策略 | FCFS / LPM / 抢占、PrefillAdder 预算、Radix 前缀匹配 |
-| [[SGLang-ScheduleBatch数据结构]] | 数据结构 | ScheduleBatch → ForwardBatch、Req、io_struct |
-| [[SGLang-Detokenizer]] | 输出进程 | 增量 UTF-8 decode、DecodeStatus |
+## 五个专题
 
----
+| 专题 | 所有权 | 核心问题 |
+|---|---|---|
+| [[SGLang-TokenizerManager]] | API 前台与 per-request 状态 | tokenization、媒体处理、请求发送、结果唤醒与 API chunk |
+| [[SGLang-Scheduler]] | waiting/running、执行批次和资源准入 | loop、continuous batching、overlap、retract、结果提交 |
+| [[SGLang-SchedulePolicy]] | 排序与新请求准入 | prefix match、token budget、chunk、priority、delayer |
+| [[SGLang-ScheduleBatch数据结构]] | 调度侧可变批次与请求对象 | `Req`、`ScheduleBatch`、输出快照和 `ForwardBatch` 交接 |
+| [[SGLang-Detokenizer]] | token→text 的增量 decode 状态 | decode window、UTF-8、stop trim、多 worker 亲和 |
 
-## 端到端时序
-
-这张图用于检查是否能复述 TokenizerManager → Scheduler → TP Worker → Detokenizer 消息流。
+## 普通生成主线
 
 ```mermaid
 sequenceDiagram
- participant Client as HTTP/gRPC 客户端
- participant TM as TokenizerManager
- participant SCH as Scheduler
- participant TW as TpWorker<br/>模型执行
- participant DT as Detokenizer
+    participant C as Client/API
+    participant T as TokenizerManager/Router
+    participant S as Scheduler/DP Controller
+    participant W as TpModelWorker
+    participant D as Detokenizer/Router
 
- Client->>TM: GenerateReqInput
- Note over TM: tokenize<br/>TokenizedGenerateReqInput
- TM->>SCH: ZMQ PUSH
- Note over SCH: ScheduleBatch<br/>PrefillAdder / 策略<br/>Req / ForwardBatch
- SCH->>TW: forward (extend / decode)
- TW-->>SCH: logits / next token ids
- Note over SCH: filter_batch / merge
- SCH->>DT: BatchTokenIDOutput
- Note over DT: DecodeStatus<br/>增量 batch_decode
- DT->>TM: BatchStrOutput (ZMQ PUSH)
- TM-->>Client: SSE 流式 chunk
+    C->>T: GenerateReqInput / OpenAI request
+    T->>T: tokenize / multimodal / validate
+    T->>S: TokenizedGenerateReqInput
+    S->>S: Req → waiting/running → ScheduleBatch
+    S->>W: direct worker call in Scheduler process
+    W->>W: ForwardBatch.init_new → ModelRunner
+    W-->>S: GenerationBatchResult
+    alt 需要文本 decode
+        S->>D: BatchTokenIDOutput
+        D-->>T: BatchStrOutput
+    else abort/embedding/管理类输出
+        S-->>T: typed output
+    end
+    T-->>C: native/OpenAI/gRPC adapter chunk
 ```
 
-这张图的读法是：数据面是 **三进程拓扑**：TokenizerManager（主进程）、Scheduler+TpWorker（GPU 子进程）、Detokenizer（独立 CPU 进程）。Scheduler **不直接**与 Detokenizer 对话：token id 经 Scheduler 发出，Detokenizer 收完后 PUSH 回 TokenizerManager，再由 TM 组装 HTTP 响应。
+### 两条关键纠正
 
----
+1. Scheduler 与 `TpModelWorker` 通常在同一 Scheduler 进程内直接调用，不是“Scheduler 通过 ZMQ 把 `ScheduleBatch` 发送给 worker”。
+2. 不是所有 Scheduler 输出都先经过 Detokenizer；abort、embedding、管理响应等可以直接发回 TokenizerManager。普通 generation token 才进入 token→text 主线。
 
-## 零基础一句话
+## 前台发送边界
 
-**像餐厅运营：** TokenizerManager 是前台点单员，Scheduler 与 SchedulePolicy 是后厨排班和配菜规则，ScheduleBatch 是订单卡片格式，Detokenizer 是传菜员，把 token id 翻译成客人能看懂的文本。
+TokenizerManager 在 pickle 前包装大 feature，再分派给 Scheduler：
 
----
+```python
+# 来源：python/sglang/srt/managers/tokenizer_manager.py L1331-L1342
+    def _send_one_request(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ):
+        tokenized_obj.time_stats.set_api_server_dispatch_time()
+        tokenized_obj = wrap_shm_features(tokenized_obj)
+        time_stats = tokenized_obj.time_stats
+        tokenized_obj.wrap_pickle_fields()
+        self._dispatch_to_scheduler(tokenized_obj)
+        tokenized_obj.time_stats = time_stats
+        tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+```
 
-## 推荐阅读顺序
+这条边界承载的不只是文本 token，还可能包含多模态共享内存引用、sampling 参数、LoRA 身份、trace 和时间统计。
 
-建议按 TokenizerManager → Scheduler → SchedulePolicy → ScheduleBatch → Detokenizer 阅读。若时间紧，最低闭环是 TokenizerManager → Scheduler → Detokenizer；仍建议补读 ScheduleBatch 与 ForwardBatch 的对比。
+## Scheduler 的职责闭环
 
-| 顺序 | 文档 | 必读理由 |
-|------|------|----------|
-| 1 | [[SGLang-TokenizerManager-核心概念]] | 理解 ReqState、Mixin、generate_request 入口 |
-| 2 | [[SGLang-Scheduler-源码走读]] | event loop、overlap、retract 主路径 |
-| 3 | [[SGLang-SchedulePolicy-核心概念]] | LPM 与 RadixCache 如何协同 |
-| 4 | [[SGLang-ScheduleBatch数据结构-排障指南]] | ScheduleBatch vs ForwardBatch（最高频混淆） |
-| 5 | [[SGLang-Detokenizer-源码走读]] | UTF-8 增量 decode 机制 |
+普通 loop 可以压成：
 
----
+```text
+recv requests
+→ process input
+→ get next batch
+→ run batch
+→ process result
+```
 
-## 上下游衔接
+但 normal、overlap、PP、PDMux、PD prefill/decode 是不同 loop 家族。`get_next_batch_to_run()` 也不是简单合并 list：它要处理新请求准入、running decode、chunked prefill、retract、grammar/spec 与资源预算。
 
-| 方向 | 模块 | 衔接点 |
-|------|------|--------|
-| ← 上游入口 | 启动与入口 | HTTP `generate_request` → TokenizerManager |
-| → 模型执行 | ModelRunner | Scheduler 调用 TpWorker → ModelRunner |
-| → 内存核心 | RadixAttention 与 KV Cache | LPM 依赖 prefix match |
-| → 高级能力 | 投机解码与 PD 分离 | overlap 与扩展调度路径 |
+## `ScheduleBatch` 与 `ForwardBatch`
 
----
+| 对象 | 所有者 | 内容 |
+|---|---|---|
+| `Req` | Scheduler | 请求身份、输入/输出 token、prefix/KV 状态、finish 状态 |
+| `ScheduleBatch` | Scheduler | 可变请求集合、调度与资源字段、跨迭代状态 |
+| `ForwardBatch` | TpModelWorker/ModelRunner 执行边界 | 本轮 GPU 所需 tensor、position、KV loc、metadata view |
+| `GenerationBatchResult` | worker→Scheduler | logits、next token、PP proxy、graph/专家等结果 |
 
-## 验证建议（零基础可试）
+`ForwardBatch.init_new()` 在 `TpModelWorker` 一侧完成；不要把它归给 ModelRunner，也不要把 `ForwardBatch` 当作可长期修改的 running batch。
 
-1. **启动服务：** `sglang serve --model-path <small-model>`，另开终端 `curl -N` 流式请求，观察首 token 延迟。
-2. **进程拓扑：** `ps aux | grep -E 'Tokenizer|Scheduler|Detokenizer'`（Windows 可用任务管理器）应见三个相关进程。
-3. **策略对比：** 同一长 system prompt 两次请求，第二次 `--schedule-policy lpm` 时 TTFT 应低于 `fcfs`（需开启 RadixCache）。
+## Detokenizer 回程
 
----
+```python
+# 来源：python/sglang/srt/managers/detokenizer_manager.py L161-L170
+    def event_loop(self):
+        """The event loop that handles requests"""
+        while True:
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
+            output = self._request_dispatcher(recv_obj)
+            if output is not None:
+                sock_send(self.send_to_tokenizer, output)
+            self.soft_watchdog.feed()
+```
 
-## 模块导航
+Detokenizer 保存增量 decode 状态并回传 `BatchStrOutput`。TokenizerManager/API 层还会再次决定 chunk 粒度、finish reason、usage 与协议格式，因此“Detokenizer 产生一次字符串”不等于“客户端只收到一个 SSE token”。
 
-| 专题 | 入口 |
-|------|------|
-| TokenizerManager | [[SGLang-TokenizerManager]] |
-| Scheduler | [[SGLang-Scheduler]] |
-| SchedulePolicy | [[SGLang-SchedulePolicy]] |
-| ScheduleBatch | [[SGLang-ScheduleBatch数据结构]] |
-| Detokenizer | [[SGLang-Detokenizer]] |
+## 拓扑不是固定三进程
+
+最简 HTTP 配置可以画成前台 + Scheduler + Detokenizer，但以下配置都会改变拓扑：
+
+- `tokenizer_worker_num > 1`：MultiTokenizerRouter + workers；
+- `detokenizer_worker_num > 1`：router + 多 detokenizer；
+- DP / DP-Attention：controller、多个 Scheduler 或不同通信路径；
+- TP/PP：Scheduler/model worker rank 组；
+- 多节点非零 rank：不一定启动 tokenizer/detokenizer；
+- encoder-only、diffusion、Ray 或 legacy gRPC：进入不同服务形态。
+
+因此进程验证应列 PID、rank 和角色，不用 `ps` 里是否恰好出现三个名字作为正确性门禁。
+
+## 推荐阅读路径
+
+### 首次理解
+
+[[SGLang-TokenizerManager-核心概念]] → [[SGLang-Scheduler-数据流]] → [[SGLang-ScheduleBatch数据结构-核心概念]] → [[SGLang-Detokenizer-数据流]]
+
+### waiting / retract / TTFT
+
+[[SGLang-Scheduler-排障指南]] → [[SGLang-SchedulePolicy-源码走读]] → [[SGLang-KV-Cache-排障指南]]
+
+### token 已有但无文本
+
+[[SGLang-Scheduler-数据流]] → [[SGLang-Detokenizer-排障指南]] → [[SGLang-TokenizerManager-排障指南]]
+
+## 运行验证
+
+**操作**
+
+1. 启动目标配置并保存最终 ServerArgs。
+2. 列出实际 PID、rank、router/worker 角色。
+3. 发一个流式请求，记录 rid 在 TokenizerManager、Scheduler、Detokenizer 三站的时间。
+4. 再发 embedding 或 abort 请求，观察是否绕过普通文本 decode。
+
+**预期**：拓扑与最终配置一致；普通 generation 沿 token→text 回程，特殊输出按 typed channel 返回；不能从单个默认拓扑外推所有模式。
 
 ← [[SGLang-启动与入口]] · → [[SGLang-模型执行]]

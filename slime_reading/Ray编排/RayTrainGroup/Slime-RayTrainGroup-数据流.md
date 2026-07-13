@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RayTrainGroup · 数据流
 
@@ -42,7 +42,7 @@ flowchart LR
 
 ## 创建流：PG 到 rank actor
 
-RayTrainGroup 解包 06 产出的 PG 三元组，并把每个 rank 调度到对应 bundle。
+RayTrainGroup 解包 [[Slime-PlacementGroup]] 产出的 PG 三元组，并把每个 rank 调度到对应 bundle。
 
 ```python
 # 来源：slime/ray/actor_group.py L48-L62
@@ -98,7 +98,7 @@ for rank in range(world_size):
 driver 通过 `create_training_models` 调用 `async_init`，再 `ray.get` 等待结果。
 
 ```python
-# 来源：slime/ray/placement_group.py L189-L208
+# 定位骨架（据 `slime/ray/placement_group.py` L189-L208 删节）：
         critic_start_rollout_ids = ray.get(critic_model.async_init(critic_model.args, role="critic", with_ref=False))
 
     actor_start_rollout_ids = ray.get(
@@ -152,14 +152,14 @@ args.rank = dist.get_rank()
 args.world_size = dist.get_world_size()
 ```
 
-这解释了一个常见误区：Ray actor 进程创建成功，不等于 distributed process group 已经创建成功。
+这解释了一个常见误区：Ray actor 进程创建成功，不等于 distributed process group 已经创建成功。当前 caller 先等待 critic init，再发起并等待 actor init；`async_init` 的 API 名称不代表这两组在当前路径中并行初始化。恢复 ID 则由 `MegatronTrainRayActor.init()` 返回，基类 `TrainRayActor.init()` 本身不返回它。
 
 ## rollout data 流：一个 ObjectRef 广播给所有 rank
 
 同步训练循环中，RolloutManager 先返回 `rollout_data_ref`，然后 RayTrainGroup 把这个 ref 传给每个训练 rank。
 
 ```python
-# 来源：train.py L67-L82
+# 来源：train.py L67-L81
 rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
 if args.offload_rollout:
@@ -180,7 +180,7 @@ else:
 RayTrainGroup 不拆数据，只把同一个 ref 发给所有 actor。下面只截取控制分支，不摘录文档字符串：
 
 ```python
-# 来源：slime/ray/actor_group.py L131-L149
+# 定位骨架（据 `slime/ray/actor_group.py` L131-L149 删去 docstring）：
 def async_train(self, rollout_id, rollout_data_ref, external_data=None):
     if isinstance(external_data, list):
         assert len(external_data) == len(self._actor_handlers)
@@ -197,13 +197,13 @@ def async_train(self, rollout_id, rollout_data_ref, external_data=None):
 | 数据 | 谁产生 | 谁消费 | 形态 |
 |------|--------|--------|------|
 | `rollout_data_ref` | RolloutManager | actor/critic ranks | 单个 Ray ObjectRef |
-| `value_refs` | critic RayTrainGroup | actor RayTrainGroup | ObjectRef list |
+| `value_refs` | critic RayTrainGroup | actor RayTrainGroup | ObjectRef list；按 rank 位置一一传递 |
 | `external_data` dict | driver 或调用方 | all ranks | 广播同一个对象 |
 | `external_data` list | driver 或 critic refs | per rank | 长度必须等于 actor 数 |
 
 ## 权重流：`update_weights` 是同步闸门
 
-`update_weights` 在 group 内部 `ray.get`，所以调用返回时所有 rank 的 `update_weights.remote()` 都已完成或抛错。
+`update_weights` 在 group 内部 `ray.get`，所以调用返回时所有 rank 的 `update_weights.remote()` 都已完成或抛错。源码 docstring 所称“rank 0 广播给其他 ranks”不符合当前默认后端：group 层只是扇出调用，Megatron actor 会取得 rollout engines 与锁，再由 weight updater 向 rollout 侧发布权重。
 
 ```python
 # 来源：slime/ray/actor_group.py L155-L157
@@ -231,7 +231,7 @@ if args.offload_rollout:
 异步训练循环为了避免生成时更新权重，会先 drain 预取的 rollout：
 
 ```python
-# 来源：train_async.py L65-L70
+# 来源：train_async.py L65-L69
 if (rollout_id + 1) % args.update_weights_interval == 0:
     # sync generate before update weights to prevent update weight in the middle of generation
     rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
@@ -268,7 +268,7 @@ def set_rollout_manager(self, rollout_manager):
     return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
 ```
 
-`clear_memory` 在 actor 里会跳过 debug rollout only，否则打印前后显存并清理：
+`clear_memory` 在 actor 里会跳过 debug rollout only，否则打印前后显存并调用通用清理函数；它不等于模型 offload。Megatron `sleep()` 还会清 host memory、按条件断开 rollout engines、销毁 process groups 并暂停 memory saver；`wake_up()` 则恢复 memory saver、重建 process groups，并把 actor 模型切回运行态。
 
 ```python
 # 来源：slime/ray/train_actor.py L94-L99
@@ -282,7 +282,7 @@ def clear_memory(self):
 
 ## parallel config 流：rank 0 上报给 RolloutManager
 
-训练 actor 初始化后，group 会同步调用 `set_rollout_manager`。只有 rank 0 将训练并行配置推给 RolloutManager。
+训练 actor 初始化后，group 会同步调用每个 rank 的 `set_rollout_manager`。每个 rank 都保存 handle，只有 rank 0 将训练并行配置推给 RolloutManager。
 
 ```python
 # 来源：slime/ray/train_actor.py L125-L128
@@ -299,14 +299,18 @@ def set_rollout_manager(self, rollout_manager):
 能跑依赖时：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/utils/test_megatron_role_config.py -q
 ```
 
 轻量环境至少跑：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
+
+当前基线实测：轻量测试 `14 passed`；role config 因缺依赖出现 6 个 import 失败（5 个缺 `sglang`，1 个缺 `ray`）。
 
 可观测日志：
 

@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # TokenizerManager · 源码走读
 
@@ -21,6 +21,7 @@ updated: 2026-07-10
 
 - 从源码解释 `generate_request` 为什么是 async generator。
 - 找到一个请求什么时候进入 `rid_to_state`，什么时候被删除。
+- 解释 normalization 和 `n > 1` 为什么会改变 batch、rid 和发送次数。
 - 解释 `BatchStrOutput`、`BatchTokenIDOutput`、`BatchEmbeddingOutput` 三类回包如何变成 HTTP 输出。
 - 判断 score、flush cache、multi-tokenizer worker 是主线分叉，不是另一套后端。
 
@@ -258,6 +259,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 |--------|------------|
 | 每个进入前台路径的 `rid` 必须先有 `ReqState` | 后端回包无法唤醒 HTTP 协程 |
 | 未到 Scheduler 前失败必须清理 state | `rid_to_state` 长期增长，健康检查和内存表现异常 |
+
+### 步骤 4A：normalize 会改写请求形态
+
+`generate_request` 的第一步不是注册 state，而是 `obj.normalize_batch_and_arguments()`。它补默认 `rid`、判断 single/batch、展开 batch 参数，并读取 `sampling_params.n`。因此后续 `_init_req_state` 看到的是规范化后的对象，不一定和 API 刚构造时相同。
+
+当前 `GenerateReqInput._validate_inputs` 只直接拒绝“三者全空”和“三者全有”；调用方仍应遵守 `text`、`input_ids`、`input_embeds` 三选一的公开契约，不要依赖两个字段同时出现时后续分支的偶然优先级。准备改 API 校验时，这里应与 HTTP/OpenAI schema、Engine 调用和测试一起收紧。
 
 ## 步骤 5：`_init_req_state` 把单请求和 batch 归一成 rid 列表
 
@@ -681,9 +688,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
 ## 步骤 13：完成时删除 state，未完成时只入队并延迟唤醒
 
-系统压力：高并发 streaming 下，如果每个 token 都立刻唤醒一个 HTTP 协程，asyncio 调度开销会很高。完成请求又必须及时释放 state 和 LoRA 引用。
+系统压力：一个大批回包可能同时唤醒许多 HTTP 协程；逐 rid 连续调度会长时间占住后台 loop。完成请求又必须及时释放 state 和 LoRA 引用。
 
-源码选择：finished 时删除 `rid_to_state[rid]`；有 `out_dict` 时写 `state.out_list`，先放入 `pending_notify`，达到 `batch_notify_size` 才批量 `event.set()`。
+源码选择：finished 时删除 `rid_to_state[rid]`；有 `out_dict` 时写 `state.out_list`，处理同一个批回包时每累计 `batch_notify_size` 个 rid 就批量 `event.set()` 并 `sleep(0)`，遍历结束后立即通知余数。这个参数控制大 batch 内的 event-loop 公平性，不会跨多个后端消息故意攒 token。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/tokenizer_manager.py L2080-L2126
@@ -806,7 +813,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 out["text"] = state.get_text()
 ```
 
-如果线上 P99 ITL 抖动，同时看到 streaming backlog 警告，要看 `batch_notify_size`、HTTP 消费速度和 `_coalesce_streaming_chunks`。
+如果线上 P99 ITL 抖动，同时看到 streaming backlog 警告，优先看 HTTP 消费速度、前台协程是否及时被调度以及 `_coalesce_streaming_chunks`；`batch_notify_size` 只影响单个大批回包处理期间的让出节奏，不能单独解释跨消息 backlog。
 
 ## 步骤 15：batch 请求只是多条单请求状态的并发等待
 
@@ -842,6 +849,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 ```
 
 这段说明 batch 在 TokenizerManager 侧是“多条 ReqState 的组织方式”，不是 Scheduler 的 `ScheduleBatch`。
+
+当 `n > 1` 时还有一层额外生命周期：TokenizerManager 先把每个原始 prompt 以 `max_new_tokens=0` 提交一次，用于缓存共同前缀；随后复制 tokenized object，为每个实际 sample 重新生成 `rid` 并发送。日志、abort 和结果 index 都必须围绕实际 sample rid 解读。
+
+但不能把规范化阶段的 state 概括成“展开后全部删除”。设原始 batch 为 `B`、采样数为 `N`：`_normalize_batch_inputs` 令 `num=B×N`，`_normalize_rid(num)` 和 `_init_req_state(obj)` 因而创建 `B×N` 个 placeholder state；这里的 `objs = [obj[i] for i in range(batch_size)]` 只消费前 `B` 个，最后也只执行 `B` 次 `del self.rid_to_state[objs[i].rid]`。预热与实际 samples 都调用 `regenerate_rid()` 创建另一组 state。当前正常完成路径因此会留下 `B×(N-1)` 个规范化 placeholder state；异常处理里的 `_discard_pending_req_states(obj)` 只在抛异常时运行，不能修复正常路径。文档将其记录为当前基线的 state 生命周期风险，不把尚未在完整服务压测中量化的影响写成确定的 OOM 结论。
 
 ## 步骤 16：score API 复用 generate/embedding 数据面
 
@@ -918,7 +929,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             self.socket_mapping.send_output(ipc_name, new_recv_obj)
 ```
 
-这说明多 worker 模式的关键不在“分词更快”本身，而在前后向路由一致性。
+这说明多 worker 模式的关键不在“分词更快”本身，而在前后向路由一致性。若同时启用多个 detokenizer worker，Scheduler 输出还会先经 `MultiDetokenizerRouter` 按 `http_worker_ipc` 稳定哈希；detokenizer worker 完成 decode 后直接把结果送回 owner tokenizer worker，以保证同一请求的 decode 状态不跨进程漂移。
 
 ## 运行验证
 
@@ -929,6 +940,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 | 非流式请求生命周期 | 在 `generate_request`、`_init_req_state`、`_handle_batch_output`、`_wait_one_response` 加断点或日志 | 同一个 rid 先进入 `rid_to_state`，后端 finished 后被删除，最后 `_wait_one_response` yield 一次 |
 | incremental streaming | 启动时打开 `--incremental-streaming-output`，发送 `stream=True` 请求 | 每个 SSE chunk 的 `text` 是 delta；若消费慢，多个 queued chunks 会在 `_coalesce_streaming_chunks` 合并 |
 | skip tokenizer | 启动 `--skip-tokenizer-init` 后用 text 请求 | `_tokenize_one_request` 抛出要求提供 `input_ids` 的错误；用 `input_ids` 请求时输出主要是 `output_ids` |
+| rid 生命周期单测 | `python -m pytest sglang/test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py -q` | abort、正常 finished、dispatch 前失败都清理 state，重复 rid 只在旧 state 仍存活时被拒绝 |
+| parallel-sampling state 计数 | 固定 `B=2`，分别发送 `n=1` 与 `n=3`，在请求前后记录 owner worker 的 `len(rid_to_state)`；同时记录规范化 rid、预热 rid、sample rid | `n=1` 完成后回到基线；当前源码的 `n=3` 路径应重点检查是否每轮净增 `2×(3-1)=4` 个 placeholder state |
 
 ## 复盘
 

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据准备工具 · 学习检查
 
@@ -22,6 +22,8 @@ updated: 2026-07-10
 - [ ] 能从一个训练脚本里指出 `MODEL_ARGS`、`--hf-checkpoint`、`--ref-load`、`--load`、`--save` 的消费者。
 - [ ] 能说明 HF→torch_dist 转换不是文件改名，而是 Megatron 构图、AutoBridge 灌权重、Megatron `save_checkpoint`。
 - [ ] 能说明 torch_dist→HF 时 `common.pt`、dist metadata、`--origin-hf-dir`、`--vocab-size` 各自解决什么问题。
+- [ ] 能区分给 loader 的 checkpoint 根目录与给离线 converter 的具体版本目录。
+- [ ] 能解释为什么 `--force` 不代表清空旧输出，以及为什么转换重跑应优先使用新目录。
 - [ ] 能给出 3 个失败模式及其源码入口。
 - [ ] 能运行或描述一个验证实验，并说出预期产物。
 
@@ -61,6 +63,7 @@ flowchart LR
 你已经下载 `/root/Qwen3-4B`，还没有 Megatron checkpoint。应该先跑：
 
 ```bash
+cd /root/slime
 source scripts/models/qwen3-4B.sh
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
   ${MODEL_ARGS[@]} \
@@ -91,7 +94,7 @@ python tools/convert_torch_dist_to_hf.py \
   --vocab-size 151936
 ```
 
-如果输出目录已经存在，要么换目录，要么加 `-f`。
+如果输出目录已经存在，首选换新目录。`-f` 只允许写入，不会清理旧 safetensors 或 assets；复用前必须由操作者确认目录已经清洁。
 
 ### 题 3：FP8 rollout
 
@@ -108,9 +111,9 @@ python tools/convert_torch_dist_to_hf.py \
 
 | 你看到的现象 | 合格解释 | 源码入口 |
 |--------------|----------|----------|
-| `--output-dir` 已存在时报错 | 导出脚本默认拒绝覆盖，防止误删已有 HF 输出 | `tools/convert_torch_dist_to_hf.py` L209-L210 |
+| `--output-dir` 已存在时报错 | 导出脚本默认拒绝写入；`--force` 只跳过检查，不清空目录 | `tools/convert_torch_dist_to_hf.py` L209-L210 |
 | 不传 `--origin-hf-dir` 也不传 `--model-name` 时报错 | converter 需要 model name 才能路由参数名转换 | `tools/convert_torch_dist_to_hf.py` L212-L219 |
-| embedding 行数多于 HF config vocab | Megatron padding 没有被裁掉，需传真实 `--vocab-size` | `padding_remover.py` L6-L12 |
+| embedding 行数与 HF config 不符 | CLI 与 checkpoint `args.vocab_size` 是两级裁剪输入，需同时核对 | `save_tensors` L106-L117；`convert_to_hf` L25-L30 |
 | 多卡转换 world size 大于层数时报错 | 脚本要求 world size 不超过 `num_layers` | `tools/convert_hf_to_torch_dist.py` L54-L57 |
 | ROCm 环境转换要求 CPU 初始化 | HIP 分支显式断言 `args.use_cpu_initialization` | `tools/convert_hf_to_torch_dist.py` L117-L120 |
 | resume 后像是从初始权重开始 | `--load` 目录无有效 tracker 时 actor 会从 `--ref-load` 初始化 | `docs/en/get_started/usage.md` L127-L145 |
@@ -120,6 +123,7 @@ python tools/convert_torch_dist_to_hf.py \
 轻量验证：
 
 ```powershell
+Set-Location slime
 python -m py_compile tools/convert_hf_to_torch_dist.py tools/convert_torch_dist_to_hf.py
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
@@ -127,6 +131,7 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 完整转换验证需要真实 HF 模型、Megatron-LM、GPU 和分布式环境：
 
 ```bash
+cd /root/slime
 source scripts/models/qwen3-4B.sh
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
   ${MODEL_ARGS[@]} \
@@ -147,7 +152,7 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
 
 1. 给一个 Slime 训练脚本，指出每个 checkpoint 参数的消费者和目录形态。
 2. 给一个 HF 模型目录，写出正确的 HF→torch_dist 转换命令。
-3. 给一个 Megatron checkpoint，写出正确的 torch_dist→HF 导出命令，并说明何时加 `--vocab-size`、`--origin-hf-dir`、`-f`。
+3. 给一个 Megatron checkpoint，先区分根目录与具体 step/release 目录，再写出 torch_dist→HF 导出命令，并说明 `--vocab-size`、`--origin-hf-dir`、`-f` 的真实边界。
 4. 遇到路径、padding、PP、ROCm、FP8 任一问题，能回到 [[Slime-数据准备工具-排障指南]] 找到源码入口。
 
 下一组建议读 [[Slime-PlacementGroup]]，把训练前的权重形态准备接到运行时资源布局。

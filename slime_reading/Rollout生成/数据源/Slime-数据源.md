@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据源
 
@@ -78,20 +78,22 @@ flowchart LR
 
 ## 本专题的不变量
 
-- `get_samples(N)` 的 N 是 prompt 组数，不是 token 数，也不是单条 sample 数。
+- `get_samples(N)` 的 N 是请求的 prompt 组数，不是 token 数，也不是单条 sample 数；默认实现只支持至多跨一个 epoch，超大 N 可能实际少返回并写出越界 offset。
 - 每个 group 的长度必须等于 `n_samples_per_prompt`。
 - `sample_offset` 管 dataset 内位置；`sample_index` 管 rollout 样本全局编号，两者不是同一个计数器。
 - buffer 优先于 dataset，但单次请求的总量仍是 N。
 - 默认 dynamic filter 丢弃的组不会自动回写 buffer。
 - checkpoint 保存的是数据消费状态，不保存原始 prompt 内容。
+- `Dataset.shuffle` 可复现排列，但会调用进程级 `random.seed`，因此还会改变同进程其他 Python 随机逻辑的后续序列。
+- fully-async 复用同一全局 worker 和首份 args/data source；它不执行默认 dynamic sampling filter，也不产生对应 drop metrics。
 
 ## 验证抓手
 
 最小验证不是起一整套大训练，而是用契约测试和源码审计确认接口形状：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -q
 node maintenance/audit_source_evidence.mjs --note slime_reading/Rollout生成/数据源/Slime-数据源-源码走读.md
 ```
 

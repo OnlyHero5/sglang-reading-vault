@@ -9,7 +9,7 @@ tags:
   - framework/flash-attn
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Online-Softmax · 学习检查
 
@@ -29,7 +29,7 @@ updated: 2026-07-10
 这个脚本不依赖 CUDA，用纯 Python 验证 streaming online softmax 和全量 softmax 等价：
 
 ```powershell
-python - <<'PY'
+@'
 import math
 
 scores = [1.0, -2.0, 3.0, 0.5, 4.0, -1.0]
@@ -57,7 +57,7 @@ full = sum(math.exp(s - full_m) * v for s, v in zip(scores, values)) / den
 print("online", online)
 print("full", full)
 print("match", abs(online - full) < 1e-12)
-PY
+'@ | python -
 ```
 
 预期现象：`match True`。

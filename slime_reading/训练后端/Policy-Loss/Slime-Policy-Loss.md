@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Policy-Loss
 
@@ -75,12 +75,15 @@ flowchart LR
 
 ## 首次阅读抓手
 
-先记住四条：
+先记住五条：
 
 - `policy_loss_function` 重新用当前 logits 算 `log_probs`，这是带梯度的路径。
 - `old_log_probs` 来自 rollout 或 train batch，用来形成 ratio/KL 对照。
+- 如果两者都没有，源码会用本次 current logprob 的 `detach()` 副本作 old baseline；此时 ratio 从 1 起步，但 current logprob 仍是带梯度的训练路径。
 - GSPO 在 policy loss 阶段把 sequence-level KL 扩展回 token 形状。
 - `loss_function` 返回的是 Megatron 需要的三元组，不只是一个 scalar。
+
+还要额外记住：算法修正和统计口径不是同一层。TIS/ICEPOP/OPSM 可以改变 `pg_loss` 的逐 token 贡献，custom reducer 只接管 PG 项；entropy、clipfrac、`ppo_kl` 和 mismatch 指标各自仍有明确的默认 reducer。
 
 ## 相关验证
 

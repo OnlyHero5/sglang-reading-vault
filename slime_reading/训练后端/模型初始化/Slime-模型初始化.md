@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 模型初始化
 
@@ -58,6 +58,7 @@ flowchart LR
 |------|------------|
 | `slime/backends/megatron_utils/model_provider.py` | provider 选择、Bridge、legacy GPTModel、critic value head、freeze |
 | `slime/backends/megatron_utils/model.py` | `setup_model_and_optimizer`、scheduler、checkpoint load、`forward_only` |
+| `slime/backends/megatron_utils/checkpoint.py` | Megatron/HF 分流、`args.load` 硬门禁与 shard validation monkey patch |
 | `slime/backends/megatron_utils/actor.py` | actor init 如何调用本模块，并构建 weight updater |
 | `slime/utils/arguments.py` | Bridge/legacy load、freeze 配置互斥 |
 
@@ -65,7 +66,7 @@ flowchart LR
 
 | 边界 | 结论 |
 |------|------|
-| [[Slime-Megatron-Actor初始化]] | Ray actor、进程组、tokenizer 等外层初始化在 17；本专题从模型装配开始 |
+| [[Slime-Megatron-Actor初始化]] | Ray actor、进程组、tokenizer 等外层初始化由该专题负责；本专题从模型装配开始 |
 | [[Slime-训练步骤]] | 训练 step 消费这里返回的 `model/optimizer/scheduler` |
 | [[Slime-Advantage计算]] | `forward_only(get_log_probs_and_entropy/get_values)` 使用这里初始化好的模型 |
 | [[Slime-上下文并行与路由重放]] | CP/routing replay 依赖 `get_batch` 与 model forward，但不是本专题主线 |
@@ -78,6 +79,7 @@ flowchart LR
 - provider 是模型图纸，`get_model` 才把图纸变成 Megatron DDP chunks。
 - actor 输出是 LM logits，critic 输出层被替换成 hidden-to-1 value head。
 - `initialize_model_and_optimizer` 总是先 setup，再 `load_checkpoint`，必要时重置 critic output layer。
+- 当前 initialize 路径最终硬依赖一个存在且非空的 `args.load`；`pretrained_checkpoint` 只通过 setup 断言，并不能替代后续仓库级 loader 的 `args.load` 门禁。
 - `forward_only` 是无梯度收集 logprob/value 的通道，不是训练 backward。
 
 ## 相关验证

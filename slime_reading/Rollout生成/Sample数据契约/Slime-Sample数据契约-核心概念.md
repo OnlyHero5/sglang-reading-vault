@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Sample数据契约 · 核心概念
 
@@ -38,7 +38,7 @@ flowchart LR
 `group_index` 和 `index` 主要服务 prompt 分组与样本编号；`rollout_id` 服务训练 loss 聚合。默认 rollout 常常一条 execution 只产出一条 training sample，所以读起来像同一件事；compact/subagent 路径会把一次 execution 拆出多条 training sample，这些 sibling 必须共享同一个 `rollout_id`。
 
 ```python
-# 来源：slime/utils/types.py L93-L149
+# 定位骨架（据 `slime/utils/types.py` L93-L149 选取核心字段）：
 @dataclass
 class Sample:
     group_index: int | None = None
@@ -60,10 +60,10 @@ class Sample:
 
 ## response 层：四个字段必须共用同一根尺子
 
-response 侧核心字段是 `response_length`、`loss_mask`、`rollout_log_probs` 和可选 top-p/routed metadata。它们都按 response token 维度对齐。
+`response_length`、`loss_mask`、`rollout_log_probs` 和 top-p offsets 按 response token 对齐；`rollout_routed_experts` 使用另一套坐标系，首维必须等于整条 `tokens` 的 next-token 长度 `len(tokens)-1`。
 
 ```python
-# 来源：slime/utils/types.py L253-L314
+# 定位骨架（据 `slime/utils/types.py` L253-L314 选取追加主干）：
 tokens = _to_int_list(tokens)
 log_probs = _to_float_list(log_probs)
 if log_probs is not None and len(log_probs) != len(tokens):
@@ -86,12 +86,12 @@ if tokens:
 
 这段代码给出最重要的不变量：训练 token 必须有 rollout logprob；非训练 token 不允许带真实 logprob；`loss_mask` 负责告诉训练哪些 response token 参与 loss。
 
-## metadata 层：top-p 和 routed experts 是 ragged 附件
+## metadata 层：top-p 与 routed experts 使用不同坐标系
 
 top-p replay 不是一个矩阵，而是 `token_ids + offsets` 的 ragged 表。第 `i` 个 response token 对应 `token_ids[offsets[i]:offsets[i+1]]`。所以 offsets 长度必须等于 `response_length + 1`，最后一个 offset 必须等于 token id 数量。
 
 ```python
-# 来源：slime/utils/types.py L13-L36
+# 定位骨架（据 `slime/utils/types.py` L13-L36 删节）：
 def _extract_rollout_top_p_token_data(
     meta_info: dict[str, Any],
     *,
@@ -107,14 +107,14 @@ def _extract_rollout_top_p_token_data(
         raise ValueError(f"SGLang top-p token offsets must start with 0, got {offsets[:1].tolist()}.")
 ```
 
-routed experts 也通过 `decode_int32_meta_array` 转成 int32 tensor，再按 `len(tokens) - 1`、`num_layers`、`moe_router_topk` reshape。它依赖 args，不能只靠 Sample 自己解释。
+routed experts 也通过 `decode_int32_meta_array` 转成 int32 tensor，但它不是 response ragged 表：源码按 `[len(tokens)-1, num_layers, moe_router_topk]` reshape，训练侧再次断言首维等于 token 序列长度减一。默认 SGLang 路径会先把 prompt ids 放进 `sample.tokens`，再追加 response，因此这里覆盖整条 prompt+response 的 next-token 位置。它依赖 args，且多段调用会覆盖旧值，不会像 top-p offsets 那样增量 merge；上游 meta 必须提供与当前完整 `tokens` 匹配的快照。
 
 ## 状态层：finish_reason 只在 Sample 边界翻译一次
 
 SGLang 返回的 `finish_reason.type` 在 `_apply_meta_info` 中被映射成 Slime 的 `Sample.Status`。
 
 ```python
-# 来源：slime/utils/types.py L362-L381
+# 定位骨架（据 `slime/utils/types.py` L362-L381 删节）：
 if not update_terminal_info or "finish_reason" not in meta_info:
     return
 
@@ -137,12 +137,14 @@ match meta_info["finish_reason"]["type"]:
 
 多轮 streaming 或 partial rollout 可以用 `update_terminal_info=False` 暂不更新终态，最后一段再让样本进入 completed/truncated/aborted。
 
+未知 `finish_reason.type` 没有 default case，会保持原 status；`FAILED` 也不是 SGLang finish reason 映射结果，而要由 rollout/tool 逻辑显式设置。
+
 ## 边界层：Sample 必须能跨 debug/Ray 边界
 
 `to_dict/from_dict` 是 debug rollout 数据和跨版本兼容的边界。`status` 要从 enum 变成字符串再变回 enum，嵌套统计对象要转成 dict，未知字段还要保留下来。
 
 ```python
-# 来源：slime/utils/types.py L222-L244
+# 定位骨架（据 `slime/utils/types.py` L222-L244 删节）：
 def to_dict(self):
     value = self.__dict__.copy()
     value["status"] = self.status.value
@@ -162,14 +164,14 @@ def from_dict(data: dict):
     sample = Sample(**init_data)
 ```
 
-`tests/test_sample.py` 明确把这个行为钉住：未知字段会作为动态属性保留，避免新旧 rollout/trainer 之间因为扩展字段直接丢信息。
+`tests/test_sample.py` 明确把这个行为钉住：未知字段会作为动态属性保留，避免新旧 rollout/trainer 之间因为扩展字段直接丢信息。但 `to_dict()` 是浅拷贝，`from_dict()` 也不会调用 response 长度校验；它们证明“保真”，不证明对象本身合法或任意外部对象都适合持久化。
 
 ## 函数返回层：rollout 函数返回的是批，而不是单条样本
 
-训练 rollout 函数应返回 `RolloutFnTrainOutput(samples=list[list[Sample]], metrics=dict)`。legacy 路径仍可返回裸 `list[list[Sample]]`，`call_rollout_fn` 会包装。
+训练 rollout 函数应返回 `RolloutFnTrainOutput`。类型注解写 `list[list[Sample]]`，但 compact/subagent 当前可返回更深嵌套，随后由 RolloutManager 在 flatten 前校验。legacy 路径仍可返回裸列表，`call_rollout_fn` 会包装；它只判断外层类型，不验证 train/eval payload 形状。
 
 ```python
-# 来源：slime/rollout/base_types.py L7-L26
+# 定位骨架（据 `slime/rollout/base_types.py` L7-L26 删节）：
 @dataclass
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]

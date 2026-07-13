@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据准备工具 · 源码走读
 
@@ -25,7 +25,7 @@ updated: 2026-07-10
 |----------|------|--------------|
 | 第一次建立权重格式全景 | 贯穿场景、步骤一到二 | `MODEL_ARGS` 是 Megatron 构图输入，HF 目录只是权重、tokenizer 和 config 来源 |
 | 排查 HF→torch_dist 转换失败 | 步骤二到四 | 转换脚本复用 Megatron parser，初始化分布式后用 AutoBridge 把 HF 权重灌进 Megatron 模型 |
-| 理解多卡转换和 PP 推导 | 步骤三 | world size 不能超过 layer 数；脚本会推导可行的 pipeline parallel size |
+| 理解多卡转换和 PP 推导 | 步骤三 | 只在 PP 默认值为 1 且 world size>1 时尝试推导；候选只沿“world size 不断除以 2”搜索 |
 | 排查训练脚本路径混淆 | 步骤六到七 | `--ref-load` 指向 bf16 torch_dist，`--hf-checkpoint` 可用于 tokenizer / rollout 初始化，FP8 HF 不替代训练权重 |
 | 排查 torch_dist→HF 导出 | 步骤八到十 | 导出先读 dist checkpoint metadata，再展开层和 expert 参数，最后按模型 converter 保存 safetensors |
 | 排查 embedding 行数或缺权重 | 步骤九到十 | padding 要显式处理；缺失权重和 tokenizer/config 等资产可从 origin HF 目录补齐 |
@@ -60,12 +60,18 @@ CKPT_ARGS=(
 
 设计选择：官方 quick start 要求先 source model script，再运行 `convert_hf_to_torch_dist.py`。
 
-```text
-来源：docs/en/get_started/quick_start.md L73-L89
-quick_start 先要求 source 对应模型脚本，把模型配置参数加载到当前环境。
-随后运行 `convert_hf_to_torch_dist.py`，并传入 `${MODEL_ARGS[@]}`。
-`--hf-checkpoint` 指向已下载的 HF 权重目录。
-`--save` 指向转换后的 `torch_dist` 保存目录。
+```bash
+# 来源：docs/en/get_started/quick_start.md L76-L77
+cd /root/slime
+source scripts/models/glm4-9B.sh
+```
+
+```bash
+# 来源：docs/en/get_started/quick_start.md L85-L88
+PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /root/GLM-Z1-9B-0414 \
+    --save /root/GLM-Z1-9B-0414_torch_dist
 ```
 
 读者抓手：`MODEL_ARGS` 是 Megatron 构图输入；`--hf-checkpoint` 是权重来源；`--save` 是转换产物目录。
@@ -102,7 +108,7 @@ def add_convertion_args(parser):
 ```
 
 ```python
-# 来源：tools/convert_hf_to_torch_dist.py L44-L84
+# 来源：tools/convert_hf_to_torch_dist.py L44-L57
 def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
@@ -123,7 +129,7 @@ def get_args():
 
 ## 步骤三：多卡转换会自动推导 PP
 
-系统压力：大模型单卡转换可能 OOM。多卡转换时，如果用户没有显式设置 pipeline parallel，脚本会把 world size 用作起点，寻找能让最后一个 PP stage 有层的 PP size。
+系统压力：大模型单卡转换可能 OOM。多卡转换时，只有当解析后的 PP 仍为 1，脚本才把 world size 用作候选；若最后一个 stage 没层，只在候选为偶数时除以 2。它不是遍历所有约数，更不保证任意 world size 都能找到方案。
 
 ```python
 # 来源：tools/convert_hf_to_torch_dist.py L59-L81
@@ -152,7 +158,7 @@ print(
 )
 ```
 
-不变量：多卡不是“随便多少卡都能跑”，PP size 必须能分配出合法层数。
+不变量：多卡不是“随便多少卡都能跑”。world size 先受 `world_size <= num_layers` 限制；自动搜索只覆盖 `world_size, world_size/2, ...` 这条链；显式 PP 则不进入该自动分支，交给 Megatron 后续校验。
 
 ## 步骤四：main 初始化分布式，再用 AutoBridge 灌权重
 
@@ -161,7 +167,7 @@ print(
 设计选择：`main()` 初始化 NCCL process group、调用 `init(args)`，构建 Megatron model，再用 mbridge `AutoBridge` 从 HF 加载权重。
 
 ```python
-# 来源：tools/convert_hf_to_torch_dist.py L87-L127
+# 来源：tools/convert_hf_to_torch_dist.py L87-L126
 def main():
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
@@ -204,7 +210,7 @@ def main():
     bridge.load_weights(model, hf_model_path, memory_efficient=True)
 ```
 
-ROCm 分支也在这里：HIP 环境必须 `--use-cpu-initialization`。
+ROCm 分支也在这里：HIP 环境必须 `--use-cpu-initialization`。但这段只 patch 了 checkpoint writer，process group 的 backend 仍显式写成 `nccl`；不能仅凭 HIP 分支就推断它会改用 Gloo 或另一套通信后端。
 
 ## 步骤五：保存 step 1，再改成 Megatron release checkpoint
 
@@ -238,19 +244,29 @@ dist.destroy_process_group()
 
 运行验证：转换后检查 `--save` 目录下的 tracker 文件内容是 `release`，并存在 release checkpoint 目录。
 
+重跑边界：代码在写 tracker 后直接 `shutil.move(source_dir, target_dir)`，没有先删除旧 `release/`。因此 `--save` 应指向全新目录；在已有 release checkpoint 上原地重跑可能形成嵌套/混合旧分片，不能视为安全覆盖流程。
+
 ## 步骤六：训练 CKPT_ARGS 把两个生态接起来
 
 系统压力：训练启动时，Megatron 侧要加载 reference/actor checkpoint；SGLang 侧要加载 HF config/tokenizer，然后等 actor 首次推权。
 
 设计选择：脚本同时传 `--hf-checkpoint` 和 Megatron `--ref-load/--load/--save`。
 
-```text
-来源：docs/en/get_started/quick_start.md L134-L148
-CKPT_ARGS 中 `--hf-checkpoint` 用于 tokenizer 等 HF 信息，不实际作为训练权重。
-`--ref-load` 是 reference model 的 Megatron checkpoint。
-`--load` 是 actor resume 路径；为空或无有效 checkpoint 时从 `--ref-load` 加载。
-`--save` 是训练期间 actor checkpoint 保存路径。
-`--save-interval` 控制保存间隔。
+```bash
+# 来源：docs/en/get_started/quick_start.md L137-L149
+CKPT_ARGS=(
+   # To load tokenizer and other information, won't actually use model weight parameters from hf path
+   --hf-checkpoint /root/GLM-Z1-9B-0414
+   # Reference Model's Megatron format checkpoint
+   --ref-load /root/GLM-Z1-9B-0414_torch_dist
+   # Actor model loading path. Should typically match --save for checkpoint resumption
+   # If empty or doesn't contain a valid checkpoint, loads from --ref-load instead
+   --load /root/GLM-Z1-9B-0414_slime/
+   # Model save path during training
+   --save /root/GLM-Z1-9B-0414_slime/
+   # Model save interval (steps)
+   --save-interval 20
+)
 ```
 
 读者抓手：`--load` 是 actor 续训目录；没有有效 checkpoint 时会从 `--ref-load` 初始化。
@@ -261,11 +277,13 @@ CKPT_ARGS 中 `--hf-checkpoint` 用于 tokenizer 等 HF 信息，不实际作为
 
 quick start 明确写了这个边界：
 
-```text
-来源：docs/en/get_started/quick_start.md L392-L405
-Slime 支持 bf16 training 与 fp8 inference 组合。
-Qwen3-4B FP8 场景只替换 `--hf-checkpoint` 到 FP8 HF 目录。
-Megatron `--ref-load` 仍然使用最初从 bf16 HF 转出的 dist weights。
+```bash
+# 来源：docs/en/get_started/quick_start.md L401-L405
+   # Used to load tokenizer and other information, actually won't use model weight parameters from hf path
+   --hf-checkpoint /root/Qwen3-4B-FP8
+
+   # The megatron checkpoint still needs to be the dist weights converted from bf16 huggingface at the beginning, not modified because of FP8 rollout.
+   --ref-load /root/Qwen3-4B_torch_dist
 ```
 
 结论：FP8 HF 不是 Megatron 训练 checkpoint 的替代品。
@@ -364,7 +382,7 @@ def get_named_params(args, state_dict):
 converter 分发：
 
 ```python
-# 来源：slime/backends/megatron_utils/megatron_to_hf/__init__.py L24-L68
+# 来源：slime/backends/megatron_utils/megatron_to_hf/__init__.py L25-L46
 def convert_to_hf(args, model_name, name, param, quantization_config=None):
     param = remove_padding(name, param, args.vocab_size)
 
@@ -396,7 +414,7 @@ def _convert_to_hf_core(args, model_name, name, param):
 设计选择：`save_tensors` 负责分片和 index，`origin_hf_dir` 可复制 missing weights 和非权重文件。
 
 ```python
-# 来源：tools/convert_torch_dist_to_hf.py L106-L145
+# 来源：tools/convert_torch_dist_to_hf.py L106-L144
 def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_size=None, origin_hf_dir=None):
     print(f"start saving to {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
@@ -429,7 +447,21 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
                         print(f"add {k} from origin hf checkpoint")
                         converted_param = f.get_tensor(k)
                         converted_names.add(k)
+                        tensor_size = converted_param.numel() * converted_param.element_size()
+                        if tensor_size + current_size > chunk_size:
+                            modeltensors.append({})
+                            current_size = 0
+                        modeltensors[-1][converted_name] = converted_param
+                        current_size += tensor_size
+                    total_size += tensor_size
 ```
+
+这里有四个严格边界：
+
+- `--add-missing-from-origin-hf` 只扫描 `origin_hf_dir` 顶层、后缀为 `.safetensors` 的文件；不解析 `.bin`，也不递归子目录。
+- `copy_assets()` 同样只复制顶层普通文件，跳过目录、原 index 和所有 `.safetensors`。
+- CLI `--vocab-size` 的预裁剪之后，`convert_to_hf()` 还会按 checkpoint `args.vocab_size` 再裁一次；两者不一致时要检查最终 shape，不能假设 CLI 完全覆盖 checkpoint 值。
+- 当前 `total_size += tensor_size` 位于“是否缺失”的条件块之外；启用补权重后，原 HF 中已存在于 `converted_names` 的 key 也会重复累计上一次的 `tensor_size`。这会让 index 的 `metadata.total_size` 失真，因此完整性验收应以 `weight_map`、实际 shard 与 tensor key/shape 为主，不能只信该数字。
 
 assets 复制：
 
@@ -452,7 +484,7 @@ def copy_assets(origin_hf_dir, output_dir):
 
 系统压力：导出 HF 可能覆盖已有模型目录；如果不知道 model name，就无法路由 converter。
 
-设计选择：默认拒绝覆盖；`model_name` 缺失时要求 `origin_hf_dir`。
+设计选择：默认拒绝写入已存在目录；`model_name` 缺失时要求 `origin_hf_dir`。但 `--force` 只跳过拒绝检查，既不删除目录，也不清理旧 safetensors/assets。
 
 ```python
 # 来源：tools/convert_torch_dist_to_hf.py L178-L219
@@ -500,6 +532,8 @@ if __name__ == "__main__":
         args.model_name = type(hf_config).__name__.lower()
 ```
 
+另一个源码漂移是 `--chunk-size`：代码默认值是 `5 * 1024**3`（5 GiB），help 仍写 “default is 2GB”。运行语义以代码默认值为准；需要可复现实验时显式传值。
+
 ## 步骤十二：训练中的 `--save-hf` 是另一条导出路径
 
 系统压力：有时不想离线跑转换脚本，而是在 actor 保存模型时顺便导出 HF。
@@ -507,7 +541,7 @@ if __name__ == "__main__":
 设计选择：`Actor.save_model` 在保存 Megatron checkpoint 后，如果 `save_hf` 不为空且 role 是 actor，就调用 `save_hf_model_to_path`。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L558-L578
+# 来源：slime/backends/megatron_utils/actor.py L558-L577
 def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
     if self.args.debug_rollout_only:
         return
@@ -530,10 +564,10 @@ def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         save_hf_model_to_path(self.args, Path(self.args.save_hf.format(rollout_id=rollout_id)), self.model)
 ```
 
-导出实现按 `megatron_to_hf_mode` 分 raw / bridge：
+导出实现按 `megatron_to_hf_mode` 分 raw / bridge。它与离线脚本不是同一实现：raw 路径会先清理目标目录中的已识别 HF 权重文件、复制顶层非权重 assets，再由分布式 writer 写分片；bridge 路径委托 Megatron Bridge。
 
 ```python
-# 来源：slime/backends/megatron_utils/hf_checkpoint_saver.py L22-L43
+# 来源：slime/backends/megatron_utils/hf_checkpoint_saver.py L22-L42
 def save_hf_model_to_path(
     args,
     output_dir: str | Path,
@@ -562,12 +596,14 @@ def save_hf_model_to_path(
 静态验证：
 
 ```powershell
-python -m py_compile tools/convert_hf_to_torch_dist.py tools/convert_torch_dist_to_hf.py
+Set-Location slime
+python -m py_compile tools/convert_hf_to_torch_dist.py tools/convert_torch_dist_to_hf.py tools/convert_torch_dist_to_hf_bridge.py tools/convert_torch_dist_to_hf_parallel.py slime/backends/megatron_utils/hf_checkpoint_saver.py
 ```
 
 完整验证需要真实模型和 Megatron：
 
 ```bash
+cd /root/slime
 source scripts/models/qwen3-4B.sh
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
   ${MODEL_ARGS[@]} \

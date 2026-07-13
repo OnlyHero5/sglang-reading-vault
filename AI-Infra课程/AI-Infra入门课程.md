@@ -10,99 +10,118 @@ tags:
   - framework/cross-framework
   - content/guide
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
-
 # AI Infra 入门课程
 
-## 学习目标
+> **课程目标：** 用 SGLang、Slime、FlashAttention 三个真实系统建立可迁移的对象、时序、资源与证据模型，而不是背三棵目录树。
 
-这条课程不是要求你按文件树读完三套框架，而是借助三个真实系统建立一套可迁移的 AI Infra 心智模型：
+## 你为什么要读
 
-- 用 SGLang 理解请求、调度、KV Cache、模型执行和生产 serving。
-- 用 Slime 理解 rollout、训练数据、分布式训练和权重一致性。
-- 用 FlashAttention 理解 tensor 如何穿过 API、binding、dispatch 和 GPU kernel。
-- 用统一实验方法解释延迟、吞吐、显存、通信和正确性之间的取舍。
+三套框架分别暴露服务、RL 闭环和 GPU kernel 的关键边界。本课程把它们组织成同一条因果链，让你知道宏观症状应落到哪类对象、哪层证据，而不是在庞大源码树里随机搜索。
 
-## 为什么这三套源码要一起读
+## 你最终要具备什么能力
 
-AI 应用看到的是一次回答，AI Infra 看到的是三种尺度同时运转：服务层在管理请求和 KV，训练层在管理样本和权重版本，kernel 层在管理 tile 与数据搬运。只懂其中一层，排障时就容易出现经典错位：拿 GPU 利用率解释 HTTP 背压，拿 reward 曲线解释旧权重 rollout，或拿 attention 公式解释 HBM traffic。
+- 沿一次请求解释 text/token/request/batch/KV/tensor/text delta 的对象变化。
+- 沿一次 RL 迭代解释 prompt/Sample/train batch/advantage/loss/weight version 的因果链。
+- 沿一次 attention 调用解释 Python API/C++ params/dispatch/tile/online softmax/O-LSE。
+- 遇到慢、错、挂、漂移时，先判断失效边界，再选择 log、metric、trace、profile、CPU test 或 GPU e2e。
+- 所有性能结论都绑定版本、硬件、workload、指标观察点和正确性门槛。
 
-SGLang、Slime 和 FlashAttention 恰好把这三种尺度摊开。课程会反复训练同一个动作：先看宏观生命周期，再把异常缩小到一次对象交接，最后用源码或实验确认。
+## 为什么把三套源码放在一起
 
-## 课程地图
+| 尺度 | 框架主角 | 主要对象 | 典型问题 |
+|------|----------|----------|----------|
+| 服务系统 | SGLang | request、batch、KV、worker result | 排队、回程、cache、吞吐与尾延迟 |
+| RL 闭环 | Slime | Sample、ObjectRef、advantage、weight version | group、陈旧、训练、同步与恢复 |
+| GPU 算子 | FlashAttention | tensor、params、tile、LSE、gradient | IO、数值、dispatch 与硬件特化 |
+
+同一次回答会穿过三个尺度。只懂一层，容易拿错证据：用 GPU utilization 解释 HTTP 背压、用 reward 曲线解释旧策略 rollout，或用 attention 公式替代 HBM traffic 实测。
+
+## 课程路线
 
 ```mermaid
 flowchart LR
-    F["基础知识<br/>token 并发 GPU 分布式 RL 指标"]
-    S["系统主线<br/>serving RL attention"]
-    C["贯穿案例<br/>prompt 到新权重"]
-    L["实验<br/>运行 观测 故障注入"]
-    R["专题参考<br/>三库深度文档"]
-    F --> S --> C --> L --> R
+    F["基础知识<br/>单位、资源、并发、数学、实验"]
+    S["三条系统主线<br/>Serving · RL · Attention"]
+    C["贯穿案例<br/>Prompt 到新权重"]
+    L["四组实验<br/>静态契约 → 真实运行"]
+    R["专题深读<br/>按任务回到源码证据"]
+    E["课程完成标准<br/>图、故障表、实验记录"]
+    F --> S --> C --> L --> R --> E
 ```
 
-## 基础知识
+### 第一阶段：共同语言
 
-先完成这些内容。它们负责解释后续文档默认使用、但原知识库没有集中讲清的先验。
+| 文档 | 学完后的产物 |
+|------|--------------|
+| [[LLM推理与Token]] | token、sequence、scheduled tokens 和 KV payload 账 |
+| [[并发进程与背压]] | 边界/容量/完成/取消表 |
+| [[GPU内存与算子]] | GPU 六类内存和 tile 生命周期图 |
+| [[分布式通信与并行]] | rank-group 坐标与控制/数据/提交三面图 |
+| [[RL后训练数学基础]] | 四种 policy/logprob 身份表与 ratio 手算 |
+| [[性能指标与实验方法]] | 可复现实验模板 |
 
-| 主题 | 读完能解决什么 |
-|------|----------------|
-| [[LLM推理与Token]] | 解释 token、prefill、decode、KV Cache 和请求输出 |
-| [[并发进程与背压]] | 分清 coroutine、进程、Actor、队列、IPC 和取消语义 |
-| [[GPU内存与算子]] | 建立 HBM、shared memory、register、带宽和显存账 |
-| [[分布式通信与并行]] | 分清 DP、TP、PP、CP、EP、collective 和 rank group |
-| [[RL后训练数学基础]] | 理解 reward、logprob、advantage、ratio、KL 和更新闭环 |
-| [[性能指标与实验方法]] | 设计可复现对照实验，不用单次数字替代结论 |
+### 第二阶段：只走最短主线
 
-## 系统主线
+1. [[推理Serving主线]]：请求账、执行账、回程账。
+2. [[Attention算子主线]]：API、dispatch、kernel 三层契约。
+3. [[RL训练闭环主线]]：五只钟、六个交接边界。
 
-基础知识读完后，只走三条短主线。这里先建立系统边界，不要求阅读所有专题文档。
+这一阶段先形成因果图，不要求把所有专题读完。遇到不懂的名词再跳到专题核心概念，避免按文件树失去主线。
 
-1. [[推理Serving主线]]：一个请求如何进入 GPU，再流式返回。
-2. [[Attention算子主线]]：一个 Q/K/V tensor 如何被 tile 化并写回输出。
-3. [[RL训练闭环主线]]：一组 prompt 如何变成训练信号和新权重。
+### 第三阶段：用一个案例贯穿三库
 
-## 贯穿案例
-
-[[从Prompt到新权重]] 使用同一组对象贯穿三库：
+[[从Prompt到新权重]] 应被复述成闭环，而不是线性目录：
 
 ```text
 prompt group
-  -> Slime Sample / rollout_id
-  -> SGLang rid / Req / ScheduleBatch
-  -> QKV / KV slot / attention tile
-  -> reward / advantage / policy loss
-  -> optimizer step / weight_version
-  -> 下一轮 rollout
+→ Slime 为每个样本调用 rollout policy
+→ SGLang request / scheduler / KV / model forward
+→ 实际 attention backend 产生 attention output
+→ token / response 回到 Slime reward 与 train data
+→ advantage / policy loss / optimizer
+→ engine 提交新权重版本
+→ 下一次 rollout policy 改变
 ```
 
-这是全课程的核心验收。读者如果只能分别解释三个框架，却不能复述这条对象生命周期，仍未形成 AI Infra 全局模型。
+要求同时保留 request id、Sample/group、KV location 和 policy version 四本身份账；它们相关但不同名。
 
-## 实验路径
+FlashAttention 在课程中承担 kernel/IO 心智模型，不表示每次 SGLang 请求都直接调用本仓库的 FlashAttention 实现。SGLang 可能选择 FlashInfer、Triton、FlashAttention 或平台专用 backend；只有 dispatch 与 profiler 证据才能证明真实 kernel。贯穿案例会显式保留这条边界。
 
-| 实验 | 主要观测 |
-|------|----------|
-| [[SGLang服务实验]] | TTFT、TPOT、KV 使用率、prefix hit、overlap |
-| [[FlashAttention性能实验]] | 正确性、shape dispatch、kernel 时间、HBM traffic |
-| [[Slime闭环实验]] | Sample 字段、DP split、loss、weight version |
-| [[跨库一致性实验]] | 请求版本、KV 生命周期、训练与 rollout 权重一致性 |
+### 第四阶段：实验与证据升级
 
-每个实验都有静态模式和运行模式。没有对应 GPU 时仍可完成源码定位和对象契约检查；有 GPU 时再补性能数据。
+| 实验 | 静态/低环境模式 | 完整环境模式 |
+|------|-----------------|--------------|
+| [[SGLang服务实验]] | 定位请求、调度、回程对象 | 真实服务、stream、overlap 与指标 |
+| [[FlashAttention性能实验]] | reference/dispatch/源码契约 | CUDA 数值、benchmark、profiler |
+| [[Slime闭环实验]] | 主循环、Sample、loss、updater 静态/CPU 检查 | Ray + Megatron + SGLang 闭环 |
+| [[跨库一致性实验]] | 字段与版本不变量 | 请求—训练—更新行为对照 |
 
-## 深入方式
+环境限制必须进入结论：静态检查通过、CPU contract 通过和 GPU e2e 通过是三种不同证据。
 
-完成课程后，再按任务进入参考层：
+## 建议学习节奏
 
-- 推理与生产：[[SGLang学习指南]]
+每个主题循环四步：
+
+1. **画模型：** 只画对象、所有者、箭头和完成信号。
+2. **找证据：** 到源码走读核对调用点、shape 和失败分支。
+3. **做验证：** 先最小静态/CPU，再按环境升级。
+4. **写反例：** 说明这个模型在哪个配置、版本或硬件下失效。
+
+不要用阅读数量作为进度。一次能解释的故障、一个被证伪的假设和一份可复现实验记录，比“读完 50 篇”更接近掌握。
+
+## 深入入口
+
+- Serving 与生产：[[SGLang学习指南]]
 - RL 后训练与扩展：[[Slime学习指南]]
 - Attention kernel：[[FlashAttention学习指南]]
-- 按主题横向跳转：[[knowledge_maps/三框架知识地图]]
-- 综合验收：[[课程完成标准]]
+- 横向主题：[[三框架知识地图]]
+- 最终验收：[[课程完成标准]]
 
-## 如何使用 Obsidian
+## Obsidian 使用建议
 
-- 把本页、当前实验和当前专题加入 Bookmarks，不依赖文件夹位置记忆入口。
-- 在专题页打开 Local Graph，深度设为 1 或 2，查看上下游而不是浏览全库大图。
-- 使用 Properties/Bases 按 `framework`、`topic`、`type`、`learning_role` 筛选内容。
-- aliases 只用于真实同义词和缩写；课程链接始终指向唯一语义文件名。
+- Bookmark 本页、当前主线、当前实验和当前专题；文件夹只负责物理归档。
+- 在专题页用 Local Graph 深度 1–2 查看语义邻居，不以全局图谱替代学习顺序。
+- 用 Properties/Bases 按 `framework`、`topic`、`type`、`learning_role` 筛选。
+- 修改实现或遇到证据争议时，按文档的 `source_baseline` 回到对应 upstream；笔记不是源码的永久替代品。

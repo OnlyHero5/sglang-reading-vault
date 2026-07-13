@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Scheduler · 源码走读
 
@@ -57,7 +57,7 @@ flowchart LR
     Decode --> Run
     Run --> Result["process_batch_result"]
     Result --> Queue
-    Result --> Output["stream_output / send_to_tokenizer"]
+    Result --> Output["stream_output<br/>正常生成经 Detokenizer<br/>skip/control 可直达 TokenizerManager"]
 ```
 
 读这条线时，不要把 Scheduler 当成单个函数，而要把它当成状态机：事件循环每转一圈，状态都会从 `waiting_queue`、`last_batch`、`running_batch`、KV pool 和控制请求里重新计算。
@@ -71,7 +71,7 @@ flowchart LR
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L4252-L4311
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L4252-L4311
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -137,7 +137,7 @@ def run_scheduler_process(
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L298-L430
+# 定位：python/sglang/srt/managers/scheduler.py L298-L430（初始化顺序骨架）
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -183,7 +183,7 @@ class Scheduler(
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L427-L520
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L427-L520
 # Init cache and memory pool
 result = kv_cache_builder.build_kv_cache(
     server_args=self.server_args,
@@ -265,7 +265,7 @@ def init_ipc_channels(self, port_args: PortArgs):
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L72-L99
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler_components/request_receiver.py L72-L99
 def recv_requests(
     self,
 ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -297,7 +297,7 @@ def recv_requests(
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L101-L141
+# 定位：python/sglang/srt/managers/scheduler_components/request_receiver.py L101-L141（跨 stage 摘要）
 def _pull_raw_reqs(self) -> Optional[List]:
     if self.ps.pp_rank == 0:
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -335,7 +335,7 @@ def _pull_raw_reqs(self) -> Optional[List]:
 - 入口 PP stage 且入口 attention TP/CP rank 才从 ZMQ 和 RPC socket 读。
 - PP 非 0 stage 从前一 stage 收 pyobj。
 - `recv_skipper` 可以在 decode 繁忙时跳过收包，减少调度开销。
-- 多模态、pickle wrapper、shared memory 特性在 broadcast 后统一收尾。
+- pickle 字段只在 PP0 unwrap；SHM feature 必须先以 pointer metadata 完成 broadcast，并在必要的 CPU group barrier 后才物化，避免源 rank 过早 unlink。
 
 **不变量与失败模式：**
 
@@ -352,7 +352,7 @@ def _pull_raw_reqs(self) -> Optional[List]:
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1352-L1395
+# 定位：python/sglang/srt/managers/scheduler.py L1352-L1395（dispatcher 节选）
 def init_request_dispatcher(self):
     self._request_dispatcher = TypeBasedDispatcher(
         [
@@ -377,7 +377,7 @@ def init_request_dispatcher(self):
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1651-L1675
+# 来源：python/sglang/srt/managers/scheduler.py L1652-L1675
 def process_input_requests(self, recv_reqs: List):
     now = time.monotonic()
     self.session_controller.maybe_reap(now)
@@ -424,7 +424,7 @@ def process_input_requests(self, recv_reqs: List):
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/io_struct.py L777-L830
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/io_struct.py L777-L830
 class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
@@ -450,7 +450,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2022-L2135
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L2022-L2135
 def handle_generate_request(
     self,
     recv_req: TokenizedGenerateReqInput,
@@ -565,12 +565,12 @@ def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
 
 **系统压力：** Continuous batching 的核心难点是同一时刻有三类状态：上一轮 prefill 结束但还没并入 decode 的请求、waiting 里的新请求、running 里的 decode 请求。顺序错误会让请求丢失、重复 decode 或延迟失控。
 
-**设计选择：** `get_next_batch_to_run()` 先合并 `last_batch` 中的 EXTEND 请求到 `running_batch`，再尝试从 waiting queue 组新 prefill；没有新 prefill 时才推进 decode。
+**设计选择：** result processor 先完成上一轮输出状态提交；下一轮 `get_next_batch_to_run()` 再过滤并合并 `last_batch` 中可继续的 EXTEND 请求，然后尝试新 prefill；没有新 prefill 时才推进 decode。overlap 中结果快照与 live `last_batch` 分离，因此“forward 已返回”不等于“结果已提交”。
 
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2586-L2714
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L2586-L2714
 def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
     self.process_pending_chunked_abort()
     self._abort_on_waiting_timeout()
@@ -634,7 +634,7 @@ def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2804-L2879
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L2804-L2879
 adder = PrefillAdder(
     self.page_size,
     self.tree_cache,
@@ -668,7 +668,7 @@ for req in self.waiting_queue:
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2884-L2965
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L2884-L2965
 if res != AddReqResult.CONTINUE:
     if res == AddReqResult.NO_TOKEN:
         if self.enable_hierarchical_cache:
@@ -721,7 +721,7 @@ new_batch.prepare_for_extend()
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3026-L3114
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L3026-L3114
 def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     initial_bs = batch.batch_size()
 
@@ -779,7 +779,7 @@ def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3176-L3295
+# 定位：python/sglang/srt/managers/scheduler.py L3176-L3295（overlap forward 骨架）
 def run_batch(
     self,
     batch: ScheduleBatch,
@@ -829,7 +829,7 @@ def run_batch(
 
 - `forward_ct` 是全局 forward 计数，也用于 metrics 和部分测试/排障。
 - overlap 下，schedule stream 准备完成后 forward stream 才能读 batch。
-- `_forward_isolation` 保护 batch 字段，避免 worker 中途修改破坏 scheduler 侧状态。
+- `_forward_isolation` 临时隔离 worker 构造执行视图时会消费或修改的 Scheduler batch 字段；结果队列使用的则是另一个受限浅快照机制。
 - D2H copy 放到 copy stream，给下一轮 forward 留并行空间。
 - `batch.input_ids = None` 表示下一轮输入从 FutureMap 重建，而不是继续共享旧 tensor。
 
@@ -848,7 +848,7 @@ def run_batch(
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3434-L3464
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L3434-L3464
 def process_batch_result(
     self,
     batch: ScheduleBatch,
@@ -881,7 +881,7 @@ def process_batch_result(
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/batch_result_processor.py L629-L722
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler_components/batch_result_processor.py L629-L722
 def process_batch_result_decode(
     self,
     batch: ScheduleBatch,
@@ -933,12 +933,12 @@ def process_batch_result_decode(
 
 **系统压力：** Pipeline Parallelism 下，每个 stage 都要接收上一 stage 的请求/proxy，运行本地 forward，再把 proxy 或 output 发往下一 stage。默认 overlap 的 `result_queue` 不能表达跨 stage 的 microbatch 和通信依赖。
 
-**设计选择：** `event_loop_pp` 为每个 microbatch 槽维护独立 `running_mbs/last_mbs/mbs`，通过 async send 和 sync recv 减少通信等待；last stage 可以用 async batch depth 缓冲输出。
+**设计选择：** 普通 `event_loop_pp` 为每个 microbatch 槽维护独立 `running_mbs/last_mbs/mbs/mb_metadata`，通过 async send、sync recv和 last-rank output queue 控制顺序；typed tensor dict 把 proxy 与 output 解复用。PD Prefill/Decode 另有独立 PP loop，在同一 microbatch 环上执行 bootstrap/transfer/release 或 retract/prealloc/transfer 共识。
 
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_pp_mixin.py L67-L168
+# 定位：python/sglang/srt/managers/scheduler_pp_mixin.py L67-L168（PP 循环骨架）
 def event_loop_pp(self: Scheduler):
     """
     A scheduler loop for pipeline parallelism.
@@ -987,9 +987,10 @@ def event_loop_pp(self: Scheduler):
 
 **不变量与失败模式：**
 
-- PP request/proxy/output 三条流不能错位。
+- PP request/proxy/output 三条流不能错位；typed inbox 只能缓存乱序消息，不能修复缺失消息。
 - async send 后，buffer 复用前必须 commit 通信 work。
 - last stage 的 CPU result processing 要等 D2H event。
+- 非 CUDA backend 若 send 近似阻塞，需要遵守源码的奇偶 rank send/recv 顺序以避免环死锁。
 
 ## 运行验证
 

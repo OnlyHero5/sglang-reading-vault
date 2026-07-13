@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # HTTP-Server · 核心概念
 
@@ -124,7 +124,7 @@ native `/generate` 可以直接走 `_global_state.tokenizer_manager`。OpenAI、
 
 ## ServerStatus 是 readiness 账本
 
-端口开始监听不代表模型已经可服务。SGLang 把 warmup 放在线程里，完成后才把 readiness 推进到 `ServerStatus.Up`。如果显式跳过 warmup，也会直接置 Up。
+端口开始监听不代表模型已经可服务。这里实际上有两层 warmup：`--warmups` 指定的 custom warmups 在 lifespan 中直接 await，完成后才启动 general warmup 线程；general warmup 再通过本机 HTTP 请求检查 `/model_info` 和实际推理入口。显式跳过 general warmup 会直接置 `ServerStatus.Up`。
 
 ```python
 # 来源：python/sglang/srt/entrypoints/http_server.py L2145-L2161
@@ -147,7 +147,7 @@ def _wait_and_warmup(
     logger.info("The server is fired up and ready to roll!")
 ```
 
-因此排查 readiness 时，不要只看 uvicorn 是否打印监听日志，还要看 warmup 是否成功、`/health` 是否越过 `Starting`、深度 health 是否能收到后端响应。
+源码基线还有一个必须正视的边界：普通模式 warmup 的非 200 或异常会进入 kill-tree 路径；PD disaggregation warmup 非 200 只把状态设为 `UnHealthy`，但 helper 仍返回先前 `/model_info` 阶段的 `success=True`，外层可能继续打印 ready 日志。readiness 排障必须同时看状态、warmup 分支和响应码，不能只搜“ready to roll”。
 
 ## 四条主线
 
@@ -156,13 +156,15 @@ def _wait_and_warmup(
 | 启动主线 | `run_server` | uvicorn/Granian 阻塞监听 | `ServerArgs → PortArgs → scheduler_infos → _GlobalState` |
 | native 请求主线 | `/generate` | `TokenizerManager.generate_request` | `GenerateReqInput` 是否 stream、abort task 是否挂上 |
 | OpenAI 请求主线 | `/v1/chat/completions` | `openai_serving_chat.handle_request` | route 是否只做委托，协议转换在哪里发生 |
-| readiness 主线 | `lifespan` warmup thread | `ServerStatus.Up` 或 `UnHealthy` | `/model_info`、warmup 请求、health generate 探测 |
+| readiness 主线 | custom warmups + general warmup thread | `ServerStatus.Up`、`UnHealthy` 或进程退出 | `/model_info`、模式分支、warmup 响应码、health 时间戳 |
 
 ## 常见误解
 
 - “HTTP Server 很厚”：不准确。文件大，是因为协议端点多、运维端点多；推理主逻辑在 TokenizerManager、Scheduler、Detokenizer。
-- “`/health` 200 就代表模型生成可用”：不一定。默认 `/health` 是轻量探活，深度探活要看 `/health_generate` 或环境变量。
+- “`/health` 200 就代表 `ServerStatus.Up`”：不成立。轻量路径只拒绝 graceful exit 和 `Starting`，即使状态是 `UnHealthy` 也可能返回 200。
+- “`/health_generate` 200 证明这条探测请求完成”：不准确。它看到探测开始后的任意 `last_receive_tstamp` 更新就成功，繁忙服务中的其他正常回包也可能满足条件。
 - “多 worker 只是 uvicorn workers”：不完整。多 tokenizer worker 需要 shared memory 传启动参数，每个 worker 都有自己的 `TokenizerWorker`。
 - “`Engine()` 和 `launch_server` 是两套推理”：不准确。它们在 `TokenizerManager.generate_request` 之后共享同一条链路。
+- “所有 OpenAI route 都一定有 handler”：不准确。`/v1/responses` handler 初始化被视为 optional，失败只记录 warning，服务本身继续启动。
 
 下一篇 [[SGLang-HTTP-Server-源码走读]] 会把这些判断逐段落到源码分支。

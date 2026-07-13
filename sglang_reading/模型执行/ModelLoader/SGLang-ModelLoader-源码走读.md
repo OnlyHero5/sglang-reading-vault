@@ -9,11 +9,11 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ModelLoader · 源码走读
 
-本篇沿一条真实冷启动主线走：`Qwen/Llama` 类 HF checkpoint 的一个 safetensors shard，如何进入当前 TP rank 的线性层参数。
+本篇先沿一条真实基线走：Llama 类 HF checkpoint 的 safetensors tensor 如何进入当前 TP rank 参数；随后用 ShardedState、BitsAndBytes、GGUF、Remote 与 Layered 路线逐一指出这条基线在哪里失效。
 
 ## 主线图
 
@@ -26,10 +26,13 @@ flowchart TB
   E --> F[hf_weights_files]
   F --> G[_get_weights_iterator]
   G --> H[(name, tensor)]
-  H --> I[model.load_weights]
-  I --> J[param.weight_loader]
-  J --> K[rank-local Parameter]
-  K --> L[quant postprocess]
+  H --> I{写入路线}
+  I --> J[model.load_weights]
+  J --> K[param.weight_loader]
+  I --> M[rank-local state/direct/remote]
+  K --> L[rank-local Parameter]
+  M --> L
+  L --> N[quant process + post-load fixup]
 ```
 
 ## 读者任务
@@ -52,11 +55,11 @@ flowchart TB
 | 排查找不到权重文件 | 第 4 节 | `_prepare_weights` 决定下载、本地目录、allow pattern、safetensors index 过滤和 PT fallback |
 | 排查加载慢或内存高 | 第 2、5 节 | weights region、CPU backup、mmap、prefetch、多线程 iterator 都会影响冷启动峰值 |
 | 排查 shape mismatch | 第 6 到 8 节 | 先看模型 `load_weights` 是否把名字映射到正确参数，再看参数 `weight_loader` 的 TP 切片 |
-| 排查 rank 间权重不同 | 第 1、7、8 节 | `tp_rank` 先进入 `LoadConfig`，真正消费点通常在 linear/quant 参数 loader |
+| 排查 rank 间权重不同 | 第 1、7、8、10 节 | 区分 LoadConfig remote rank、运行时 linear rank、rank-local iterator/state 与 presharded 标志 |
 | 排查量化模型启动后错误 | 第 9 节 | `model.load_weights` 之后还会遍历模块执行 `quant_method.process_weights_after_loading` |
 | 判断特殊 loader 改了哪段 | 第 10 节、运行验证 | remote、RunAI、FlashRL、BitsAndBytes 等通常替换 transport、iterator 或 postprocess 的一段，不等于重写整条主线 |
 
-读的时候保持三层分开：文件层解决“权重从哪里来”，模型层解决“名字映射到哪个参数”，参数层解决“当前 rank 拿哪一片并写到哪里”。
+读的时候保持四层分开：文件/transport 解决“字节从哪里来”，写入路线决定“是否经过模型名字 remap”，rank-local 协议决定“在哪里且只切一次”，完成阶段负责 quant layout 与模型 post-load fixup。
 
 ## 1. ModelRunner 先编译 LoadConfig
 
@@ -426,7 +429,7 @@ def get_model_loader(
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 ```
 
-关键点：这里仍然没有“本 rank 切片”。iterator 只是让权重按 name 流入模型。
+对默认普通 HF 路线，关键点是这里通常还没有 tensor 切片；但 `_prepare_weights` 可按 TP rank stagger 文件顺序以错峰 I/O，不能把“读取顺序不同”误判为“每 rank 选了不同 shard”。BitsAndBytes、remote connector 等特殊 iterator 则可能真的产出 rank-local tensor。
 
 ## 6. DefaultModelLoader 初始化模型后才灌权重
 
@@ -559,7 +562,7 @@ def get_model_loader(
 
 这段说明：shape mismatch 或 “Parameter not found” 多半不是 `_prepare_weights` 的问题，而是 name remap、模型分层、PP layer 范围或模型实现的加载规则问题。
 
-## 8. 参数自己的 weight_loader 完成本 rank 写入
+## 8. 默认全量 tensor 由 parameter loader 完成本 rank 写入
 
 `RowParallelLinear.weight_loader` 根据本 rank 的参数 shape 计算 `start_idx`，再 narrow checkpoint tensor，最后 shape assert 和 copy。
 
@@ -629,11 +632,11 @@ def get_model_loader(
         param_data.copy_(loaded_weight)
 ```
 
-这一步才是 checkpoint tensor 到 rank-local parameter 的最终写入。
+这一步是 Llama + 普通全量 tensor 基线的最终写入。卡片中的条件本身就是边界：BitsAndBytes 4bit 或 `use_presharded_weights` 会跳过这里的 narrow；QKV/Merged/quant parameter v2 还有各自的 packed、replicated KV head 与 scale 协议。`self.tp_rank` 默认来自 `get_parallel()`，不是 `LoadConfig.tp_rank`。
 
-## 9. 加载后还要做量化后处理
+## 9. 加载完成至少有两类动作
 
-`model.load_weights` 完成后，loader 遍历所有 module，如果 module 有 `quant_method`，就调用 `process_weights_after_loading`。CPU offload 场景下，它会通过 `device_loading_context` 临时把参数搬到目标设备处理。
+默认路线在 `model.load_weights` 后遍历 module 执行 `quant_method.process_weights_after_loading`。CPU offload 场景通过 `device_loading_context` 临时搬运，并在 quant method 替换 parameter/storage 时谨慎恢复。另一类是模型级 `post_load_weights`：Dummy、ShardedState、RemoteInstance、Remote KV 等绕过 `model.load_weights()` 的路线必须显式触发，用来补齐模型派生状态。
 
 ```python
 # 来源：python/sglang/srt/model_loader/loader.py L772-L821
@@ -689,18 +692,22 @@ def get_model_loader(
                     quant_method.process_weights_after_loading(module)
 ```
 
-## 10. 特殊 loader 改变的是某一段主线
+## 10. 特殊 loader 组成路线矩阵
 
 | loader | 改变哪一段 |
 |--------|------------|
 | `DummyModelLoader` | 不读 checkpoint，随机初始化，用于 profiling |
+| `ShardedStateLoader` | 按 `model-rank-{rank}` 读取并直接 copy state dict，绕过模型 remap |
+| `BitsAndBytesModelLoader` | 非预量化时可在 iterator 内先 TP 切片再 4bit；预量化 TP>1 被拒绝 |
 | `GGUFModelLoader` | 文件解析和参数 materialize 特殊化 |
 | `LayeredModelLoader` | 用 meta 初始化，逐层 materialize，降低峰值 |
-| `RemoteInstanceModelLoader` | 权重来源从本地/HF 变成远端实例参数 |
+| `RemoteModelLoader` | FS 走 model loader，KV 按 rank state dict direct copy |
+| `RemoteInstanceModelLoader` | 按参数顺序 NCCL broadcast 或按注册地址传输，绕过名字 remap |
 | `ModelOptModelLoader` | 加载和量化工作流合并 |
 | `QuantizedRLModelLoader` | RL 场景下让权重重载走 native FP8 路线 |
+| `RunaiModelStreamerLoader` | 改用流式/分布式 safetensors iterator，仍复用默认 postprocess |
 
-特殊 loader 不是平行世界。它们仍要交付 `nn.Module`，并且最终仍要满足模型参数槽的 shape 和 dtype 约束。
+特殊 loader 统一于“交付可执行 `nn.Module`”，不统一于中间调用链。判断新 loader 时要回答五问：权重是否 rank-local；是否经过模型 remap；是否直接写 state/address；quant process 在写前还是写后；谁负责 model post-load fixup。
 
 ## 运行验证
 
@@ -708,9 +715,9 @@ def get_model_loader(
 |------|----------|------|
 | 文件选择 | 日志中的 load format、权重文件后缀、`Cannot find any model weights` | 能定位到 `_prepare_weights` 的 allow pattern |
 | 启动慢 | `Loading safetensors checkpoint shards` 进度、多线程/prefetch 参数 | 能判断是文件 IO、mmap、NFS/page cache 还是模型写入慢 |
-| rank OOM | 各 rank 日志和 GPU memory | 如果只有部分 rank 异常，优先看 TP shape 和 `weight_loader` |
+| rank OOM | 各 rank 文件顺序、iterator 窗口、tensor 是否 rank-local、GPU memory | 先定位 I/O/CPU 峰值还是 rank-local 写入，不机械归因 parameter loader |
 | 量化后异常 | `quant_method.process_weights_after_loading` | 确认后处理是否执行，参数是否临时搬到目标设备 |
 
 ## 复盘
 
-这条源码主线可以压缩成一句话：ModelLoader 只把“权重流”送进模型，真正的模型语义在 `load_weights`，真正的 TP 分片在参数自己的 `weight_loader`。
+这条源码主线应压缩成一句话：ModelLoader 选择一条把来源字节变成可执行 rank-local 模型的协议；默认 HF 路线把名字语义交给 `model.load_weights`、把常规 TP 切片交给 parameter loader，特殊路线可以改写任何一段，但必须避免漏切、重切、漏 post-load 或部分更新。

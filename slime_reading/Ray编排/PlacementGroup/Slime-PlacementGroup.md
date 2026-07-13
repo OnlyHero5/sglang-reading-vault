@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # PlacementGroup
 
@@ -20,7 +20,7 @@ updated: 2026-07-10
 读完后，你应该能排查四类问题：
 
 - 启动一直打印 `Waiting for placement group`。
-- colocate 下 actor 和 rollout 为什么共用 bundle，但需要 offload 分时使用显存。
+- colocate 下 actor 和 rollout 为什么只共享共同前缀，较大一侧仍可能有独占后缀，以及为什么重叠部分需要 offload 分时使用显存。
 - external rollout 为什么不会在本地 Ray PG 里申请 rollout GPU。
 - RayTrainGroup 和 SGLang engine 为什么必须使用同一套重排后的 bundle 顺序。
 
@@ -71,11 +71,12 @@ flowchart LR
 
 | 不变量 | 为什么重要 |
 |--------|------------|
-| Slime 只创建一个主 PG，再切 actor/rollout/critic 视图 | 下游不能假设 actor 和 rollout 是两套互不相关的 PG |
+| Slime 只创建一个主 PG，再切 actor/rollout/critic 视图 | 下游不能假设 actor、critic、rollout 是三套互不相关的物理资源池 |
 | `rollout_offset` 只决定 rollout 视图从哪里开始切 | 它不是物理 GPU id，也不是 SGLang engine id |
 | `reordered_bundle_indices` 用于 Ray scheduling | 训练 rank 和 SGLang engine 都必须消费同一套逻辑顺序 |
 | `reordered_gpu_ids` 用于调试和 engine base GPU id | 它帮助 Ray bundle 顺序与物理 GPU 对齐 |
-| colocate 共享 bundle，不等于显存可以同时占满 | 需要 `offload_train` / `offload_rollout` 的生命周期配合 |
+| colocate 共享的是 logical 0 起始的共同前缀 | 若两侧 GPU 数不同，较大一侧还有不重叠后缀；重叠部分需要 offload 生命周期 |
+| critic 与 actor 复用同一前缀 | 当前二者各以 0.4 GPU 的 Ray 份额绑定同一 bundle，`use_critic` 会强制 `offload_train` |
 | external rollout 不占本地 rollout PG | `rollout_num_gpus` 在 external 场景更多是逻辑 serving 容量 |
 
 ## 运行验证入口
@@ -83,14 +84,16 @@ flowchart LR
 轻量验证优先跑布局单测：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_placement_group.py -q
 ```
 
-如果本地缺少 Ray，该测试会在 import 阶段失败；这属于环境依赖问题，不代表文档引用错误。
+如果本地缺少 Ray，该测试会在 import 阶段失败；这属于环境依赖问题，不代表文档引用错误。本库当前 Windows 环境即因缺 `ray` 在 collection 阶段受阻，已改用从当前源码 AST 抽取 `_get_placement_group_layout` 的静态执行，10 个矩阵 case 全部通过。
 
 参数校验相关的 colocate 边界可跑：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
 
@@ -99,6 +102,8 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 - colocate 下 `rollout_num_gpus=0` 会保留为 0，但 offload 标志被打开。
 - delta weight update 会拒绝 colocate。
 - placement group 矩阵固定 normal、debug、external、colocate 的 `(num_gpus, rollout_offset)`。
+
+`tests/utils/test_megatron_role_config.py` 还依赖 `sglang` 与 `ray`；缺依赖时只能做源码交叉核对，不能记录为测试通过。
 
 ## 衔接
 

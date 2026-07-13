@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Ray参数 · 数据流
 
@@ -85,9 +85,9 @@ del args.offload
 | 普通 decoupled | `rollout_num_gpus=32` | `(48, 16)` | Ray 申请 48 GPU；rollout 从第 16 个 bundle 后开始 |
 | train-only debug | `debug_train_only=True` | `(16, 0)` | 只保留 actor 资源 |
 | rollout-only debug | `debug_rollout_only=True`、`rollout_num_gpus=32` | `(32, 0)` | 只按 rollout GPU 建 PG |
-| colocate 小于 actor | `colocate=True`、`rollout_num_gpus=8` | `(16, 0)` | 同一组 16 GPU，rollout 只使用其中一部分 |
-| colocate 等于 actor | `colocate=True`、`rollout_num_gpus=16` | `(16, 0)` | actor/rollout 完全共享同一组 16 GPU |
-| colocate 大于 actor | `colocate=True`、`rollout_num_gpus=32` | `(32, 0)` | PG 扩到 32 GPU，actor 仍是其中的训练切片 |
+| colocate 小于 actor | `colocate=True`、`rollout_num_gpus=8` | `(16, 0)` | rollout 使用前 8 个 bundle，与 actor 前缀重叠 |
+| colocate 等于 actor | `colocate=True`、`rollout_num_gpus=16` | `(16, 0)` | 两侧视图长度相同，覆盖同一组 16 GPU |
+| colocate 大于 actor | `colocate=True`、`rollout_num_gpus=32` | `(32, 0)` | actor 使用前 16 个 bundle，rollout 可使用 32 个；共同前缀重叠 |
 | zero rollout non-colocate | `rollout_num_gpus=0` | `(16, 16)` | 仍有 actor PG；rollout 视图为空切片 |
 | zero rollout colocate | `colocate=True`、`rollout_num_gpus=0` | `(16, 0)` | 同卡模式保留 actor PG，不启动本地 engine |
 | external engines | `rollout_external=True` | `(16, 16)` | PG 只申请 actor GPU；rollout offset 指向空切片 |
@@ -223,6 +223,6 @@ def train(args):
 python -m pytest slime/tests/test_placement_group.py -q
 ```
 
-预期结果是场景矩阵中的十个 layout 全部通过。若你修改了 `slime_validate_args` 或 `_get_placement_group_layout`，先让这张矩阵仍然成立，再考虑更新文档和更高层测试。
+依赖齐全时，预期结果是场景矩阵中的十个 layout 全部通过。当前轻量环境缺 `ray` 时会在 collection 阶段失败；此时只能逐行核对参数化用例与 `_get_placement_group_layout`，不能把静态核对写成运行通过。
 
 下一篇 [[Slime-Ray参数-排障指南]] 会按症状进入这些分支。

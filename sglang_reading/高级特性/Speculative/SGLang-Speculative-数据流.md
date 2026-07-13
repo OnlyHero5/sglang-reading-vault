@@ -15,7 +15,7 @@ updated: 2026-07-10
 
 ## 你为什么要读
 
-这篇只回答一个问题：一次投机 decode 中，对象什么时候改变形态，谁持有状态，下一跳消费者是谁。读完应能分清 `ScheduleBatch`、`SpecInput`、`VerifyInput`、`logits_output`、`predict/accept_index/accept_lens`、KV mover 和 `GenerationBatchResult` 的边界。
+这篇只回答一个问题：一次投机 decode 中，对象什么时候改变形态，谁持有状态，下一跳消费者是谁。主线先跟 EAGLE/NGRAM 的树验收，再单列 DFLASH 的 block 验收；读完应能分清“共同调度结果”和“算法内部对象”，而不会把 `accept_index` 或 KV mover 当成所有算法都有的步骤。
 
 ## 总览：一条请求的对象形态
 
@@ -35,9 +35,11 @@ sequenceDiagram
   Spec->>Batch: batch.spec_info = VerifyInput
   Spec->>Target: forward_batch_generation(is_verify=True)
   Target-->>Spec: logits_output
-  Spec->>Samp: logits + draft_probs + retrieve_*
+  Spec->>Samp: EAGLE/NGRAM logits + retrieve_*
   Samp-->>Spec: predict / accept_lens / accept_index
-  Spec->>KV: move accepted KV
+  opt EAGLE topk > 1 或 NGRAM
+    Spec->>KV: move accepted KV
+  end
   Spec-->>Sch: GenerationBatchResult
 ```
 
@@ -46,9 +48,9 @@ sequenceDiagram
 | 对象 | draft 前 | verify 中 | accept 后 |
 |------|----------|-----------|-----------|
 | `ScheduleBatch.input_ids` | 普通 decode 输入 | draft token 或 verify token | 下一轮输入由结果处理推进 |
-| `ScheduleBatch.spec_info` | 空或上一轮输入 | `EagleVerifyInput` / `NgramVerifyInput` | 结果里携带 `next_draft_input` |
-| `batch.out_cache_loc` | 当前 forward 写入位置 | verify 临时位置 | accepted 部分被搬到 target 主链 |
-| `accept_index` | 不存在 | accepted token 的 verify 位置索引 | KV mover 和 logprob 消费 |
+| `ScheduleBatch.spec_info` | 空或上一轮输入 | `EagleVerifyInput` / `NgramVerifyInput` / `DFlashVerifyInput` | 结果里携带算法专用下一轮输入 |
+| `batch.out_cache_loc` | 当前 forward 写入位置 | verify 临时位置 | EAGLE 树/NGRAM 视布局搬移；DFLASH 独立提交 |
+| `accept_index`（tree verify） | 不存在 | accepted token 的 verify 位置索引 | EAGLE/NGRAM 的 KV mover 和 logprob 消费；DFLASH 不生产此对象 |
 | `accept_lens` | 不存在 | 每请求接受长度，含 bonus | Scheduler 更新 `seq_lens` |
 
 ## 1. `EagleDraftInput`：draft 阶段的随身包
@@ -343,10 +345,11 @@ NGRAM 返回结果的形态类似，但 `next_draft_input` 是下一轮 NGRAM ve
 | 交互边 | 携带对象 | 不变量 | 破坏后现象 |
 |--------|----------|--------|------------|
 | Scheduler → Spec Worker | `ScheduleBatch` | `forward_mode`、`seq_lens`、`sampling_info` 与当前 batch 对齐 | verify 输入维度错、grammar mask 错 |
-| Spec Worker → Draft | `EagleDraftInput` 或 corpus state | bonus token 与 hidden states 属于同一请求 | draft 候选偏离上下文 |
-| Draft → Target Verify | `EagleVerifyInput` / `NgramVerifyInput` | `retrieve_*` 与 `custom_mask` 描述同一棵树 | attention mask 或 accept path 错 |
-| Target → Sampling | `logits_output.next_token_logits` | logits 行数等于 verify token 数 | accept_index 指向错误位置 |
-| Sampling → KV mover | `predict`、`accept_lens`、`accept_index` | `accept_lens` 含 bonus，`num_correct_drafts` 不含 bonus | off-by-one、KV 写回错位 |
+| Spec Worker → 候选生成 | `EagleDraftInput`、corpus state 或 DFLASH block state | token、hidden/cache 状态属于同一请求 | draft 候选偏离上下文 |
+| Tree draft → Target Verify | `EagleVerifyInput` / `NgramVerifyInput` | `retrieve_*` 与 `custom_mask` 描述同一棵树 | attention mask 或 accept path 错 |
+| Target → Tree sampling | `logits_output.next_token_logits` | logits 行数等于 verify token 数 | `accept_index` 指向错误位置 |
+| Target → DFLASH accept | logits 与固定 block candidates | `commit_lens = accept_len + 1`，bonus 写在接受边界 | 输出 token 与推进长度错位 |
+| Tree sampling → 条件式 KV mover | `predict`、`accept_lens`、`accept_index` | NGRAM 总是搬；EAGLE 仅 `topk > 1` 搬，且 mover 接收 drafts-only count | off-by-one、KV 写回错位 |
 | Worker → Scheduler | `GenerationBatchResult` | `next_token_ids` 和 `new_seq_lens` 同步 | 输出 token 数与请求长度不一致 |
 
 ## 运行验证
@@ -358,5 +361,11 @@ NGRAM 返回结果的形态类似，但 `next_draft_input` 是下一轮 NGRAM ve
 | `EAGLEWorkerV2.verify` 进入时 | `batch.spec_info` 应是 `EagleVerifyInput`，`draft_token_num` 与 verify token 数一致 |
 | `eagle_sample` 返回后 | `accept_lens` 至少为 1，因为包含 bonus token |
 | `_finalize_accept_tree_path` | 只在 `topk > 1` 且非 idle 时执行 |
-| `move_accept_tokens_to_target_kvcache` | `size == bs * accept_index.shape[1]` |
+| `move_accept_tokens_to_target_kvcache` | 仅在实际调用路径观察；`size == bs * accept_index.shape[1]` |
 | `NGRAMWorker.forward_batch_generation` verify 分支 | `draft_worker is None`，但仍调用 target verify 和 KV mover |
+
+## 8. DFLASH：同样交付推进长度，但不生产树验收对象
+
+DFLASH 的 target verify 使用标准 causal mask。若非 greedy 且 sampling verify kernel 可用，它调用 DFLASH 专用 sampling verify；否则走 argmax 的 block 接受逻辑。两条路径都形成 `commit_lens = accept_len + 1` 和 `out_tokens`，但不调用 `eagle_sample`，也不把 `accept_index` 交给通用 KV mover。
+
+因此调试对象应分层：Scheduler 仍关心 `accept_lens/new_seq_lens/next_token_ids` 的一致性；DFLASH worker 内部则应观察 `candidates`、`accept_len`、`bonus`、`commit_lens` 与 block cache materialization。把 EAGLE 树的 `retrieve_*`、custom tree mask 或 compact path 套到 DFLASH，得到的断点不会命中。

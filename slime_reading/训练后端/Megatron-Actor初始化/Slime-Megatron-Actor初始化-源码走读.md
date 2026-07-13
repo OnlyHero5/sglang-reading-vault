@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Megatron-Actor初始化 · 源码走读
 
@@ -35,7 +35,7 @@ updated: 2026-07-10
 | 第一次建立初始化主线 | 读者任务、主线地图、1 到 3 | driver、RayTrainGroup、Ray actor 分别负责触发、调度和进程内环境 |
 | 排查 `debug_rollout_only` | 4 | 这是最早短路，直接返回 rollout 起点，不进入 Megatron 模型加载 |
 | 区分两层 init | 5 到 6 | `TrainRayActor.init` 建 PyTorch distributed，`initialize.init` 补 Megatron 全局状态 |
-| 排查 HF config/tokenizer 读取 | 7 | 同节点按 rank 串行读取，避免并发写缓存带来的不稳定 |
+| 排查 HF config/tokenizer 读取 | 7 | 每轮按 local-slot 跨节点并发、节点内串行；任一 rank 失败会卡住全局 barrier |
 | 定位模型与 checkpoint 对齐 | 8 到 9 | `initialize_model_and_optimizer` 返回 `loaded_rollout_id`，actor/ref/teacher/old_actor 进入同一套备份系统 |
 | 排查权重同步初始化 | 10 | init 阶段只选择 updater 类型，真正连接 rollout engines 发生在后续 `update_weights` |
 | 理解 offload 语义 | 11 到 12 | sleep/wake 是训练栈暂停与恢复，会销毁和恢复 process groups |
@@ -66,10 +66,10 @@ flowchart TD
 
 系统压力：Megatron 训练必须所有 rank 一起初始化；任何单 rank 的 checkpoint 步数不同，后续 rollout id 都会错位。
 
-设计选择：`create_training_models` 先创建 train group，再对每个 actor handler 调 `init.remote`，最后 `ray.get` 聚合返回值，并要求所有 rank 的 `start_rollout_id` 一致。
+设计选择：`create_training_models` 先创建 train group，再对每个 actor handler 调 `init.remote`，最后 `ray.get` 聚合返回值，并要求所选 role 的 rank 列表内 `start_rollout_id` 一致。
 
 ```python
-# 来源：slime/ray/placement_group.py L189-L210
+# 定位骨架（非逐行摘录）：slime/ray/placement_group.py L189-L210
 critic_start_rollout_ids = ray.get(critic_model.async_init(critic_model.args, role="critic", with_ref=False))
 
 actor_start_rollout_ids = ray.get(
@@ -93,6 +93,8 @@ actor_model.set_rollout_manager(rollout_manager)
 
 - `with_ref` 由 KL 相关参数推导，不是用户手工调用。
 - 使用 critic 时，当前源码以 critic 返回的 rollout id 作为全局起点。
+- 此时只断言 critic ranks 彼此一致，不会对比 actor ranks；当前源码注释也要求 critic 场景由用户显式决定起点。
+- 若 `args.start_rollout_id` 已在参数阶段设置，聚合返回值不会覆盖它。
 - `set_rollout_manager` 在 init 之后执行；init 阶段并不会连接 SGLang engines。
 
 ## 2. Ray actor 创建阶段已经写好 rank 环境变量
@@ -102,7 +104,7 @@ actor_model.set_rollout_manager(rollout_manager)
 设计选择：`TrainRayActor.__init__` 在远程 actor 创建时设置环境变量；rank 0 生成 master 地址和端口，其余 rank 复用。
 
 ```python
-# 来源：slime/ray/train_actor.py L28-L49
+# 定位骨架（非逐行摘录）：slime/ray/train_actor.py L28-L49
 class TrainRayActor(RayActor):
     def __init__(self, world_size, rank, master_addr, master_port):
         configure_logger()
@@ -124,6 +126,8 @@ class TrainRayActor(RayActor):
 
 不变量：如果这里的 `LOCAL_RANK` 与 Ray 实际分配 GPU 不一致，后面的 `torch.cuda.set_device` 会把 rank 放到错误设备上。
 
+NUMA affinity 又使用 `global RANK % num_gpus_per_node` 选择 NVML device，而不是上面算出的 `LOCAL_RANK`。当 Ray bundle/GPU id 被重排时，训练 CUDA device 可能正确，但 CPU affinity 绑到另一块物理 GPU；这是性能与拓扑诊断边界，不一定直接报错。
+
 ## 3. RayTrainGroup 注入运行环境，并并发调用 init
 
 系统压力：offload 和 routing replay 有进程级环境要求，必须在 Ray actor 启动时注入，而不是模型初始化中途再设置。
@@ -131,7 +135,7 @@ class TrainRayActor(RayActor):
 设计选择：`_allocate_gpus_for_actor` 构造 `runtime_env.env_vars`，offload 时设置 `LD_PRELOAD` 与 `TMS_*`，routing replay 只对 actor role 开启。
 
 ```python
-# 来源：slime/ray/actor_group.py L55-L103
+# 定位骨架（非逐行摘录）：slime/ray/actor_group.py L55-L103
 env_vars = {
     "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
     "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1"),
@@ -154,7 +158,7 @@ TrainRayActor = ray.remote(**actor_options)(actor_impl)
 `async_init` 本身只是把调用广播到所有 handlers：
 
 ```python
-# 来源：slime/ray/actor_group.py L121-L128
+# 定位骨架（非逐行摘录）：slime/ray/actor_group.py L121-L128
 def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
     self.args = args
     return [
@@ -213,7 +217,7 @@ def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
 设计选择：父类 `TrainRayActor.init` 设置 CUDA device、调用 `dist.init_process_group`、初始化 gloo 辅助组；随后 `initialize.init` 调 `mpu.initialize_model_parallel` 切出 Megatron 子组。
 
 ```python
-# 来源：slime/ray/train_actor.py L50-L70
+# 定位骨架（非逐行摘录）：slime/ray/train_actor.py L50-L70
 def init(self, args, role, with_ref=False, with_opd_teacher=False):
     self.args = args
     self.role = role
@@ -238,7 +242,7 @@ def init(self, args, role, with_ref=False, with_opd_teacher=False):
 Megatron 侧只负责切子组：
 
 ```python
-# 来源：slime/backends/megatron_utils/initialize.py L33-L53
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/initialize.py L33-L53
 def _initialize_distributed(args, get_embedding_ranks=None, get_position_embedding_ranks=None):
     mpu.initialize_model_parallel(
         args.tensor_model_parallel_size,
@@ -268,7 +272,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 设计选择：Slime 的 `initialize.init` 是 Megatron 初始化的精简入口：设置全局 args，切并行组，设置 seed，初始化 microbatch calculator，并允许最后执行自定义 hook。
 
 ```python
-# 来源：slime/backends/megatron_utils/initialize.py L56-L104
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/initialize.py L56-L104
 def init(args):
     set_args(args)
     if args.enable_experimental:
@@ -298,15 +302,17 @@ def init(args):
 - seed 会随 PP rank、可选 DP rank 变化，避免所有并行 rank 使用同一随机流。
 - NumPy 2.x 会被显式拒绝，这是 Megatron 兼容性边界。
 - 自定义 init hook 位于标准初始化之后，适合补注册，不适合替代 parallel state 初始化。
+- NumPy 2.x 断言位于 `_initialize_distributed` 之后；失败时 TP/PP/DP 等子组已经部分创建，当前函数没有清理回滚。
+- 任一后续 seed/tokenizer/microbatch/custom hook 异常同样不会自动销毁 world 与 Megatron groups，原 actor 不适合作为干净进程直接重试 init。
 
-## 7. HF config/tokenizer 按节点串行读取
+## 7. HF config/tokenizer 按节点内 local slot 串行读取
 
 系统压力：多个 rank 同时读写 HF cache 可能造成缓存文件竞态；但每个 actor 又都需要 config/tokenizer。
 
-设计选择：按 `rank % num_gpus_per_node` 轮转读取，并在每轮后用 gloo barrier 同步。
+设计选择：按 `rank % num_gpus_per_node` 轮转读取，并在每轮后用全局 gloo barrier 同步。同一个 i 上每台节点各有一个 rank 同时读取，所以是“节点内串行、节点间并发”，不是全局只允许一个 reader。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L64-L76
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L64-L76
 if is_megatron_main_rank():
     init_tracking(args, primary=False, role=role)
 
@@ -321,7 +327,7 @@ for i in range(args.num_gpus_per_node):
 dist.barrier(group=get_gloo_group())
 ```
 
-读者抓手：这里的 barrier 是工程稳定性措施，不是模型并行计算的一部分。
+读者抓手：这里的 barrier 是工程稳定性措施，不是模型并行计算的一部分。它假设 global rank 按每节点固定 GPU 数连续排列；任一节点路径不可见、远程代码卡住或 reader 抛错，其他所有 rank 都会停在 barrier，且没有 timeout/错误广播来指出首个失败者。
 
 ## 8. 模型装配返回 checkpoint 对齐信息
 
@@ -330,7 +336,7 @@ dist.barrier(group=get_gloo_group())
 设计选择：`initialize_model_and_optimizer` 一次性返回四件东西，actor init 只在外层把 `loaded_rollout_id` 转成下一轮起点。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L78-L106
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L78-L106
 if args.offload_train:
     if (x := args.train_memory_margin_bytes) > 0:
         logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
@@ -357,7 +363,7 @@ if role == "critic":
 设计选择：初始化 actor 权重后，`TensorBackuper` 以 tag 形式保存不同参数快照；`load_other_checkpoint` 临时改 load 参数，加载辅助 checkpoint 后备份到对应 tag。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L108-L131
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L108-L131
 self.weights_backuper = TensorBackuper.create(
     source_getter=lambda: named_params_and_buffers(
         self.args,
@@ -384,7 +390,7 @@ if self.args.keep_old_actor:
 辅助 checkpoint 的加载方式：
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L654-L682
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L654-L682
 def load_other_checkpoint(self, model_tag: str, path: str) -> None:
     old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
     self.args.load = path
@@ -405,7 +411,7 @@ def load_other_checkpoint(self, model_tag: str, path: str) -> None:
     self._active_model_tag = model_tag
 ```
 
-不变量：辅助权重只加载 model，不加载 optimizer/RNG；否则会污染当前 actor 训练状态。
+不变量：辅助权重只加载 model，不加载 optimizer/RNG；否则会污染当前 actor 训练状态。但 `load_other_checkpoint` 临时改写 `args.load/no_load_optim/no_load_rng/finetune/ckpt_step` 时没有 `try/finally`。load 失败会留下被改写的 args 和可能部分写入的模型，不能安全继续加载下一个 tag。
 
 ## 10. weight_updater 在 init 中只定桥型
 
@@ -414,7 +420,7 @@ def load_other_checkpoint(self, model_tag: str, path: str) -> None:
 设计选择：init 根据配置选择 updater class 并实例化，但不在这里获取 rollout engines。真正连接和推权发生在 `update_weights()`。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L133-L168
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L133-L168
 if self.args.vocab_size is None:
     hf_vocab = getattr(self.hf_config, "vocab_size", None)
     self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
@@ -446,7 +452,7 @@ self.weight_updater = update_weight_cls(...)
 真正连接 rollout engines 的位置：
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L583-L628
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L583-L628
 def update_weights(self) -> None:
     if self.args.debug_train_only or self.args.debug_rollout_only:
         return
@@ -475,7 +481,7 @@ def update_weights(self) -> None:
 设计选择：actor init 清理临时缓存；若启用 offload，先确保当前 tag 是 `actor`，再 `sleep()`。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L170-L188
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L170-L188
 clear_memory()
 
 if self.args.offload_train:
@@ -504,7 +510,7 @@ return start_rollout_id
 设计选择：`sleep()` 清内存、断开部分 rollout engine 连接、销毁 process groups，然后暂停 `torch_memory_saver`；`wake_up()` 恢复内存管理、重载 process groups，并切回 actor 权重 tag。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L190-L220
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L190-L220
 def sleep(self) -> None:
     assert self.args.offload_train
 
@@ -536,7 +542,7 @@ def wake_up(self) -> None:
     print_memory("after wake_up model")
 ```
 
-不变量：调用 `sleep/wake_up` 前必须已经经过完整 init；`debug_rollout_only` 不具备这些对象。
+不变量：调用 `sleep/wake_up` 前必须已经经过完整 init；`debug_rollout_only` 不具备这些对象。`train()`、`save_model()`、`update_weights()` 也没有用 finally 保证失败后 sleep/destroy；异常后的 actor 资源态必须重新审计，通常直接重建更可靠。
 
 ## 运行验证
 
@@ -555,7 +561,7 @@ python -m pytest slime/tests/test_megatron_argument_validation.py
 
 完整初始化验证需要 Ray、CUDA、Megatron、checkpoint 与可用 GPU。预期现象：
 
-- 正常模式：所有 rank 返回同一个 `start_rollout_id`，driver 不触发 `assert len(set(start_rollout_ids)) == 1`。
+- 正常模式：所选 role 的各 rank 返回同一个 `start_rollout_id`，driver 不触发 `assert len(set(start_rollout_ids)) == 1`。
 - `debug_rollout_only`：`init` 快速返回 `0`，不会出现 Megatron checkpoint load 日志。
 - `offload_train`：init 末尾出现 sleep 相关 memory 日志，第一次 `train()` 前出现 wake 相关 memory 日志。
 

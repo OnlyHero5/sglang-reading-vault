@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 磁盘权重同步 · 数据流
 
@@ -47,7 +47,7 @@ sequenceDiagram
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk.py L70-L98
+# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk.py L70-L97
 if dist.get_rank() == 0:
     logger.info("Updating rollout weights from disk checkpoint %s", version_dir)
     ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
@@ -78,6 +78,8 @@ if dist.get_rank() == 0:
     ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
 ```
 
+该目录是最终路径而非 staging rename；engine reload 被 barrier 延后到保存完成之后。若共享盘对其他 host 不具备及时 read-after-write 可见性，full disk 没有内置 hook 修复这一点。
+
 ## Delta Disk：trainer publish，host apply，engine reload
 
 delta disk 多了一层 host-local checkpoint。Trainer 只发布 diff；每个 rollout host 先把自己的本地 HF 副本追到目标版本，再让 engine 从这个本地目录 reload。
@@ -101,7 +103,7 @@ sequenceDiagram
 delta updater 连接 engine 时保留两类 actor：`rollout_engines` 用于 reload，`all_engine_actors` 用于每台 host 本地 apply。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L60-L75
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L60-L75；省略未消费参数）
 def connect_rollout_engines(
     self,
     rollout_engines: Sequence[ActorHandle],
@@ -120,7 +122,7 @@ def connect_rollout_engines(
 reload 阶段先让 host apply，再让 engine 普通 disk reload：
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L169-L186
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L169-L186；省略 barrier 与列表换行）
 def _reload_engines(self) -> None:
     if self._commit_hook is not None:
         self._commit_hook(self.args, self._version_dir, list(self.rollout_engines))
@@ -140,12 +142,14 @@ def _reload_engines(self) -> None:
     dist.barrier(group=get_gloo_group())
 ```
 
+注意 trainer 的 `_snapshot` 已在 `_encode_delta.collect` 中前移，早于这里的 commit、host apply 与 reload。任何后续失败都会让 trainer base 与 host state 分叉；版本号和 snapshot 都不会自动回滚。
+
 ## Host-Local Apply：版本链是强不变量
 
 `apply_deltas` 必须从当前 `.delta_sync/state.json` 的下一版开始逐个 apply。若本地版本和 delta 的 `base_version` 不一致，直接失败。
 
 ```python
-# 来源：slime/utils/disk_delta.py L155-L164
+# 定位骨架（基于 slime/utils/disk_delta.py L155-L164；省略 compression/encoding 校验）
 def _apply_version(local_ckpt_dir: str, version_dir: str) -> None:
     with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
         meta = json.load(f)["metadata"]
@@ -170,12 +174,14 @@ def apply_deltas(local_ckpt_dir: str, delta_root: str, target_version: int) -> N
             _apply_version(local_ckpt_dir, os.path.join(delta_root, f"weight_v{version:06d}"))
 ```
 
+但强校验不等于事务回滚：每版先原地写 mmap，后验 checksum，最后才更新 state。失败时 state 保持旧值，文件可能已部分变化。overwrite 可用同版重放修复；XOR 路径应重建本地 checkpoint，而不是直接重试。
+
 ## Engine 侧：delta 被隐藏在 Slime 层
 
 SGLang engine actor 在启动时后台 materialize base；真正 reload 时 `sync_local_checkpoint` 负责 apply，`update_weights_from_disk` 只发送普通 HTTP payload。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L171-L182
+# 来源：slime/backends/sglang_utils/sglang_engine.py L175-L182
 if self.args.update_weight_mode == "delta" and self.args.update_weight_transport == "disk":
     from slime.utils.disk_delta import init_local_checkpoint
 
@@ -187,7 +193,7 @@ if self.args.update_weight_mode == "delta" and self.args.update_weight_transport
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L396-L437
+# 定位骨架（基于 slime/backends/sglang_utils/sglang_engine.py L396-L437；拼接 local sync 与 HTTP reload）
 def sync_local_checkpoint(self, target_version: int):
     from slime.utils.disk_delta import apply_deltas, init_local_checkpoint
 
@@ -224,7 +230,7 @@ def update_weights_from_disk(
 colocate tensor 的边界是 GPU rank group，而不是文件版本。落在 actor GPU 范围内的 engine 走 IPC；超出的远端 engine 会保留 distributed 更新路径。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py L86-L117
+# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py L87-L105
 total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
 colocate_engine_nums = 0
 for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
@@ -246,9 +252,12 @@ if self.use_distribute:
     self._group_name = "slime"
 ```
 
+切分后 `self.rollout_engines` 只保留 colocated 子集。`update_weights()` 的 pause、flush、continue 和量化 post-process 都遍历该字段，远端 `distributed_rollout_engines` 不在闸门内；混合模式的数据传输存在，但更新隔离语义弱于纯 colocate 或纯 distributed。
+
 ## 复盘
 
 - full disk 的状态边界是共享目录。
 - delta disk 的状态边界是 shared delta dir 加每 host 的 `.delta_sync/state.json`。
 - engine 侧看到的仍是 disk reload，delta 是 Slime trainer 与 host actor 的内部协议。
 - colocate tensor 没有 checkpoint 目录，排障时要看 IPC bucket、Gloo group 和 CUDA IPC 清理。
+- full/delta/tensor 三条路径都缺少统一失败回滚；版本、文件、engine 服务态和 trainer snapshot 必须分账检查。

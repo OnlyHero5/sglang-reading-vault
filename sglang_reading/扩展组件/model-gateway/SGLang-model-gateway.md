@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # model-gateway
 
@@ -21,12 +21,18 @@ updated: 2026-07-10
 
 ## 1. 本模块目标
 
-专题读法：`sgl-model-gateway`（Rust 二进制 `smg`）是 SGLang 的**独立 API 网关层**，位于客户端与 srt worker 之间。它用 Axum 暴露 OpenAI 兼容 HTTP/gRPC 端点，通过 `WorkerRegistry` 管理后端 worker 池，按负载均衡策略（round-robin、consistent hash、cache-aware 等）路由请求，并支持 PD disaggregation（prefill/decode 分离）、IGW 多 router 模式、熔断与重试。
+专题读法：`sgl-model-gateway`（Rust 二进制 `smg`）是 SGLang 的独立 API 网关层，位于客户端与推理 worker 之间。它用 Axum 暴露 HTTP API，可通过 HTTP 或 gRPC 连接 worker；`RouterManager` 先决定使用 Regular、PD、OpenAI 等哪类 router，具体 router 再从 `WorkerRegistry` 的可用候选中按 policy 选 worker。
+
+读本专题要守住三个边界：
+
+1. Gateway 代理请求和响应，但不执行模型 forward，也不搬运 PD 的 KV tensor。
+2. `healthy`、`available`、`ready` 是三层状态：worker 健康、健康且 breaker 可执行、Gateway 达到当前模式最低服务条件。
+3. retry 只能发生在 response 交给客户端之前；流式 2xx 之后的 body error 只能归因和中断，不能透明换 worker 续传。
 
 **源码锚点：**
 
 ```rust
-// 来源：sgl-model-gateway/src/server.rs L70-L78
+// 定位骨架（非逐行摘录）：来源 sgl-model-gateway/src/server.rs L70-L78
 #[derive(Clone)]
 pub struct AppState {
  pub router: Arc<dyn RouterTrait>,
@@ -41,7 +47,7 @@ pub struct AppState {
 读法：
 
 - `AppState` 注入所有 Axum handler：路由决策走 `router`，worker 管理走 `context.worker_registry`。
-- IGW 模式下 `router_manager` 协调 HTTP/gRPC × Regular/PD 四套 router。
+- IGW 模式下 `router_manager` 最多协调 HTTP Regular、HTTP PD、HTTP OpenAI、gRPC Regular、gRPC PD 五类 router。
 
 ---
 
@@ -49,12 +55,12 @@ pub struct AppState {
 
 ```
 Client (OpenAI SDK / curl)
- │ HTTP/gRPC
+ │ HTTP
  ▼
 sgl-model-gateway (smg) ← 本模块
- │ 反向代理 + 选 worker
+ │ 选 router + 选 worker + 反向代理
  ▼
-srt worker(s) — /v1/chat/completions, /generate, gRPC Engine
+SGLang / vLLM / external worker(s)
 ```
 
 | 组件 | 职责 |
@@ -64,6 +70,8 @@ srt worker(s) — /v1/chat/completions, /generate, gRPC Engine
 | `routers/http/pd_router.rs` | Prefill+Decode 分离路由 |
 | `core/worker_registry.rs` | worker 注册、consistent hash ring |
 | `routers/router_manager.rs` | IGW 多 router 编排 |
+| `core/retry.rs` | 可重试状态、退避与 attempt 生命周期 |
+| `routers/streaming_utils.rs` | 流结束、流错误、客户端取消的 breaker 归因 |
 | `policies/` | worker 选择策略 |
 
 ---
@@ -72,7 +80,9 @@ srt worker(s) — /v1/chat/completions, /generate, gRPC Engine
 
 - [ ] 能说明 gateway 与 srt 的职责边界（gateway 不做 forward，只做路由/代理）
 - [ ] 能追踪 `/v1/chat/completions` 从 Axum handler 到 worker HTTP 的路径
-- [ ] 能解释 PD 模式下 readiness 为何要求 prefill+decode 各至少一个 healthy worker
-- [ ] 能用一条真实或静态请求轨迹证明 handler、router、policy、worker client 的交接，并记录失败时由哪一层重试或熔断
+- [ ] 能解释单一 PD 模式下 readiness 为何要求 prefill+decode 各至少一个 healthy worker
+- [ ] 能说明 IGW readiness 200 为什么不保证某个 PD 模型已经凑齐一对 worker
+- [ ] 能沿一次 HTTP PD attempt 解释 pair、bootstrap room、并行双发、Prefill body 对响应交付的门控、KV 直传，以及 breaker 分侧归因已经覆盖和仍未覆盖的路径
+- [ ] 能用一条真实或静态请求轨迹证明 handler、router、policy、worker client 的交接，并指出流式 2xx 前后不同的重试边界
 
 → [[SGLang-model-gateway-核心概念]] · [[SGLang-model-gateway-源码走读]] · [[SGLang-model-gateway-数据流]]

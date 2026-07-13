@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Ray参数 · 核心概念
 
@@ -43,7 +43,7 @@ flowchart TB
 | Actor 集群 | `actor_num_nodes * actor_num_gpus_per_node` | 训练侧 GPU 总量 |
 | Rollout GPU | `rollout_num_gpus` | 本地推理池 GPU 总量；external 下由远端 discovery 写回 |
 | Engine GPU | `rollout_num_gpus_per_engine` | 一个 SGLang engine 吃几张卡 |
-| Colocate | `colocate` | actor 和 rollout 看同一组物理 GPU，靠 offload 时间复用 |
+| Colocate | `colocate` | actor 与 rollout 的 GPU 视图从同一 bundle 前缀开始并发生重叠，靠 offload 时间复用 |
 | Decoupled | `colocate=False` | actor 和 rollout 使用 placement group 的不同切片 |
 | Offload train | `offload_train` | 生成时训练模型让出 GPU 显存 |
 | Offload rollout | `offload_rollout` | 训练时 SGLang 让出 GPU 显存 |
@@ -51,10 +51,10 @@ flowchart TB
 
 ## Colocate 不是“少申请一点卡”
 
-Colocate 的关键不是节约一个字段，而是让 actor 和 rollout 共享同一组物理 GPU。共享以后，两边不能同时常驻完整 GPU 状态，所以 validate 会把默认 offload 打开。
+Colocate 的关键不是节约一个字段，而是让 actor 和 rollout 的资源视图重叠。两侧 GPU 数相等时视图一致；数量不等时，较小一侧只使用共同前缀。重叠区域不能同时常驻双方完整 GPU 状态，所以 validate 会把默认 offload 打开。
 
 ```python
-# 来源：slime/utils/arguments.py L70-L99
+# 来源：slime/utils/arguments.py L70-L100
 parser.add_argument(
     "--colocate",
     action="store_true",
@@ -63,6 +63,12 @@ parser.add_argument(
         "Whether to colocate the inference engines and the actor. "
         "Turning this on will also set --offload to true."
     ),
+)
+parser.add_argument(
+    "--offload",
+    action="store_true",
+    default=False,
+    help=("Equivalent to --offload-train + --offload-rollout. "),
 )
 parser.add_argument(
     "--offload-train",
@@ -122,7 +128,7 @@ if args.offload_rollout is None:
 Slime 同时接 Megatron、SGLang 和自身参数。某些 debug 模式不需要 SGLang server，所以要先看少量 CLI，再决定是否跳过 SGLang parser。
 
 ```python
-# 来源：slime/utils/arguments.py L1530-L1559
+# 定位骨架（非逐行摘录）：来源 slime/utils/arguments.py L1530-L1559
 def _pre_parse_mode():
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
@@ -149,7 +155,7 @@ def parse_args(add_custom_arguments=None):
 传 `--rollout-external-engine-addrs` 后，Slime 不应该相信本地 CLI 猜测的 GPU 数。它会访问每个外部 server 的 `/server_info` 或 `/get_server_info`，再写回 `args.rollout_num_gpus` 和 `args.rollout_num_engines`。
 
 ```python
-# 来源：slime/backends/sglang_utils/external.py L107-L120
+# 来源：slime/backends/sglang_utils/external.py L107-L119
 def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
     addrs = args.rollout_external_engine_addrs
@@ -198,7 +204,7 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
 - `num_gpus`：整个 placement group 要申请多少 GPU bundle。
 - `rollout_offset`：rollout 视图从 bundle 的哪个位置开始。
 
-如果 `rollout_offset=0`，actor 和 rollout 看同一段 bundle；如果 offset 等于 actor GPU 数，rollout 看后半段 bundle。
+如果 `rollout_offset=0`，rollout 从 PG 的第一个 bundle 开始，与 actor 使用的前缀重叠；这不保证两侧长度相同。如果 offset 等于 actor GPU 数，rollout 从 actor 资源之后开始。
 
 ## 复盘
 

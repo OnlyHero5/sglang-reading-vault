@@ -9,110 +9,99 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Ray编排
 
-> **你只需阅读本目录，不必打开 `slime/` 源码。**
-> 内嵌代码对应 slime Git commit `22cdc6e1`。
+> **读者任务：** 区分“Ray 预订了哪块资源”和“此刻谁占着显存”，并解释 rank、bundle、actor group 与权重 collective 如何对齐。
 
----
+## 你为什么要读
 
-## 本目录解决什么问题
+Placement Group 解决的是调度所有权：哪些 actor 被允许落到哪些 GPU bundle。colocate 的 sleep/wake、SGLang weight/KV offload 解决的是运行时显存所有权。前者成功不代表后者安全；同一个 bundle 上的两个系统若没有正确交接，仍会 OOM 或互相等待。
 
-启动与入口部分讲清了启动链上谁被创建。本目录回答：**Slime 如何通过 Ray Placement Group 锁定 GPU bundle，并在 `--colocate` / `--offload-rollout` / `--offload-train` 组合下让 actor 与 rollout 分时复用同一张卡？**
+RayTrainGroup 则是 driver 侧的 rank 集合代理：它创建一组 TrainRayActor、收集异步结果，并把 `train`、`save`、`update_weights` 等操作 fan-out 到各 rank。真正的 NCCL/tensor/disk 权重传输发生在每个 Megatron actor 的 updater 内，不是 RayTrainGroup 自己“广播模型”。
 
-两个专题覆盖 Ray 资源编排全链路：
-
-| 模块 | 角色 | 一句话 |
-|------|------|--------|
-| [[Slime-PlacementGroup]] | GPU 预订 | `create_placement_groups()`、bundle 重排、colocate 共用 PG |
-| [[Slime-RayTrainGroup]] | 训练进程组 | TrainRayActor × world_size、NCCL init、`async_train` / `update_weights` |
-
----
-
-## 端到端时序
-
-这张图用于检查是否能解释 `--colocate` / `--offload-*` 下 PG + RayTrainGroup 如何分时复用 GPU。
+## 两层资源模型
 
 ```mermaid
-sequenceDiagram
- participant TR as train.py
- participant PG as PlacementGroup
- participant RM as RolloutManager<br/>Rollout 生成
- participant RTG as RayTrainGroup
- participant ACT as MegatronTrainRayActor<br/>训练后端
- participant ENG as SGLangEngine<br/>Rollout 生成
+flowchart TB
+    A["args<br/>nodes · GPUs · colocate"]
+    PG["Placement Groups<br/>bundle 与 node/IP 布局"]
+    RG["RayTrainGroup<br/>rank → actor handle"]
+    RM["RolloutManager<br/>server groups / engines"]
+    MEM["运行时显存交接<br/>sleep · wake · offload · onload"]
+    UP["Weight Updater<br/>collective / tensor / disk"]
 
- TR->>PG: create_placement_groups()
- Note over PG: actor / rollout / critic<br/>bundle 分配 · IP 重排
- alt colocate
- PG->>RM: 共用 actor PG
- PG->>RTG: 同一 PG · allocate_train_group
- else 分离部署
- PG->>RM: rollout PG
- PG->>RTG: actor PG
- end
- RTG->>ACT: TrainRayActor.remote × N
- Note over ACT: rank0 master IP:port<br/>NCCL init
- RM->>ENG: SGLangEngine.remote
- Note over ENG: launch_server<br/>HTTP + Router
- loop 主循环 offload
- ACT->>ACT: sleep() 释放训练显存
- ENG->>ENG: generate 占用 rollout 显存
- ACT->>ACT: wake_up() 恢复训练
- end
+    A --> PG
+    PG --> RG
+    PG --> RM
+    RG --> MEM
+    RM --> MEM
+    RG --> UP
+    UP --> RM
 ```
 
-这张图的读法是：PG 是 **一次性 GPU 锁定**；colocate 模式下 actor 与 rollout **共享 bundle**，靠 `sleep` / `wake_up` 与 engine pause 分时复用显存，而不是把训练和 rollout 固定切到两组 GPU。
+| 层 | 负责 | 不负责 |
+|----|------|--------|
+| Ray PG | bundle 预留、placement、colocate/分离拓扑 | 自动清空显存、保证 collective 正确 |
+| RayTrainGroup | actor handle、rank fan-out、ObjectRef 聚合 | 模型内部 PP/TP/DP 算法 |
+| actor / engine 生命周期 | sleep/wake、weights/KV onload/offload | 重新决定 Ray placement |
+| weight updater | rank/engine 连接与版本传输 | Ray driver 的迭代节拍 |
 
----
+## 分离与共置的真正差别
 
-## 零基础一句话
+| 模式 | 调度拓扑 | 显存时序 | 主要风险 |
+|------|----------|----------|----------|
+| 分离部署 | 同一 PG 预留中的 actor 与 rollout 使用不重叠 bundle 区间 | 通常可同时驻留 | GPU 成本高、跨节点传输与 process group 更复杂 |
+| colocate | rollout 与训练指向重叠的 actor bundle | 必须按阶段交接 weights/KV 与训练状态 | offload 不完整、唤醒顺序错误、同卡峰值重叠 |
 
-**像「订会议室 + 排座位号」：** PlacementGroup 一次性锁定 N 块 GPU 并重排 bundle；RayTrainGroup 按 rank 创建 TrainRayActor 并广播 NCCL；colocate 时 actor 与 rollout 共用同一间“会议室”，靠 offload 轮流上台。
+同步主循环在 rollout 结束后可 offload rollout，训练结束后再清理/睡眠训练侧，更新权重前后重新 onload；这些动作由 driver、RolloutManager 和 actor 共同完成。PG 本身不会观察 PyTorch allocator。来源：`train.py` L64-L94。
 
----
+## RayTrainGroup 应该怎样读
+
+沿四个问题阅读 [[Slime-RayTrainGroup-源码走读]]：
+
+1. 每个 actor 的 world rank、local rank、node rank 如何确定？
+2. 初始化结果如何聚合，单个 rank 失败会如何暴露？
+3. `async_train` 返回的是哪些 ObjectRef；driver 在哪里 `ray.get` 形成屏障？
+4. `update_weights` 如何 fan-out 到 actor，而 actor 又如何取得 rollout engine 和 lock？
+
+RayTrainGroup 的价值是把“调用全体 rank”封装成一个 driver API；它没有抹掉分布式失败。任一 actor 未返回、collective rank 集不一致或 placement 不满足，group 调用仍可能整体卡住。
 
 ## 推荐阅读顺序
 
-建议先读 PlacementGroup，再读 RayTrainGroup。时间紧时至少建立 bundle、rank、colocate 和 offload 的共同模型。
-
-| 顺序 | 文档 | 必读理由 |
+| 顺序 | 文档 | 读者任务 |
 |------|------|----------|
-| 1 | [[Slime-PlacementGroup-核心概念]] | bundle、colocate、IP 重排术语 |
-| 2 | [[Slime-PlacementGroup-源码走读]] | `create_placement_groups` 主路径 |
-| 3 | [[Slime-RayTrainGroup-核心概念]] | TrainRayActor、ObjectRef 聚合 |
-| 4 | [[Slime-RayTrainGroup-源码走读]] | `async_init` / `async_train` API |
-| 5 | [[Slime-PlacementGroup-排障指南]] | colocate 强制 offload 分支 |
+| 1 | [[Slime-PlacementGroup-核心概念]] | 认识 bundle、PG lifetime、colocate 与 node ordering |
+| 2 | [[Slime-PlacementGroup-源码走读]] | 沿 args → bundle → ready → 重排读实现 |
+| 3 | [[Slime-RayTrainGroup-核心概念]] | 区分 group proxy 与 rank-local actor |
+| 4 | [[Slime-RayTrainGroup-源码走读]] | 跟踪 init/train/save/update fan-out |
+| 5 | [[Slime-PlacementGroup-排障指南]] | 按 pending、错位、OOM、offload 失败定位 |
 
----
+## 可执行验证
+
+静态检查：
+
+```powershell
+rg -n "create_placement_groups|placement_group|bundle|colocate" `
+  slime/slime/ray/placement_group.py
+
+rg -n "class RayTrainGroup|async_train|update_weights|ray\.get|\.remote" `
+  slime/slime/ray/actor_group.py slime/slime/ray/train_actor.py
+```
+
+预期：第一组显示 actor/rollout PG 的构造和共置分支；第二组显示 group 通过 actor handles fan-out，而不是在 driver 内执行训练。
+
+真实小规模运行时再用 Ray Dashboard 核对 actor 数量和 placement。Dashboard 只能证明调度位置，显存交接仍要结合 actor/engine 日志与 memory snapshot。
 
 ## 上下游衔接
 
-| 方向 | 模块 | 衔接点 |
-|------|------|--------|
-| ← 启动与入口 | [[Slime-训练主循环]] | `train()` 调用 `create_placement_groups()` |
-| → Rollout 生成 | [[Slime-RolloutManager]] · [[Slime-SGLang-Engine]] | PG bundle 进入 rollout servers |
-| → 训练侧 | [[Slime-Megatron-Actor初始化]] | `allocate_train_group` → RayTrainGroup |
-| → 权重同步 | [[Slime-分布式权重同步]] | `update_weights` 经 RayTrainGroup 广播到 engine |
-| → SGLang 对照 | [[SGLang-Scheduler]] | engine 内 SGLang 调度（推理侧） |
-
----
-
-## 自测建议（零基础可试）
-
-1. **colocate 组合：** 对照 [[Slime-Ray参数-排障指南]]，列出 `--colocate` 开启时 `--offload-rollout` / `--offload-train` 的强制关系。
-2. **bundle 拓扑：** 在 [[Slime-PlacementGroup-数据流]] 的 mermaid 上，口述 actor PG 与 rollout PG 在分离模式下的差异。
-3. **Ray 进程：** 启动小规模训练后，用 Ray Dashboard 确认 TrainRayActor 数量 = `--actor-num-gpus-per-node × --actor-num-nodes`。
-
----
-
-## 模块导航
-
-| 目录 | 状态 |
-| ------ | ------ |
-| [[Slime-PlacementGroup|PlacementGroup]] | ✅ |
-| [[Slime-RayTrainGroup|RayTrainGroup]] | ✅ |
+| 方向 | 模块 | 交接对象 |
+|------|------|----------|
+| ← 启动 | [[Slime-启动与入口]] | 最终 `args` 与 PG 创建顺序 |
+| → Rollout | [[Slime-RolloutManager]]、[[Slime-引擎拓扑]] | rollout PG、server groups、engine actors |
+| → 训练 | [[Slime-Megatron-Actor初始化]] | RayTrainGroup 与 rank-local model state |
+| → 权重 | [[Slime-权重同步]] | engine list、lock、GPU layout、version |
+| → 推理内部 | [[SGLang-Scheduler]] | Ray 只到 engine 边界，request 调度属于 SGLang |
 
 ← [[Slime-启动与入口]] · → [[Slime-Rollout生成]]

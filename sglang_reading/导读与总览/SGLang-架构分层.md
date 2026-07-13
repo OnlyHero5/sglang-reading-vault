@@ -13,129 +13,49 @@ updated: 2026-07-10
 ---
 # SGLang 架构分层
 
-> 本节说明 SGLang monorepo 的 12 层架构与代表代码 · 内嵌代码对应 sglang `70df09b`
-
 ## 你为什么要读
 
-SGLang 知识图谱将代码组织为 **10 个架构层**。每层下方列出职责、代表代码与关键文件——读者可据此定位「某功能属于哪一层」。
+文件夹可以分层，运行时却不是十层洋葱。一次请求会在 API worker、runtime 子进程和 GPU step 之间往返；KV、并行组、LoRA、PD、Speculative 等机制又横穿多个阶段。更可靠的模型是：
 
----
+- 六个运行平面：描述一次普通请求怎样前进和回程；
+- 四条横切轴：描述资源、拓扑和特性怎样改变多个平面。
 
-## 总览图
+读完后，你应能把一个类放到“主要责任平面”，同时指出它读取了哪些横切状态，而不是强迫每个文件只能属于一层。
+
+## 总图：六个运行平面，四条横切轴
 
 ```mermaid
-flowchart TB
- DOC["文档与配置层"]
- EP["入口层"]
- API["协议适配层"]
- ORCH["引擎编排层"]
- SCH["请求调度层"]
- EXE["模型执行层"]
- MEM["内存与 Attention 层"]
- ADV["高级特性层"]
- EXT["扩展组件层"]
- PUB["公共 API 层"]
+flowchart LR
+    C["Client / SDK"] --> A["协议与入口适配"]
+    A --> T["API 侧请求所有权<br/>TokenizerManager / ReqState"]
+    T --> S["调度与生命周期<br/>Req / ScheduleBatch"]
+    S --> E["一步执行<br/>ForwardBatch / ModelRunner"]
+    E --> O["token/text 回程<br/>Scheduler / Detokenizer / API"]
+    O --> C
 
- DOC --> EP --> API --> ORCH --> SCH --> EXE
- EXE --> MEM
- SCH --> ADV
- EXE --> EXT
- PUB --> EP
- PUB --> EXT
+    R["runtime 编排与 IPC"] -.启动和连接.-> T
+    R -.启动和连接.-> S
+    R -.启动和连接.-> O
+
+    M["资源与地址轴<br/>prefix / KV / weight / adapter"] -.约束.-> S
+    M -.供给.-> E
+    D["分布式拓扑轴<br/>TP / PP / DP / EP / CP"] -.改变执行者.-> S
+    D -.改变执行者.-> E
+    F["特性轴<br/>PD / Spec / Grammar / LoRA / MM"] -.插入.-> T
+    F -.插入.-> S
+    F -.插入.-> E
 ```
 
----
+这张图不是性能因果图。某平面存在，不代表它一定是瓶颈；某横切机制启用，也不代表每个请求都会走同一分支。
 
-## 1. 文档与配置层
+## 平面一：协议与入口适配
 
-**职责：** 项目说明、包配置、版本与全局常量。
+**责任：** 把 native HTTP、OpenAI、Ollama、gRPC 或进程内 Engine 的调用语义，转换为 runtime 能理解的请求对象；校验、错误格式和流式协议仍属于适配器责任。
 
-| 文件 | 一句话 |
-|------|--------|
-| `README.md` | 官方特性介绍与快速开始 |
-| `python/pyproject.toml` | CLI 入口、依赖、Rust 扩展声明 |
-| `python/sglang/global_config.py` | 运行时全局常量 |
-
-**读法：** 读源码前先看本层，建立 monorepo 边界感。
-
-**源码锚点：**
+OpenAI 基类的关键边界是“先转换成内部对象，再按 stream 分流”：
 
 ```python
-## 来源：python/sglang/global_config.py L1-L15（节选）
-"""Global configurations"""
-
-# FIXME: deprecate this file and move all usage to sglang.srt.environ or sglang.__init__.py
-
-class GlobalConfig:
-    """
-    Store some global constants.
-    """
-
-    def __init__(self):
-        # Verbosity level
-        # 0: do not output anything
-        # 2: output final text after every run
-        self.verbosity = 0
-```
-
----
-
-## 2. 入口层
-
-**职责：** 用户命令 → 服务进程。CLI、`launch_server`、HTTP/gRPC 监听。
-
-**读法：** `sglang serve` 的默认路径：`cli/main` → `cli/serve` → `launch_server` → `http_server.launch_server`。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/launch_server.py L47-L51
-    else:
-        # Default mode: HTTP mode.
-        from sglang.srt.entrypoints.http_server import launch_server
-
-        launch_server(server_args)
-```
-
-| 文件 | 职责 |
-|------|------|
-| `cli/main.py` | 子命令路由 serve/generate/version |
-| `cli/serve.py` | LLM vs diffusion 检测 |
-| `launch_server.py` | HTTP/gRPC/Ray/Encoder 四路分发 |
-| `srt/entrypoints/http_server.py` | FastAPI 应用与路由挂载 |
-| `srt/server_args.py` | CLI → ServerArgs 解析 |
-
----
-
-## 3. 协议适配层
-
-**职责：** 外部 API 协议（OpenAI/Ollama）→ 内部 `GenerateReqInput`。
-
-**读法：** `OpenAIServingBase` 模板方法统一校验、转换、流式响应；Ollama 为平行适配器。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/entrypoints/openai/serving_base.py L73-L109
-    async def handle_request(
-        self, request: OpenAIServingRequest, raw_request: Request
-    ) -> Union[Any, StreamingResponse, ErrorResponse]:
-        """Handle the specific request type with common pattern
-        If you want to override this method, you should be careful to record the validation time.
-        """
-        received_time = monotonic_time()
-
-        try:
-            # Validate request
-            error_msg = self._validate_request(request)
-            if error_msg:
-                return self.create_error_response(error_msg)
-
-            # Log the raw OpenAI request payload before conversion to tokenized form.
-            request_logger = self.tokenizer_manager.request_logger
-            if request_logger.log_requests and request_logger.log_requests_level >= 2:
-                request_logger.log_openai_received_request(request, request=raw_request)
-
+# 来源：python/sglang/srt/entrypoints/openai/serving_base.py L92-L109
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
@@ -156,29 +76,51 @@ class GlobalConfig:
                 )
 ```
 
-**要点：**
+**不负责：** batch 准入、KV 分配和具体 attention kernel。
 
-- 模板方法：`handle_request` 固定校验→转换→分流；子类实现 `_convert_to_internal_request` 与 streaming handler。
-- `adapted_request` 为内部 `GenerateReqInput`；`processed_request` 保留 OpenAI 形态供响应格式化。
-- 流式与非流式在转换后分叉，二者最终都调用 `tokenizer_manager.generate_request`。
+**入口：** `srt/entrypoints/http_server.py`、`entrypoints/openai/`、gRPC sidecar/bridge、`srt/entrypoints/engine.py`。深入见 [[SGLang-启动与入口]]。
 
-| 文件 | 职责 |
-|------|------|
-| `openai/serving_base.py` | OpenAI 模板基类 |
-| `openai/serving_completions.py` | `/v1/completions` |
-| `openai/serving_chat.py` | `/v1/chat/completions` |
-| `ollama/serving.py` | Ollama JSON 协议 |
+## 平面二：API 侧请求所有权
 
----
-
-## 4. 引擎编排层
-
-**职责：** `Engine._launch_subprocesses` 启动 TokenizerManager（主进程）+ Scheduler/Detokenizer（子进程），建立 ZMQ 通道。
-
-**源码锚点：**
+**责任：** TokenizerManager 规范化输入、创建 `ReqState`、tokenize/多模态预处理/LoRA 解析、向 Scheduler dispatch，并等待结果唤醒调用方。
 
 ```python
-## 来源：python/sglang/srt/entrypoints/http_server.py L2494-L2506
+# 来源：python/sglang/srt/managers/tokenizer_manager.py L611-L633
+        self._init_req_state(obj, request)
+        try:
+            if self.server_args.language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
+
+            # Log the request
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
+
+                # Tokenize the request and send it to the scheduler
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    state = self.rid_to_state[obj.rid]
+                    if obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request):
+                        yield response
+```
+
+**不负责：** 决定哪些请求共享下一次 GPU step。`rid_to_state` 是 API 等待状态，不是 KV 地址表。
+
+深入见 [[SGLang-TokenizerManager]] 与 [[SGLang-HTTP请求全链路]]。
+
+## 平面三：runtime 编排与 IPC
+
+**责任：** 根据 ServerArgs 构造进程图、端口和通信对象，启动 Scheduler/Detokenizer 等 runtime 组件，并监控子进程生命周期。
+
+```python
+# 来源：python/sglang/srt/entrypoints/http_server.py L2494-L2506
     # Launch subprocesses
     (
         tokenizer_manager,
@@ -194,114 +136,199 @@ class GlobalConfig:
     )
 ```
 
-**要点：** HTTP 主进程与子进程 Scheduler/Detokenizer 通过 **ZMQ + 不同 port** 通信（见 `io_struct.py` 消息定义）。
+**边界：** “主进程 + Scheduler + Detokenizer”是普通基线，不是所有部署的固定进程数。多 HTTP worker、DP、PP、PD、gateway 与 gRPC 会增加进程和通信边。
 
----
+## 平面四：调度与请求生命周期
 
-## 5. 请求调度层
+**责任：** 把 tokenized request 变成 `Req`，维护 waiting/running/retracted/finished 状态，做排序、准入和 batch commit，驱动一次 forward 并消费上一步结果。
 
-**职责：** Tokenize → 组 batch → GPU forward → 回传 token id。
+最容易犯的错误是把 TokenizerManager、Scheduler、SchedulePolicy 和 ScheduleBatch 都叫“调度层”，从而丢失所有权：
 
-| 文件 | 职责 |
-|------|------|
-| `tokenizer_manager.py` | tokenize + IPC 下发 |
-| `scheduler.py` | 事件循环、continuous batching |
-| `schedule_policy.py` | PrefillAdder、retract |
-| `schedule_batch.py` | Req/ScheduleBatch 结构 |
-| `detokenizer_manager.py` | token → 文本 |
+| 对象/组件 | 权威责任 |
+|-----------|----------|
+| `ReqState` | API worker 等待与返回状态 |
+| `Req` | Scheduler 单请求运行状态 |
+| SchedulePolicy/PrefillAdder | 排序与准入候选 |
+| `ScheduleBatch` | 可变的当前/运行 batch 状态 |
+| overlap result queue | 保存 batch copy 与异步结果的配对 |
 
-**读法：** 本层是 SGLang 吞吐量的核心——`event_loop_overlap` 让 CPU 调度与 GPU 前向流水线并行。
-
----
-
-## 6. 模型执行层
-
-**职责：** `ModelRunner` 加载权重、管理 KV cache、执行 forward；`ModelRegistry` 按 architecture 选择模型类。
-
-**源码锚点：**
+normal loop 展示了最小提交边界：
 
 ```python
-## 来源：python/sglang/srt/models/registry.py L130-L131
-ModelRegistry = _ModelRegistry()
-ModelRegistry.register("sglang.srt.models")
+# 来源：python/sglang/srt/managers/scheduler.py L1521-L1540
+    def event_loop_normal(self):
+        """A normal scheduler loop."""
+        while True:
+            if self.gracefully_exit:
+                break
+
+            # Receive requests
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            # Get the next batch to run
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            # Launch the current batch
+            if batch:
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
 ```
 
-| 文件 | 职责 |
-|------|------|
-| `model_executor/model_runner.py` | 前向执行主类 |
-| `managers/tp_worker.py` | TP worker 封装 |
-| `models/registry.py` | 模型注册表 |
-| `models/llama.py`, `qwen3.py`, `deepseek_v2.py` | 具体架构 |
+深入见 [[SGLang-Scheduler]]、[[SGLang-SchedulePolicy]] 与 [[SGLang-ScheduleBatch数据结构]]。
 
----
+## 平面五：一步模型执行
 
-## 7. 内存与 Attention 层
-
-**职责：** RadixCache 前缀共享、Attention backend、MoE、量化 kernel。
-
-**读法：** RadixAttention 是 SGLang 相对 vLLM 的差异化能力——跨请求共享相同 prompt 前缀的 KV。
-
-**源码锚点：**
+**责任：** 把 live `ScheduleBatch` 物化为一步 `ForwardBatch`，选择 eager/decode graph/prefill graph/split-prefill 等执行路径，运行模型并在合适的 rank sampling。
 
 ```python
-## 来源：python/sglang/srt/mem_cache/radix_cache.py L355-L365（节选）
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Find the longest cached prefix of ``key`` in the radix tree.
+# 来源：python/sglang/srt/managers/tp_worker.py L490-L518
+        # Get forward batch from schedule batch
+        if batch is not None:
+            # update the consumer index of hicache to the running batch
+            self.set_hicache_consumer(batch.hicache_consumer_index)
 
-        The logical namespace for prefix matching is determined by both the
-        token id sequence and the optional ``extra_key`` carried by ``RadixKey``.
-        Entries that share identical leading token ids but have *different*
-        ``extra_key`` values are intentionally kept disjoint and never share
-        prefix nodes. This is useful to:
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        else:
+            # FIXME(lsyin): unify the interface of forward_batch
+            assert forward_batch is not None
 
-        * Isolate KV cache lines for different LoRA / adapter IDs.
-        * Separate requests that intentionally should not share state (e.g.,
+        # Deprecated kwarg: pre-planners mark the batch themselves now.
+        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
+        if self.is_dllm():
+            return self._forward_batch_generation_dllm(forward_batch)
+
+        if self.pp_group.is_last_rank:
+            out = self.model_runner.forward(
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            batch_result = GenerationBatchResult(
+                logits_output=logits_output,
+                can_run_cuda_graph=can_run_cuda_graph,
+                expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=out.routed_experts_output,
+                indexer_topk_output=out.indexer_topk_output,
+            )
 ```
 
----
+**不负责：** 外部协议、长期请求身份和 checkpoint 格式选择。ModelRegistry 选类、ModelLoader 写权重、ModelRunner 执行模型是相邻但不同的责任。
 
-## 8. 高级特性层
+深入见 [[SGLang-模型执行]]、[[SGLang-ModelRunner]]、[[SGLang-ModelLoader]] 与 [[SGLang-Attention]]。
 
-| 能力 | 锚点文件 |
-|------|----------|
-| Sampling / 约束解码 | `sampling/`, `constrained/` |
-| 投机解码 EAGLE | `speculative/eagle_worker_v2.py` |
-| PD 分离 | `disaggregation/prefill.py`, `decode.py` |
-| TP/PP/EP/DP | `distributed/parallel_state.py` |
+## 平面六：token/text 回程
 
----
-
-## 9. 扩展组件层
-
-| 组件 | 目录 | 模块 |
-|------|------|------|
-| sgl-kernel | `sgl-kernel/python/sgl_kernel/` | [[SGLang-sgl-kernel]] |
-| model-gateway | `sgl-model-gateway/src/` | [[SGLang-model-gateway]] |
-| Frontend lang | `python/sglang/lang/` | [[SGLang-前端语言]] |
-| multimodal_gen | `python/sglang/multimodal_gen/` | [[SGLang-多模态生成]] |
-| VLM / LoRA | `srt/multimodal/`, `srt/lora/` | [[SGLang-多模态]] · [[SGLang-LoRA]] |
-
----
-
-## 10. 公共 API 层
-
-**职责：** `import sglang` 时暴露的 Frontend API 与 LazyImport 的 Runtime `Engine`。
-
-**读法：** 易错点——`from sglang import Engine` 实际得到的是 **Runtime Engine**（LazyImport 覆盖 Frontend Engine）。
-
-**源码锚点：**
+**责任：** Scheduler 更新 `Req` 并形成 token 级输出；普通文本路径由 Detokenizer 做增量 decode，再由 TokenizerManager 按 rid 唤醒等待者，最后由协议 adapter 生成 SSE/OpenAI chunk。
 
 ```python
-## 来源：python/sglang/__init__.py L79
-Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
+# 来源：python/sglang/srt/managers/detokenizer_manager.py L151-L168
+    def init_request_dispatcher(self):
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (BatchEmbeddingOutput, self.handle_batch_embedding_out),
+                (BatchTokenIDOutput, self.handle_batch_token_id_out),
+                (FreezeGCReq, self.handle_freeze_gc_req),
+                (ConfigureLoggingReq, self.handle_configure_logging_req),
+            ]
+        )
+
+    def event_loop(self):
+        """The event loop that handles requests"""
+        while True:
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
+            output = self._request_dispatcher(recv_obj)
+            if output is not None:
+                sock_send(self.send_to_tokenizer, output)
 ```
 
-## 运行验证
+**边界：** `skip_tokenizer_init` 可让 token 输出绕过 Detokenizer；stream interval 和 batch notify 也意味着“一个 token 对应一个 HTTP chunk”并不成立。
 
-这篇是读者的分层地图，维护时先用源码检索确认每一层的代表入口仍然存在：全局配置、启动入口、OpenAI serving、HTTP server、模型注册、RadixCache、公共 API。
+## 横切轴一：资源与地址
+
+这条轴回答“请求为什么有资格执行、执行时读写哪里”：
+
+| 资源 | 关键对象 | 必须区分 |
+|------|----------|----------|
+| prefix | RadixKey、MatchResult、tree node/lock | 逻辑命中不等于 device 已可读 |
+| KV | req-to-token row、generic/virtual loc、physical pool | 请求行、地址 id 和 tensor layout |
+| 权重 | model class、rank-local parameter、loader iterator | 类选择、参数映射和最终写入 |
+| LoRA | adapter id、CPU cache、GPU memory pool | 已加载 CPU 不等于当前 batch 已驻留 GPU |
+
+深入见 [[SGLang-内存与Attention]]、[[SGLang-RadixAttention]]、[[SGLang-KV-Cache]] 和 [[SGLang-ModelLoader]]。
+
+## 横切轴二：分布式拓扑
+
+TP、PP、DP、EP、CP 改变“哪个 rank 收请求、持有参数、执行 collective、产生 logits、汇总输出”。它不是某个高级特性目录下的一层。
+
+排查时至少写出：global rank、local rank、rank-in-group、group 成员、collective 顺序、shape/dtype/device。只看相邻 global rank 无法解释通信职责。
+
+深入见 [[SGLang-分布式]]。
+
+## 横切轴三：条件特性
+
+| 特性 | 主要插入点 | 不取消的不变量 |
+|------|------------|----------------|
+| PD | 入口路由、Scheduler 队列、KV transfer、回程 | rid、metadata gate、资源释放 |
+| Speculative | draft input、target verify、accept/reject、sampling | target KV 与输出顺序 |
+| Grammar | token mask、sampling、overlap 同步边界 | grammar state rollback/commit |
+| LoRA | API 解析、batch capacity、layer method | adapter 身份与 residency |
+| 多模态 | processor、token/embedding 对齐、transport | placeholder 与序列位置 |
+| MoE/量化 | 模型 layer、dispatch/kernel、权重加载 | id/scaling/method 所有权 |
+
+这些机制多数是正交分支，不应被画成 `PD → Spec → LoRA → MoE` 的固定 pipeline。插入点总览见 [[SGLang-业务流程]]。
+
+## 横切轴四：扩展与公共表面
+
+| 表面 | 角色 | 阅读入口 |
+|------|------|----------|
+| `python/sglang/lang/` | 前端语言与程序表达 | [[SGLang-前端语言]] |
+| `sgl-kernel/` | 独立 kernel/extension 能力 | [[SGLang-sgl-kernel]] |
+| `sgl-model-gateway/` | 多实例路由与协议代理 | [[SGLang-model-gateway]] |
+| `multimodal_gen/` | 多模态生成 runtime | [[SGLang-多模态生成]] |
+| `srt/lora/`、`srt/multimodal/` | serving 主线内扩展 | [[SGLang-LoRA]] · [[SGLang-多模态]] |
+
+公共 import 只说明符号暴露方式，不等于 runtime 所有权。修改 `__init__.py`、lazy import 或 CLI 时，应重新检查 import side effect 和实际启动路径。
+
+## 症状如何映射到平面
+
+| 症状 | 第一平面/轴 | 不要先归因 |
+|------|-------------|------------|
+| 400/schema/协议错误 | 协议适配 | Scheduler |
+| rid 等待但未入队 | API 请求所有权/IPC | attention kernel |
+| waiting 堆积、retract | 调度 + 资源轴 | HTTP route |
+| Graph replay/shape 错 | 一步执行 + 拓扑轴 | prefix key |
+| token 有、文本无 | 回程平面 | 模型权重 |
+| cache hit 但仍慢 | 资源轴 + workload | Radix tree 必然失效 |
+| 多卡 hang | 拓扑轴 | 单一 rank 的最后一条日志 |
+
+## 静态验证
+
+操作：确认六个平面的代表入口仍存在：
 
 ```powershell
-rg -n 'global_config|def run_server|class OpenAIServingBase|FastAPI|def launch_server|ModelRegistry|def match_prefix|LazyImport|Engine =' sglang/python/sglang/global_config.py sglang/python/sglang/launch_server.py sglang/python/sglang/srt/entrypoints/openai/serving_base.py sglang/python/sglang/srt/entrypoints/http_server.py sglang/python/sglang/srt/models/registry.py sglang/python/sglang/srt/mem_cache/radix_cache.py sglang/python/sglang/__init__.py
+$checks = @(
+  @{ Path = 'sglang/python/sglang/srt/entrypoints/openai/serving_base.py'; Pattern = 'class OpenAIServingBase' },
+  @{ Path = 'sglang/python/sglang/srt/managers/tokenizer_manager.py'; Pattern = 'class ReqState' },
+  @{ Path = 'sglang/python/sglang/srt/entrypoints/engine.py'; Pattern = 'class Engine' },
+  @{ Path = 'sglang/python/sglang/srt/managers/scheduler.py'; Pattern = 'def event_loop_normal' },
+  @{ Path = 'sglang/python/sglang/srt/model_executor/model_runner.py'; Pattern = 'class ModelRunner(' },
+  @{ Path = 'sglang/python/sglang/srt/managers/detokenizer_manager.py'; Pattern = 'class DetokenizerManager' }
+)
+
+foreach ($check in $checks) {
+  rg -n --fixed-strings $check.Pattern $check.Path
+  if ($LASTEXITCODE -ne 0) { throw "missing architecture plane: $($check.Pattern)" }
+}
 ```
 
-读输出时不要只看是否命中，还要看命中分布：入口层、HTTP/OpenAI 层、模型执行层、内存层、公共 API 层都应各有锚点。某一层入口迁移时，本文的分层表要同步调整。
+预期：六组入口全部命中。命中只证明代表对象仍存在；若进程图、所有权或调用边变化，必须同步更新本页的平面关系。
+
+## 复盘
+
+SGLang 的主架构不是十个互不相交的文件夹层，而是协议适配、API 请求所有权、runtime 编排、调度生命周期、一步执行和输出回程六个平面，被资源地址、分布式拓扑、条件特性和扩展表面四条轴共同切过。用这个模型读源码，既能看全局，又不会把相邻对象的责任揉成一句“框架内部处理”。

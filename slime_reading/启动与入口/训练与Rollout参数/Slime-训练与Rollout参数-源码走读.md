@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 训练与Rollout参数 · 源码走读
 
@@ -25,7 +25,7 @@ updated: 2026-07-10
 |----------|------|--------------|
 | 第一次建立参数到闭环的路径 | 贯穿场景、主线图、步骤一到四 | 参数不是静态配置，很多 `*-path` 会在 RolloutManager 初始化时变成 callable |
 | 区分 custom rollout 和 custom generate | 步骤二、步骤六 | `rollout_function_path` 是整条生成协议；单次 SGLang generate 只是默认 rollout 内部的一环 |
-| 排查 batch size 关系 | 贯穿场景、步骤三 | `rollout_batch_size` 是 prompt group 数，`n_samples_per_prompt` 扩成样本数，`num_steps_per_rollout` 反推 `global_batch_size` |
+| 排查 batch size 关系 | 贯穿场景、步骤三、步骤八 | 默认路径先形成 rollout execution；compact 可展开多条 Sample，scheduler 按唯一 `rollout_id` 而非行数分步 |
 | 排查数据源和 buffer 入口 | 步骤四到五 | `data_source_path` 构造 DataSource，对 prompt group 游标、buffer 和 partial 回灌负责 |
 | 排查 dynamic filter / sample filter | 步骤六到七 | dynamic filter 决定是否保留一组样本，sample filter 和 all-samples process 是生成后的出口 |
 | 排查 reward / advantage / loss 生效点 | 步骤八到九 | reward postprocess 和 train data conversion 在 RolloutManager，advantage 和 loss 分支在 Megatron loss |
@@ -44,11 +44,11 @@ python train.py --rollout-batch-size 64 --n-samples-per-prompt 4 --num-steps-per
 主线推导：
 
 - 一次 rollout 目标是 64 个 prompt group。
-- 每个 prompt 生成 4 个 response，所以进入训练账的样本数是 256。
-- `num_steps_per_rollout=2` 会把 `global_batch_size` 推成 128。
+- 默认路径每个 prompt 发起 4 个 rollout execution，共 256 个；通常也返回 256 条 Sample。
+- `num_steps_per_rollout=2` 会把 `global_batch_size` 推成每步 128 个唯一 rollout id。
 - `rollout_function_path` 被 RolloutManager 加载为整条生成函数。
 - `advantage_estimator=grpo` 在 Megatron loss 中决定 returns/advantages 分支。
-- 每轮训练后，主循环按 `update_weights_interval` 决定是否把 actor 权重推给 rollout engine。
+- 同步 `train.py` 每轮训练后发布；只有流水异步 `train_async.py` 用 `update_weights_interval` 控制发布间隔，并在发布前 drain 在途 generation。
 
 ## 主线图
 
@@ -168,7 +168,7 @@ def add_rollout_arguments(parser):
 
 系统压力：eval 可以复用 rollout 函数；用户也可以用 `num_steps_per_rollout` 表达“一个 rollout 产出的样本分几步训练”。这些不是 parser 默认值能完全表达的。
 
-设计选择：validate 里补 `eval_function_path`，并用 rollout 样本账反推 `global_batch_size`。
+设计选择：validate 里补 `eval_function_path`，并用默认 rollout execution 规模反推 `global_batch_size`。这条公式不能解释成“每步裸 Sample 行数”。
 
 ```python
 # 来源：slime/utils/arguments.py L1908-L1919
@@ -189,7 +189,7 @@ if args.num_steps_per_rollout is not None:
 执行逻辑：
 
 - `eval_function_path=None` 是“延迟到 validate 继承 rollout path”。
-- `num_steps_per_rollout` 是训练侧 batch 推导，不改变 rollout 生成多少样本。
+- `num_steps_per_rollout` 是训练侧 rollout-count 推导，不改变 rollout 生成与 compact 展开的 Sample 行数。
 - 如果用户同时给了不一致的 `global_batch_size`，validate 直接 assert。
 
 ## 步骤四：RolloutManager 装配所有高层 callable
@@ -269,7 +269,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 设计选择：默认 rollout 维护 `data` 和 `all_data` 两本账；dynamic filter drop 后只减少剩余水位，不把 group 加入有效数据。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L394-L450
+# 来源：slime/rollout/sglang_rollout.py L394-L439
 # instantiate data filters
 dynamic_filter = (
     load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
@@ -318,7 +318,7 @@ while len(data) < target_data_size:
             pbar.update(args.n_samples_per_prompt)
 ```
 
-不变量：`len(data)` 最终必须等于 `rollout_batch_size`，但 `all_data` 可能更多，因为它包括被 filter 丢掉的 group。
+这张卡只展示“生成—过滤—保留”主干；后续代码还会 close progress、abort 在途请求并 assert `len(data) == rollout_batch_size`。`all_data` 可能更多，因为它包括被 filter 丢掉的 group。
 
 ## 步骤七：sample filter 和 all-samples process 是生成后的两个出口
 
@@ -351,7 +351,7 @@ return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), ab
 
 系统压力：rollout 输出是 `Sample`，训练需要 tensor/list 结构的 train data；reward 可能还要归一化或自定义重排。
 
-设计选择：RolloutManager 先给 custom conversion 优先级；否则走默认 reward postprocess，再生成 train data。
+设计选择：RolloutManager 先给 custom conversion 优先级；否则走默认 reward postprocess，再生成 train data。生成结果会先被展平；compact sibling 必须共享 rollout id，默认单行 execution 则可由 converter 补唯一 id。
 
 ```python
 # 来源：slime/ray/rollout.py L686-L723
@@ -396,6 +396,10 @@ def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sampl
 ```
 
 读者抓手：`custom_reward_post_process_path` 改 reward 两本账；`custom_convert_samples_to_train_data_path` 直接替换整个 sample 到 train_data 的转换。
+
+随后 `_split_train_data_by_dp()` 把 `global_batch_size` 解释为每步唯一 rollout id 数。一个 id 下可以有多条 Sample，所有 sibling 保持在同一步，loss reducer 用整条 rollout 的 mask 总和归一化。
+
+这里存在一个当前测试缺口：`test_plugin_runtime_hook_contracts.py` 的 reference converter 只返回 tokens/reward/mask 等旧最小字段，但 `_split_train_data_by_dp()` 现在无条件读取 `data["rollout_ids"]`。自定义 converter 若完全替换默认转换，必须自行提供 `rollout_ids` 及 scheduler 后续依赖的字段；现有 contract test 尚不能证明这一运行契约完整。
 
 ## 步骤九：训练侧再消费 advantage 和 loss 参数
 
@@ -470,9 +474,9 @@ parser.add_argument(
 ```python
 # 来源：train_async.py L65-L69
 if (rollout_id + 1) % args.update_weights_interval == 0:
-    if args.offload_rollout:
-        ray.get(rollout_manager.onload_weights.remote())
-
+    # sync generate before update weights to prevent update weight in the middle of generation
+    rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+    rollout_data_next_future = None
     actor_model.update_weights()
 ```
 
@@ -559,11 +563,12 @@ def update_weights(self) -> None:
 
 ## 运行验证
 
-首选 contract tests：
+从知识库根目录运行：
 
 ```powershell
-python -m pytest tests/plugin_contracts -q
-python -m pytest tests/test_megatron_argument_validation.py -q
+python -m pytest slime/tests/test_dp_schedule.py -q
+python -m pytest slime/tests/plugin_contracts -q
+python -m pytest slime/tests/test_megatron_argument_validation.py -q
 ```
 
 预期现象：
@@ -571,7 +576,10 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 - path loading tests 验证 eval function、dynamic filter、buffer filter、data source、sample filter、all-samples process、custom RM 的签名。
 - rollout contract tests 验证 `rollout_function_path` 的整条函数契约。
 - generate contract tests 验证 per-sample `custom_generate_function_path` 及 eval 覆盖优先级。
-- argument validation tests 验证 `eval_function_path` 继承、global batch 推导、delta/disk 约束。
+- DP schedule tests 验证按唯一 rollout id 分步、compact sibling 同步归组、尾部不足一整步时裁剪等不变量。
+- argument validation tests 当前验证 HF/AllGather-CP 与 disk/delta/zero-rollout 等边界；并未覆盖 `eval_function_path` 继承或 global-batch 公式。
+
+当前轻量环境实测：DP schedule 9 passed，argument validation 14 passed；plugin contracts 因缺 `httpx` 在 collection 阶段失败。
 
 ## 复盘迁移
 
@@ -579,7 +587,7 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 
 1. 先找最终消费点，再回头看 `add_argument`。
 2. path 参数必须找 `load_function` 和 contract tests。
-3. batch 参数必须画清 prompt group、sample、train step 三本账。
+3. batch 参数必须画清 prompt group、rollout execution、Sample 行、train step 与 micro-batch 五本账。
 4. 算法参数要看 loss 分支，不要只看 help text。
 5. 后端透传要看 ownership 边界和 validate 互斥。
 

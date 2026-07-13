@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ModelLoader · 数据流
 
@@ -30,11 +30,14 @@ flowchart LR
   E --> H[RemoteInstanceModelLoader<br/>远端实例参数]
   F --> I[(name, tensor) iterator]
   G --> I
-  H --> J[rank-local Parameter]
-  I --> K[model.load_weights]
-  K --> L[param.weight_loader]
-  L --> J
-  J --> M[quant postprocess]
+  I --> K{写入协议}
+  K --> L[model.load_weights<br/>param.weight_loader]
+  K --> N[rank-local state dict<br/>direct copy]
+  H --> O[parameter broadcast / address transfer]
+  L --> J[rank-local Parameter]
+  N --> J
+  O --> J
+  J --> M[quant process / post-load fixup]
 ```
 
 这张图的关键是区分两类流：
@@ -127,7 +130,7 @@ flowchart LR
         )
 ```
 
-冷启动数据流里，`tp_rank` 从这里进入 `LoadConfig`，但它不会在 `_prepare_weights` 阶段切文件。它被远端实例 backend 和参数级 `weight_loader` 消费。
+冷启动数据流里，`tp_rank` 从这里进入 `LoadConfig`，主要供 remote-instance 等 loader 使用。普通 linear parameter loader 的 `self.tp_rank` 默认来自运行时并行上下文。`_prepare_weights` 还可能按 TP rank 错峰调整 shard 文件读取顺序，但那只是 I/O 顺序，不是 tensor 切片。
 
 ## 3. 从磁盘热更新复用默认 loader，但不重建模型
 
@@ -174,7 +177,9 @@ flowchart LR
             return model
 ```
 
-这里的设计压力是一致性：热更新不重新走 `_initialize_model`，所以新 checkpoint 的结构必须能被现有模型参数接住。失败时不要先看 `ModelRegistry`，而要看 iterator 是否读到目标 tensor、名字是否能被当前模型 `load_weights` 识别。
+这里的设计压力是一致性：热更新不重新走 `_initialize_model`，所以新 checkpoint 的结构必须能被现有模型参数接住。更危险的是它原地逐参数写入，没有事务边界；失败时模型可能已经部分变更。
+
+当前异常分支日志称“Rolling back to original weights”，但代码已经把 `self.model_config.model_path` 改成目标路径，随后用同一个目标配置重新创建 iterator。这只能再次尝试装载目标 checkpoint，不能证明恢复了旧权重。生产系统若需要原子切换，应在外层保留旧 checkpoint/备用实例或另行实现版本化恢复，不能依赖这条日志承诺。
 
 ## 4. 分布式和 tensor 热更新绕过文件层
 
@@ -272,9 +277,9 @@ tensor 热更新也是同一个参数写入协议，只是入口来自序列化 
         return True, "Success"
 ```
 
-因此，热更新的核心不是 `DefaultModelLoader`，而是“能否构造出模型类可接受的 `(name, tensor)` 序列”。
+因此，热更新的核心不是 `DefaultModelLoader`，而是“transport 产出的名字、shape、dtype 是否与现有参数协议一致，以及失败时如何处理已发生的部分写入”。
 
-## 5. FlattenedTensorBucket 是 transport 优化，不是模型语义
+## 5. FlattenedTensorBucket 是零拷贝 view 重建协议，不是模型语义
 
 `FlattenedTensorBucket` 保存的是名字、shape、dtype 和 byte 范围。它提高传输效率，但重建后仍然回到 `(name, tensor)`。
 
@@ -324,7 +329,7 @@ tensor 热更新也是同一个参数写入协议，只是入口来自序列化 
         return reconstructed
 ```
 
-排障时不要把 bucket 当作新的权重格式。它只是 transport 容器，模型名字匹配和参数切片仍由 `model.load_weights` 与 `weight_loader` 完成。
+重建 tensor 是对同一个 uint8 flattened storage 的 slice/view/reshape，不是逐 tensor clone。排障时既要检查 metadata 的 byte offset/dtype/shape，也要保证 flattened storage 在消费完成前存活。它仍不是新模型语义；重建后回到 model/direct loader 协议。
 
 ## 6. 远端存储和远端实例不是一回事
 
@@ -388,7 +393,7 @@ tensor 热更新也是同一个参数写入协议，只是入口来自序列化 
                     )
 ```
 
-这两条路线的共同点是最终都要交付 `model.eval()`；差异是权重来源，一个是远程 checkpoint 存储，一个是远端实例的参数。
+这两条路线的共同点是最终都要交付 `model.eval()`；中间协议却不同。Remote FS 走 `model.load_weights`；Remote KV 按 rank iterator 直接 copy state dict；RemoteInstance NCCL 按 `model.named_parameters()` 顺序广播，TransferEngine 按参数名校验 numel/element size 后写入注册地址。后二者绕过模型名字 remap，因此源/目标模型参数集合、顺序或地址 metadata 必须严格一致。
 
 ## 7. Layered loader 改变峰值显存边界
 
@@ -417,7 +422,7 @@ tensor 热更新也是同一个参数写入协议，只是入口来自序列化 
             weights = self._get_all_weights(model_config, model)
 ```
 
-如果 layered load 失败，先看模型类是否提供 `load_weights_to_module`，再看具体模块是否能从 `meta` materialize 到目标设备。
+如果 layered load 失败，先看模型类是否提供 `load_weights_to_module`，再看具体模块是否能从 `meta` materialize 到目标设备。注意它把同一个 generator 递归传给各模块，模型方法必须以单向消费方式正确分派权重；这不是简单地把默认 loader 自动切成逐层模式。
 
 ## 运行验证
 
@@ -425,7 +430,7 @@ tensor 热更新也是同一个参数写入协议，只是入口来自序列化 
 |------|----------|----------|
 | `remote_instance` 没生效 | 搜日志里的 fallback warning，或断点 `ServerArgs._handle_load_format` | 配置不完整会在进入 `LoadConfig` 前回退到 `auto` |
 | 从磁盘热更新失败 | 断点 `update_weights_from_disk` 的 `get_weight_iter` 和 `model_load_weights` | iterator 构造失败与模型写入失败会返回不同消息 |
-| 分布式热更新 shape mismatch | 记录 `names/dtypes/shapes` 与 `params_dict` | transport 已完成，错误在模型名字映射或参数 `weight_loader` |
+| 分布式热更新 shape mismatch | 记录 `names/dtypes/shapes` 与 `params_dict` | transport 已完成，错误在现有模型写入协议；失败后按“可能部分写入”处理 |
 | bucket 更新后输出异常 | 对比 bucket `metadata` 与重建后的 tensor shape/dtype | bucket 只负责还原 `(name, tensor)`，不会修正模型语义 |
 | layered load 报不支持 | 检查模型类是否有 `load_weights_to_module` | loader 需要模型类提供逐模块灌权重入口 |
 
@@ -434,5 +439,5 @@ tensor 热更新也是同一个参数写入协议，只是入口来自序列化 
 ModelLoader 的交互边界可以压成三句话：
 
 - 冷启动先看 `ServerArgs` 到 `LoadConfig` 的事实表，再看 loader factory。
-- 只要已经变成 `(name, tensor)`，后续语义就交给模型类和参数 `weight_loader`。
-- 热更新、远端加载、layered load 改变 transport 或内存策略，但不能绕过参数名字、shape、dtype 这些不变量。
+- `(name, tensor)` 是常见接口，不是所有路线必经点；rank-local state dict 和 parameter-address transfer 可以绕过模型 remap。
+- 热更新、远端加载、layered load 改变 transport、rank-local 化和内存策略，但不能绕过参数集合、shape、dtype、完成动作与失败一致性这些不变量。

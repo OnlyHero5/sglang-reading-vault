@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 数据源 · 数据流
 
@@ -76,7 +76,7 @@ RolloutManager 在构造时创建 DataSource，在训练步中传给 rollout 函
 默认 `generate_rollout` 并不直接拿 dataset 对象，而是把 `data_source.get_samples` 这个 bound method 交给 async 主循环。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L618-L640
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L618-L640 删节）：
 def generate_rollout(
     args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
@@ -94,7 +94,7 @@ def generate_rollout(
 `generate_rollout_async` 对这个接口的使用很直接：当未完成的 group 数不足目标时，就再拉 `over_sampling_batch_size` 组。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L408-L412
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L408-L412 删节）：
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             samples = data_source(args.over_sampling_batch_size)
@@ -102,6 +102,8 @@ def generate_rollout(
 ```
 
 这里的设计压力是吞吐，而不是“严格一次取一批”。过采样允许 filter drop 后还有足够任务在路上，但代价是 dataset 游标可能比有效训练样本前进得更快。
+
+接口还有一个进展性前提：`get_samples(k)` 必须能返回非空 group。默认 async 主循环的内层 while 没有“数据耗尽”分支；空 dataset 或自定义 source 持续返回 `[]` 时，它会反复拉取而无法进入 `asyncio.wait`。DataSource 不能用空 list 表示永久 EOF，除非配套替换 rollout 控制逻辑。
 
 ## Buffer 视角：同形状，不同成熟度
 
@@ -154,12 +156,14 @@ DataSource buffer 存的仍然是 `list[list[Sample]]`，但这些 Sample 可能
 
 续训时这很关键：`sample_offset=17` 只有在同一个 epoch 排列上才有意义。恢复 offset 但没恢复 shuffle，相当于拿同一把尺子量了另一条路。
 
+副作用边界：实现使用进程级 `random.seed`，不是局部 `random.Random`。所以恢复或跨 epoch shuffle 会改变同一进程其他 Python `random` 消费者的序列；确定性只证明 dataset 排列可重建，不证明其他随机模块不受影响。
+
 ## Fully-async 视角：DataSource 变成跨 step 队列
 
 fully-async rollout 不是在每个训练 step 内一次性取大 batch，而是后台 worker 持续从 data source 单组取样，生成完成后把结果放到输出队列。遇到 aborted group 时，它会把 group 重新塞回 data source。
 
 ```python
-# 来源：slime/rollout/fully_async_rollout.py L135-L152
+# 来源：slime/rollout/fully_async_rollout.py L136-L152
                 while len(active_tasks) < max_concurrent and self.running:
                     groups = self.data_buffer.get_samples(1)
                     if not groups:
@@ -180,7 +184,7 @@ fully-async rollout 不是在每个训练 step 内一次性取大 batch，而是
 ```
 
 ```python
-# 来源：slime/rollout/fully_async_rollout.py L182-L189
+# 来源：slime/rollout/fully_async_rollout.py L183-L189
             if any(getattr(s, "status", None) == Sample.Status.ABORTED for s in result):
                 try:
                     self.data_buffer.add_samples([result])
@@ -191,6 +195,8 @@ fully-async rollout 不是在每个训练 step 内一次性取大 batch，而是
 ```
 
 这里 buffer 的语义比默认路径更重：它不只是 partial 回收站，也承担持续补水队列的职责。详见 [[Slime-其他Rollout路径]]。
+
+fully-async 与默认路径并非只差“后台化”：全局 worker 首次创建后冻结首份 args 和 data source；它直接调用 `generate_and_rm_group`，不经过默认 `generate_rollout_async` 的 dynamic filter、过采样 metrics 与 all-samples hook。source 持续返回空列表时，worker 只会每秒重试，而前台收集循环没有 deadline，会一直等待目标 batch。
 
 ## 训练侧视角：DataSource 到这里已经退出主线
 
@@ -224,6 +230,8 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 | `RolloutManager.save/load` | `save` / `load` | checkpoint | `args.save`、`args.load`、rollout id |
 | `get_num_rollout_per_epoch` | `len(data_source)` | 计算 epoch 步数 | 是否有 dataset、是否过滤为空 |
 | fully-async worker | `get_samples(1)` / `add_samples` | 后台持续运行 | worker 是否复用同一 data source |
+
+对于 custom buffer filter，还要验证返回数不超过请求数。`WithBuffer.get_samples` 没有这个断言；超额返回会把剩余请求数变成负数，并可能把 dataset offset 向后移动。
 
 ## 运行验证
 

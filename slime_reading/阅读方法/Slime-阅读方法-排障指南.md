@@ -9,99 +9,101 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 阅读方法 · 排障指南
 
 ## 你为什么要读
 
-本篇按读者最常见的误解排障。方法论专题的目标不是让你记住宣传语，而是避免后续读源码时走错坐标系。
+源码阅读也会“排障”：症状是结论互相矛盾、图画不通、某个对象找不到；根因往往是把逻辑角色当进程、把远程发起当完成，或把设计文章当当前实现。本页按“症状—可能原因—源码入口—操作—预期”给出纠偏路径。
 
-## 1. 推荐阅读顺序是什么
+## 1. 症状：一直在找 Data Buffer 服务
 
-先建立三角闭环，再读主循环和参数系统：
+**可能原因**：把 README 的架构角色当成一一对应的 daemon。
 
-| 阶段 | 专题 | 目的 |
-|------|------|------|
-| 0 | [[Slime-阅读方法]] | 建立 Training / Rollout / Data Buffer 坐标 |
-| I | [[Slime-训练主循环]] | 跟 `generate → train → update_weights` |
-| II | [[Slime-Ray参数]]、[[Slime-训练与Rollout参数]] | 搞清 CLI 到 `args` 的事实编译 |
-| III | [[Slime-PlacementGroup]]、[[Slime-RayTrainGroup]] | 理解 Ray 资源和 rank actor |
-| IV | [[Slime-RolloutManager]] 到 [[Slime-外部推理引擎]] | 读 rollout 生产线 |
-| V | [[Slime-Megatron-Actor初始化]] 到 [[Slime-上下文并行与路由重放]] | 读训练后端 |
-| VI | [[Slime-分布式权重同步]] 到 [[Slime-插件与示例]] | 读权重同步、agent、扩展 |
+**源码入口**：`slime/rollout/data_source.py`、`slime/ray/rollout.py`、`slime/rollout/types.py`。
 
-## 2. 读 Slime 前要先懂多少 SGLang
+**操作**：定位 DataSource 的 `get_samples/add_samples`、RolloutManager 的 converter 与 `_split_train_data_by_dp()`，再找 `ray.put`。
 
-至少要懂三件事：
+**预期**：你能把 Data Buffer 拆成 prompt/sample 管理、rollout 编排、训练转换和对象存储交付，而不是找到一个名为 DataBuffer 的独立服务才算成功。
 
-- SGLang server mode 如何接受 `/generate`。
-- router 为什么能给多 engine 提供单入口。
-- 权重热更新为什么不同于普通 serving。
+## 2. 症状：看到 `async_train()` 就判断整轮训练是异步的
 
-博文强调 RL workload 有大量在线采样，因此 inference performance 是关键，Slime 才选择深度集成 SGLang。来源：docs/en/blogs/introducing_slime.md L53-L59
+**可能原因**：把远程 API 名称当成 happens-before 关系。
 
-不用先读完 SGLang 全库；先读 [[SGLang-HTTP-Server]]、[[SGLang-Scheduler]]、[[SGLang-分布式]] 中和 serving 主线相关的部分即可。
+**源码入口**：`train.py`、`train_async.py`。
 
-## 3. Slime 和 veRL 的本质区别是什么
+**操作**：给每个 `.remote()` 标出对应 future，再圈出每个 `ray.get`；分别画同步入口和 async 入口的时间线。
 
-一句话：Slime 把 Megatron 和 SGLang 的原生控制面留给用户，自己专注 RL loop；多 backend 框架通常会做统一抽象层，再把不同后端映射进去。
+**预期**：同步入口在训练后立即等待；pipeline async 只重叠下一批 generation 与当前 train，并在发布前等待在途 generation；fully async 需要另读 example，不能由 `train_async.py` 外推。
 
-| 问题 | Slime | 多 backend RL 框架常见取舍 |
-|------|-------|----------------------------|
-| 训练后端 | Megatron 原生参数和并行 | 自有 worker / trainer 抽象 |
-| Rollout | SGLang deep integration | 多推理后端公共接口 |
-| 扩展方式 | `--*-path` hook | 子类、worker、pipeline 配置 |
-| 主循环 | 暴露 `train.py` | trainer class 封装 |
+## 3. 症状：认为 colocate 等于同进程共享参数
 
-Slime 的优势是大规模 Megatron + SGLang 生产路径更直接；代价是你要理解这两个上游系统本身。
+**可能原因**：混淆 Ray PlacementGroup、GPU bundle、Ray actor 进程和 tensor transport。
 
-## 4. 为什么只选 SGLang 一个 rollout backend
+**源码入口**：`slime/ray/placement_group.py`、`slime/ray/rollout.py`、weight updater 实现。
 
-因为 RL rollout 需要用到 SGLang 的服务、路由、缓存、disaggregation、MoE、权重更新等特有能力。README 明确说，选择单一 rollout backend 可以直接发挥 SGLang-specific 能力，而不是被迫抽象成多个推理引擎的公共能力子集。来源：README.md L22-L26
+**操作**：分别记录 training/rollout actor 的创建位置、placement view 和 updater 类型。
 
-vime 这类项目说明 rollout backend 可以被替换，但那属于基于 Slime substrate 的外部扩展，不是 Slime 主线设计。
+**预期**：colocate 的第一含义是资源重叠；训练与 serving 通常仍是不同 Python 进程。tensor/CUDA IPC 路线传递 handle/metadata，不等于共享同一个 Python `Parameter` 对象。
 
-## 5. Data Buffer 是独立服务吗
+## 4. 症状：参数明明写在 CLI，运行事实却不一致
 
-不是。README 的 Data Buffer 是架构角色名：它管理 prompt 初始化、自定义数据和 rollout 生成方法。来源：README.md L90-L92
+**可能原因**：忽略 pre-parse、namespace merge、validator 派生值和 custom config 后期覆盖。
 
-实现上会分散在 DataSource、RolloutManager、Sample group、train_data conversion 和 Ray ObjectRef 交付里。不要一看到 Data Buffer 就去找单独 daemon。
+**源码入口**：`slime/utils/arguments.py::parse_args`、`slime_validate_args`，以及 SGLang/Megatron validator。
 
-## 6. Agent RL 要不要换框架
+**操作**：从 flag 定义追到 parse 后字段，再追所有赋值点；不要只读 `add_argument(default=...)`。
 
-不需要。Slime 的方法论是让 agent workflow 通过 data generation 或 reward workflow 接进同一闭环。多数情况优先看 [[Slime-自定义扩展]]，从 `custom_generate + custom_rm` 开始；只有默认 rollout 外循环不够时，才替换完整 `rollout_function`。
+**预期**：你能解释 train-only 为何跳过 SGLang parse、`load_debug_rollout_data` 为何改写 `debug_train_only`、`use_critic` 如何由 advantage estimator 派生，并能指出后期 custom config 不一定重跑全部前置校验。
 
-## 7. 为什么有 rollout-only 和 train-only debug
+## 5. 症状：把所有权重更新都叫 CheckpointEngine
 
-RL bug 往往不会立刻报错，必须能拆开验证。README 把 rollout-only、train-only 调试列为 correctness-first infrastructure 的一部分。来源：README.md L18-L26
+**可能原因**：把“发布新权重”的统一语义误当成统一类和 transport。
 
-`load_debug_rollout_data` 会切到 train-only，避免实例化 SGLang servers。来源：slime/utils/arguments.py L1844-L1849
+**源码入口**：actor/updater 选择逻辑、SGLang update endpoint/worker、disk delta 实现。
 
-## 8. 怎么判断自己读懂了本专题
+**操作**：按 colocate/full/delta 与 NCCL/disk 两个维度列实际 updater；分别追 layout 转换、transport、SGLang 应用和版本递增。
 
-不看正文，能回答以下问题就够：
+**预期**：至少分清 tensor/CUDA IPC、distributed NCCL、full disk、delta disk 四路；知道 weight version 只是发布序号，参数相等性需要另行检查。
 
-- Slime 的两大能力是什么。
-- Training / Rollout / Data Buffer 三角各自负责什么。
-- `generate → train → update_weights` 为什么构成闭环。
-- `--sglang-*` 为什么不是普通配置糖。
-- 自定义 agent workflow 为什么不应该 fork training kernel。
+## 6. 症状：custom generate、custom RM、rollout function 总是画成固定串行链
 
-答不出来时，回到 [[Slime-阅读方法-源码走读]] 的 README 和博文证据。
+**可能原因**：没有先判断 hook 替换层级。
 
-## 9. 怎么用命令验证自己没有读偏
+**源码入口**：参数中的 `*_path`，`load_function` 调用点，默认 `sglang_rollout.py`。
 
-用三个只读命令检查坐标系：
+**操作**：对每个 hook 写出“由谁加载、收到什么、返回什么、默认实现是否仍执行”。
+
+**预期**：完整 rollout function 能替换外层生成组织；custom generate/RM 是默认流水线中的槽位；DataSource 管数据供给/回填。并非所有 hook 都同时执行。
+
+## 7. 症状：源码与 docstring、博文或笔记冲突
+
+**可能原因**：版本漂移，或说明文字概括了旧行为。
+
+**源码入口**：当前 baseline 的函数体、调用点和 tests。
+
+**操作**：先确认 baseline；用调用者验证分支是否可达；把冲突记录为“说明文字声称 X，当前函数体执行 Y”，必要时补静态或运行实验。
+
+**预期**：结论明确注明证据等级，不静默调和冲突。例如 advantage 计算的 docstring 与 pipeline-last-stage early return 条件不一致时，以当前函数体和调用契约作为实现判断，同时保留漂移提示。
+
+## 8. 症状：得出“更快”“稳定”“阈值是 X”之类结论
+
+**可能原因**：从架构或依赖表直接推导性能，缺少硬件、版本和 workload。
+
+**源码入口**：相关 benchmark、profiling/trace 文档和实际运行日志。
+
+**操作**：补齐 GPU、节点、模型、并行策略、序列长度、batch、精度、版本和统计方法；无法运行时，把结论降级为设计意图或待验证假设。
+
+**预期**：静态源码只证明机制存在；性能数字仅对记录的环境和 workload 成立。
+
+## 9. 最小只读诊断
 
 ```powershell
-rg -n "High-Performance Training|Flexible Data Generation|Correctness-first infrastructure" slime/README.md
-rg -n "server-based mode|SGLang-only debug mode|Megatron-only debug mode|train.py" slime/docs/en/blogs/introducing_slime.md
-rg -n "debug_rollout_only|load_debug_rollout_data|debug_train_only" slime/slime/utils/arguments.py
+rg -n 'def generate|_convert_samples_to_train_data|_split_train_data_by_dp' slime/slime/ray/rollout.py
+rg -n 'ray.get|async_train|update_weights' slime/train.py slime/train_async.py
+rg -n 'skip_sglang|load_debug_rollout_data|use_critic' slime/slime/utils/arguments.py
+rg -n 'ServerArgs.add_cli_args|skipped_args' slime/slime/backends/sglang_utils/arguments.py
 ```
 
-预期：
-
-- README 同时命中训练、数据生成和正确性基础设施，说明 Slime 不是单纯 loss 库。
-- 博文同时命中 server-based rollout、两个 debug mode 和暴露 `train.py`，说明少封装是为了让同步点和调试路径可见。
-- `arguments.py` 命中 rollout-only 与 train-only 的互斥和改写逻辑，说明调试模式不是文档口号，而是会改变资源编排和后端启动的真实分支。
+预期是同时看见对象加工、等待关系、参数派生和受控透传。任何一类缺失，都说明当前结论只覆盖了 Slime 闭环的一部分。

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # RolloutManager · 源码走读
 
@@ -24,6 +24,8 @@ updated: 2026-07-10
 - reward normalization 结果不符合预期。
 - DP schedule 因 global batch、micro batch 或动态 batch 配置失败。
 - 训练 actor 拿到的数据字段缺失或 dtype 不对。
+- 可变 fanout 被默认 reward normalization 错当成一个全局组。
+- 尾部 rollout 被 step 取整丢弃，或 FLOPs 均衡路径越过 token cap。
 
 ## 长文读法
 
@@ -82,6 +84,8 @@ for rollout_id in range(args.start_rollout_id, args.num_rollout):
     if args.offload_rollout:
         ray.get(rollout_manager.offload.remote())
 
+    actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+
     if args.use_critic:
         value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
         if actor_trains_this_step:
@@ -107,7 +111,7 @@ for rollout_id in range(args.start_rollout_id, args.num_rollout):
 源码入口：来源：slime/ray/rollout.py L420-L471
 
 ```python
-# 来源：slime/ray/rollout.py L430-L455
+# 定位骨架（据 `slime/ray/rollout.py` L430-L455 删节）：
 rollout_init_handles: list[Any] = []
 if self.args.debug_train_only:
     self.servers: dict[str, Any] = {}
@@ -125,7 +129,7 @@ if rollout_init_handles:
     ray.get(rollout_init_handles)
 ```
 
-这里要注意顺序：RolloutManager 不是每轮临时 import 函数；它在 actor 初始化时挂好插件。路径错误通常启动时就暴露。
+这里要注意顺序：RolloutManager 不是每轮临时 import 函数；它在 actor 初始化时挂好插件。路径错误通常启动时就暴露。`debug_train_only` 只保证不创建 servers；真正的磁盘复放通常由 `load_debug_rollout_data` 触发，参数归一化会自动把它改成 train-only。
 
 ## 3. start_rollout_servers 把 SGLang 拓扑压成 servers map
 
@@ -136,7 +140,7 @@ if rollout_init_handles:
 源码入口：来源：slime/ray/rollout.py L1089-L1228
 
 ```python
-# 来源：slime/ray/rollout.py L1103-L1127
+# 定位骨架（据 `slime/ray/rollout.py` L1103-L1127 删节）：
 if args.rollout_external:
     return start_external_rollout_servers(args, start_router=_start_router)
 
@@ -159,7 +163,7 @@ for model_idx, model_cfg in enumerate(config.models):
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L1217-L1228
+# 定位骨架（据 `slime/ray/rollout.py` L1217-L1228 删节）：
 servers[model_cfg.name] = RolloutServer(
     server_groups=server_groups,
     router_ip=router_ip,
@@ -168,6 +172,7 @@ servers[model_cfg.name] = RolloutServer(
     update_weights=model_cfg.update_weights,
 )
 
+# Expose per-model router info for custom rollout functions.
 args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
 
 return servers, pending_init_handles
@@ -195,6 +200,7 @@ def generate(self, rollout_id):
     self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
     _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
     if self.args.debug_rollout_only:
+        # if debug rollout only, we don't convert samples to train data and directly return
         return
     data = self._convert_samples_to_train_data(data)
     return self._split_train_data_by_dp(data)
@@ -211,7 +217,7 @@ def generate(self, rollout_id):
 源码入口：来源：slime/ray/rollout.py L635-L665
 
 ```python
-# 来源：slime/ray/rollout.py L635-L665
+# 定位骨架（据 `slime/ray/rollout.py` L635-L665 删节）：
 if self.args.load_debug_rollout_data:
     data = torch.load(
         self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
@@ -248,7 +254,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
     return output
 ```
 
-读者抓手：如果 rollout 函数返回裸 list，不一定错；`call_rollout_fn` 会兼容。但如果 compact nested list 的 sibling 没有 `rollout_id`，会在 flatten 前失败。
+读者抓手：如果 rollout 函数返回裸 list，不一定错；`call_rollout_fn` 会兼容。但如果 compact nested list 的 sibling 没有 `rollout_id`，会在 flatten 前失败。磁盘 debug 复放已是扁平 Sample，绕过该校验；正常路径若返回空列表，则后续 `data[0]` 会 `IndexError`。flatten 也只观察第一个元素的层级，因此自定义输出应保持整批嵌套形态一致。
 
 ## 6. compact rollout 必须显式标注 rollout_id
 
@@ -259,7 +265,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
 源码入口：来源：slime/ray/rollout.py L898-L927
 
 ```python
-# 来源：slime/ray/rollout.py L898-L927
+# 定位骨架（据 `slime/ray/rollout.py` L898-L927 删去 docstring）：
 def _validate_rollout_id_annotated(node, depth=0):
     if isinstance(node, Sample):
         return
@@ -290,7 +296,7 @@ def _validate_rollout_id_annotated(node, depth=0):
 源码入口：来源：slime/ray/rollout.py L686-L711
 
 ```python
-# 来源：slime/ray/rollout.py L686-L711
+# 定位骨架（据 `slime/ray/rollout.py` L686-L711 删去函数头与注释）：
 if self.custom_reward_post_process_func is not None:
     return self.custom_reward_post_process_func(self.args, samples)
 
@@ -316,7 +322,7 @@ if (
 return raw_rewards, raw_rewards
 ```
 
-失败模式：样本顺序如果不再按 prompt group 排列，group normalization 会混组。
+失败模式：等量 fanout 时，代码依赖“样本按 prompt group 连续排列”来 reshape；顺序改变会混组。更关键的是，样本总数不等于 `n_samples_per_prompt * rollout_batch_size` 时，fallback `view(-1, rewards.shape[-1])` 对一维 rewards 只形成一行，等价于对整批做全局中心化，而不是按可变大小 prompt group 归一化。可变 fanout 应使用按 `group_index` 分组的 custom reward hook。
 
 ## 8. Sample 转成列式 train_data
 
@@ -327,7 +333,7 @@ return raw_rewards, raw_rewards
 源码入口：来源：slime/ray/rollout.py L713-L823
 
 ```python
-# 来源：slime/ray/rollout.py L720-L745
+# 定位骨架（据 `slime/ray/rollout.py` L720-L745 删节）：
 raw_rewards, rewards = self._post_process_rewards(samples)
 
 assert len(raw_rewards) == len(samples)
@@ -355,7 +361,7 @@ train_data = {
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L747-L761
+# 定位骨架（据 `slime/ray/rollout.py` L747-L761 删节）：
 loss_masks = []
 for sample in samples:
     if sample.loss_mask is None:
@@ -375,6 +381,8 @@ train_data["loss_masks"] = loss_masks
 - `remove_sample=True` 不是删除样本，而是把 loss mask 清零。
 - `rollout_id=None` 会自动分配临时 id，但 compact sibling 应该提前显式设置同一 id。
 - 可选的 rollout logprobs、top-p replay、MoE routed experts、多模态、teacher logprobs 在后续条件块加入。
+- 除多模态与 `raw_reward` 外，多数可选列用 `samples[0]` 决定是否整列存在；混合来源 batch 若第一条没有、后续有，字段可能被整体忽略；若第一条有而后续缺失，后端可能在列构造或消费时失败。
+- custom converter 在函数开头直接返回，必须自行生成后续 split 需要的字段；当前没有独立 schema validator，缺字段通常表现为稍后的 `KeyError`。
 
 ## 9. rollout_mask_sums 固定 loss 分母
 
@@ -405,7 +413,7 @@ train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id
 源码入口：来源：slime/utils/dp_schedule.py L82-L209
 
 ```python
-# 来源：slime/utils/dp_schedule.py L127-L150
+# 定位骨架（据 `slime/utils/dp_schedule.py` L127-L150 删节）：
 rollout_id_to_samples: dict[int, list[int]] = {}
 for sample_pos, rid in enumerate(rollout_indices):
     rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
@@ -425,7 +433,7 @@ for step_i in range(num_steps):
 ```
 
 ```python
-# 来源：slime/utils/dp_schedule.py L167-L208
+# 定位骨架（据 `slime/utils/dp_schedule.py` L167-L208 删节）：
 target_K = max(((len(step_mbs) + align_to - 1) // align_to) * align_to, align_to)
 if target_K != len(step_mbs):
     if args.use_dynamic_batch_size:
@@ -451,7 +459,7 @@ for r in range(dp_size):
         micro_batch_indices[r].append(list(range(local_start, local_start + len(mbs_locals))))
 ```
 
-排障顺序：先看 unique rollout 数是否小于 `global_batch_size`，再看 step 内 sample 数是否小于 `dp_size`，再看 static micro-batch 是否满足对齐。
+排障顺序：先看 unique rollout 数是否小于 `global_batch_size`，再看除法余数是否意味着尾部 rollout 被丢弃，再看 step 内 sample 数是否小于 `dp_size`，最后看 static micro-batch 是否满足对齐。动态 `balance_by_flops` 路径要单独检查实际 bin 的 token 总和，因为它不保证 token cap。
 
 ## 11. _split_train_data_by_dp 打包每个 rank 的 ObjectRef
 
@@ -462,7 +470,7 @@ for r in range(dp_size):
 源码入口：来源：slime/ray/rollout.py L826-L895
 
 ```python
-# 来源：slime/ray/rollout.py L841-L895
+# 定位骨架（据 `slime/ray/rollout.py` L841-L895 删节）：
 dp_size = self.train_parallel_config["dp_size"]
 total_lengths = [len(t) for t in data["tokens"]]
 data["total_lengths"] = total_lengths
@@ -497,7 +505,7 @@ return rollout_data_refs
 源码入口：来源：slime/ray/rollout.py L39-L102
 
 ```python
-# 来源：slime/ray/rollout.py L80-L102
+# 定位骨架（据 `slime/ray/rollout.py` L80-L102 删节）：
 def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
     for key, dtype in _ROLLOUT_DATA_TENSOR_DTYPES.items():
         if key in rollout_data:
@@ -524,6 +532,8 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
 - `micro_batch_indices[r]` 是 rank-local 下标。
 - `tokens/loss_masks/logprobs` 等热路径字段是 CPU contiguous tensors。
 
+`total_lengths` 之所以先整列复制到每个 DP 包，是训练进程取包后先把全局长度写入 `Timer().seq_lens`，再依据 `partition` 切成本 rank 的局部长度；`raw_reward` 则保留整批口径供 pass@k 等全局日志使用。二者不是“永远不切”，而是延迟到训练侧按各自用途处理。
+
 ## 12. RolloutManager 同时是权重更新的路由点
 
 系统压力：训练结束后要把 actor 权重推回 SGLang；多模型场景下只更新 policy server，fault tolerance 后新 engine 也要补更新。
@@ -535,7 +545,7 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
 源码入口：来源：slime/ray/rollout.py L595-L616
 
 ```python
-# 来源：slime/ray/rollout.py L527-L540
+# 定位骨架（据 `slime/ray/rollout.py` L527-L540 删去 docstring）：
 def get_updatable_engines_and_lock(self):
     srv = self._get_updatable_server()
     engines = srv.engines if srv else []
@@ -546,14 +556,23 @@ def get_updatable_engines_and_lock(self):
     return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets, all_engine_actors
 ```
 
-这条路径和训练数据路径无关，但它解释了为什么 RolloutManager 是闭环边界对象：它一边生产训练数据，一边把训练后的权重更新目标暴露给 actor。
+这条路径和训练数据路径无关，但它解释了为什么 RolloutManager 是闭环边界对象：它一边生产训练数据，一边把训练后的权重更新目标暴露给 actor。目标是第一个 `update_weights=True` 的 server，不是所有可更新模型。
 
 ## 运行验证
 
 - 打开 `debug_rollout_only`：预期 `_get_rollout_data`、debug save、日志执行，但不调用 `_convert_samples_to_train_data`。
 - 使用 `load_debug_rollout_data`：预期不请求 SGLang，直接加载 Sample 并进入 convert/split。
 - 构造 compact nested output 且缺失 sibling `rollout_id`：预期 `_validate_rollout_id_annotated` 报错。
-- 用 `tests/test_dp_schedule.py` 验证 DP schedule：预期 partitions 覆盖 kept samples，且每个 rank 的 micro-batch 数相同。
+- 用 `tests/test_dp_schedule.py` 验证 DP schedule：预期 9 项通过，partitions 覆盖 kept samples，尾部不足整 step 的 rollout 被排除，且每个 rank 的 micro-batch 数相同。
+
+```powershell
+Set-Location slime
+python -m pytest tests/test_dp_schedule.py -q
+```
+
+当前基线：`9 passed`。相关 6 个 Python 文件静态编译通过。插件 runtime-hook contracts 在当前环境 collection 失败，直接原因是缺 `httpx`；同时本机 Torch 对 NumPy 2.x 发出 ABI 警告，均未冒充测试通过。
+
+可变 fanout 结论还通过 AST 抽取当前 `_post_process_rewards` 函数体实跑：固定四样本、每 prompt 两条时输出 `[-1, 1, -2, 2]`；三样本触发 fallback 时输出约 `[-3.67, -1.67, 5.33]`，三者只满足整批均值为 0。
 
 ## 复盘迁移
 

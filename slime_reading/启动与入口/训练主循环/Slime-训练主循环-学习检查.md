@@ -29,7 +29,7 @@ updated: 2026-07-10
 - [ ] 为什么首次 generate 前必须推一次 actor 权重。
 - [ ] 为什么 sync `train.py` 里的 `async_train` 仍然是同步 step 语义。
 - [ ] 为什么 `train_async.py` 禁止 colocate。
-- [ ] 为什么 PPO critic-only 阶段只等待 critic，不训练 actor。
+- [ ] 为什么 PPO critic-only 阶段只训练 critic，但同步 step 尾部仍会调用 actor 权重发布。
 - [ ] 为什么 save 最后一轮会触发，而 eval 不一定。
 - [ ] 为什么 debug 参数会在进入主循环前改写资源和 offload 配置。
 
@@ -38,7 +38,7 @@ updated: 2026-07-10
 - [ ] placement group 卡住时，能根据 GPU 总数、可用数和 layout 判断资源缺口。
 - [ ] 首轮 rollout 权重异常时，能检查 bootstrap `onload_weights -> update_weights -> onload_kv`。
 - [ ] colocate OOM 时，能检查 `offload_train/offload_rollout` 的 validate 后值和主循环顺序。
-- [ ] async staleness 时，能解释 `update_weights_interval` 的影响和 drain future 的必要性。
+- [ ] async staleness 时，能解释一步 ahead 预取的固有滞后一拍、`update_weights_interval` 的额外影响和 drain future 的必要性。
 - [ ] eval-only 没训练时，能说明它是循环外特例。
 - [ ] debug train only / rollout only 行为异常时，能先回到 `arguments.py` 校验分支。
 
@@ -71,6 +71,6 @@ python -m pytest slime/tests/test_qwen3_4B_ppo_train_critic_only.py -q
 
 全部满足后，应该能做到：
 
-- 不打开源码也能复述同步和异步训练主循环。
+- 借助时序图能准确复述同步与流水异步主循环；修改实现或处理争议时会回到当前 baseline 源码。
 - 根据症状判断问题在资源、rollout、训练、权重同步、周期动作还是参数校验。
 - 改训练入口时知道哪些顺序不能乱动，尤其是 offload/onload 和 update weights。

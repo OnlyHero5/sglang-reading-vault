@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练数据 · 核心概念
 
@@ -52,6 +52,8 @@ flowchart TD
 | `PackedSeqParams` | `get_batch` | Megatron model | THD packed sequence 边界 |
 | `full_loss_masks` | `get_batch` | model forward/loss | shape 必须等于 `tokens.shape` |
 
+还要单独记住两个“非局部字段”：`total_lengths` 和 `raw_reward` 在 Ray 分片中仍保存全局列表。Actor 侧只把 `total_lengths` 按 `partition` 收缩；`raw_reward` 保持全局。这不是普通样本列的行为，日志代码若把它与 rank-local 列按同一个下标遍历，就会产生错配。
+
 ## pack-first-distribute-second
 
 Train Data 的调度哲学是：先在全局 step 内打包 micro-batch，再分发给 DP rank。这样做的目的不是追求最优装箱，而是保证 pipeline 能同步。
@@ -59,7 +61,7 @@ Train Data 的调度哲学是：先在全局 step 内打包 micro-batch，再分
 源码入口：来源：slime/utils/dp_schedule.py L1-L38
 
 ```python
-# 来源：slime/utils/dp_schedule.py L8-L23
+# 定位骨架（基于 `slime/utils/dp_schedule.py` L8-L23；把模块 docstring 转写为注释）
 # The scheduling philosophy is **pack first, distribute second**:
 #
 #   1. Group samples by rollout id (``rollout_indices[i]`` =
@@ -101,7 +103,7 @@ Train Data 的调度哲学是：先在全局 step 内打包 micro-batch，再分
 源码入口：来源：slime/backends/megatron_utils/data.py L201-L245
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L219-L245
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L219-L245；省略类缩进与 docstring）
 def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
     batch = {}
     indices = self.micro_batch_indices[self.offset]
@@ -140,7 +142,7 @@ VPP 会创建多个 iterator，每个 iterator 有独立 offset，避免 virtual
 源码入口：来源：slime/backends/megatron_utils/data.py L28-L163
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L106-L148
+# 定位骨架（基于 `slime/backends/megatron_utils/data.py` L106-L148；省略 token 写回与 mask 中段）
 max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 packed_seq_params = PackedSeqParams(
     cu_seqlens_q=cu_seqlens,
@@ -172,6 +174,14 @@ Train Data 不计算 policy loss，但它保留 loss 需要的分母语义：
 
 所以调度不能随意按 sample 打散 rollout sibling；否则 loss 分母和 step 语义都会变。
 
+## 三个不会替你兜底的边界
+
+1. `build_dp_schedule` 不校验 `len(total_lengths) == len(rollout_indices)`，也不校验 `global_batch_size > 0`。调用方必须保证长度、正数和并行配置合法；否则可能是显式异常，也可能是尾部长度从未参与调度。
+2. 尾部不足 `global_batch_size` 个 rollout 时，源码用整除计算 `num_steps`，剩余 rollout 不进入任何 `partition`，且该函数不记录 warning。恢复训练样本数时应比较输入 sample 集与 partitions 并集。
+3. RolloutManager 不是把 `train_data` 的所有键透明传给 actor，而是按硬编码列表复制。当前 `metadata` 虽在 `_convert_samples_to_train_data` 中写入，却不在 `_split_train_data_by_dp` 白名单内；扩展字段必须同时改生产、传输和消费三处。
+
+这三点分别对应“参数契约、样本覆盖、字段可达性”，不能用 `full_loss_masks.shape == tokens.shape` 这一条末端断言替代。
+
 ## 运行验证
 
 Train Data 的验证重点是三段：DP schedule、DataIterator 播放、`get_batch` 组装 packed THD。
@@ -180,4 +190,4 @@ Train Data 的验证重点是三段：DP schedule、DataIterator 播放、`get_b
 rg -n 'build_dp_schedule|pack first|class DataIterator|def get_batch|PackedSeqParams|cu_seqlens|full_loss_masks|rollout_mask_sums|num_microbatches|global_batch_sizes|dynamic' slime/slime/utils/dp_schedule.py slime/slime/backends/megatron_utils/data.py slime/slime/ray/rollout.py slime/slime/backends/megatron_utils/model.py
 ```
 
-读输出时先看 `build_dp_schedule` 返回的 `partitions/micro_batch_indices/num_microbatches/global_batch_sizes`，确认 step 与 DP 对齐；再看 `DataIterator` 如何按 schedule 播放；最后看 `get_batch`，确认 `cu_seqlens`、`PackedSeqParams` 和 `full_loss_masks` 是模型输入空间，不是 response 空间。
+读输出时先看 `build_dp_schedule` 返回的 `partitions/micro_batch_indices/num_microbatches/global_batch_sizes`，确认 step 与 DP 对齐并核对是否裁掉尾部 rollout；再看 RolloutManager 的字段白名单和 `DataIterator` 如何播放；最后看 `get_batch`。默认 CP 下 `cu_seqlens` 是还原到原始长度坐标的 packed 边界；allgather-CP 下它描述全局拼接流，而 `tokens` 已是当前 CP rank 的局部 chunk，二者不能按普通局部 tensor 边界理解。

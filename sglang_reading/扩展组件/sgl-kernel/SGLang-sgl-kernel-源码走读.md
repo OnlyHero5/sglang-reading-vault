@@ -13,31 +13,29 @@ updated: 2026-07-10
 ---
 # sgl-kernel · 源码走读
 
-> 读法：本篇关注 `sgl-kernel/python/sgl_kernel` 的 Python 加载层与 wrapper 层。真正的 CUDA/ROCm kernel 在扩展库中注册；这里的源码重点是动态库加载、副作用注册、参数约束、buffer 归一化与 `torch.ops.sgl_kernel.*` 调用边界。
+> 读法：本篇先沿 `merge_state_v2` 走通 SRT 能力门禁、Python wrapper、dispatcher schema、C++ launcher 与 CUDA kernel，再用 MoE、KV I/O、投机验证、采样和 allreduce 对照不同 ABI。只读 Python wrapper 无法证明算子如何注册、谁拥有 fallback，也无法判断实际执行实现。
 
 ---
 
 ## 长文读法
 
-这篇按“Python 包如何把扩展 op 安全暴露给 SRT”读：`__init__.py` import 时加载架构匹配的动态库并预加载 CUDA runtime，wrapper 文件只做参数约束、buffer 归一化和 `torch.ops.sgl_kernel.*` 转发，最后再给可导出的函数批量套 debug wrapper。真正的 CUDA/ROCm 实现不在这些 Python 文件里。
+这篇按“一个 SRT 计算如何跨过五道边界”读：`__init__.py` 先加载 `common_ops`、随后才尝试 preload CUDA runtime；wrapper 可能校验、转换、分配、缓存或选择可选依赖；`common_extension*.cc` 定义 schema 与设备 dispatch；C++/CUDA/ROCm 实现最后消费 tensor。导出层再按当前平台存在的符号批量套 debug wrapper。
 
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
 | 第一次建立 sgl-kernel 边界 | 1 | Python 入口首先是动态库注册器，函数 re-export 依赖 import 副作用完成 |
-| 排查 op 找不到或加载错架构 | 1.1 到 1.3 | `_load_architecture_specific_ops` 按硬件变体加载 `.so`，CUDA runtime 预加载解决动态链接问题 |
+| 排查 op 找不到或加载错变体 | 1.1 到 1.3 | CC90 选 fast-math 目录，其余选 precise-math 目录；preload 发生在 `common_ops` 加载之后 |
 | 理解 attention wrapper | 2 | wrapper 校验 DeepSeek MLA / partial attention state 的形状和 workspace，再转到 PyTorch dispatcher |
 | 理解 MoE 路由 wrapper | 3 | token-expert 对齐、top-k softmax / sigmoid 都是预分配输出张量后交给扩展 op 写入 |
 | 排查 GEMM 或 KV 迁移 | 4 | GEMM wrapper 基本是轻量转发，KV I/O wrapper 明确 src/dst index 和每层迁移边界 |
 | 理解投机采样与 top-k 后处理 | 5 | 这些接口大多以可变输出张量为契约，调用方要提前准备 `predict`、`accept_index`、概率或 score buffer |
-| 看 ROCm / debug 特殊路径 | 6 | ROCm allreduce 只在 HIP 构建下暴露；debug wrapper 是导出层的统一包裹，不改变 kernel 语义 |
+| 看 allreduce / debug 特殊路径 | 6 | CUDA 与 ROCm 都有 custom allreduce，但 ABI 不同；debug wrapper 只包装当前平台已经导出的白名单符号 |
 
 读的时候不要在本篇寻找 kernel 算法细节。本篇的价值是确认 SRT 调用扩展 op 前，Python 层负责了哪些输入契约，以及哪些错误会留到扩展库或 kernel launch 时才暴露。
 
 ## 1. 包初始化与动态库加载
 
 ### 1.1 `__init__.py`：import 时加载 architecture-specific ops
-
-来源：sgl-kernel/python/sgl_kernel/__init__.py L18-L23
 
 **问题与约束：** `sgl_kernel` 被上层 SRT import 时，Python 符号和 C++/CUDA 扩展 op 都必须已经注册；同时 CUDA runtime 的动态链接问题需要尽早处理。
 
@@ -48,6 +46,7 @@ updated: 2026-07-10
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/__init__.py L18-L23
     # Initialize the ops library based on current GPU
     common_ops = _load_architecture_specific_ops()
 
@@ -60,23 +59,22 @@ updated: 2026-07-10
 
 **为什么这样写：** wrapper 层不应在每次函数调用时检查扩展库是否存在，否则热路径会被 import 状态污染。把加载集中到包初始化，可以让函数调用退化成轻量的 `torch.ops` 转发。
 
-**不变量与失败模式：** 扩展库必须在 wrapper 被调用前成功注册；CUDA runtime 预加载只应在 CUDA 构建下执行；Apple Silicon 走 Metal 分支，不暴露 CUDA 符号。若 `_load_architecture_specific_ops` 失败，后续 wrapper 会在 `torch.ops.sgl_kernel` 处整体不可用。
+**不变量与失败模式：** 扩展库必须在 wrapper 被调用前成功注册；Apple Silicon 走 Metal 分支，不暴露 CUDA 符号。当前顺序先执行 `_load_architecture_specific_ops()`，再调用 `_preload_cuda_library()`，所以后者无法补救 `common_ops` 自身首次加载时已经发生的 CUDA runtime 解析失败。
 
 **要点：** `sgl-kernel` 的 Python 入口首先是动态库注册器，其次才是函数 re-export 容器。
 
-### 1.2 `_load_architecture_specific_ops`：从架构目录精确加载 `.so`
-
-来源：sgl-kernel/python/sgl_kernel/load_utils.py L84-L101
+### 1.2 `_load_architecture_specific_ops`：从所选目录加载 compiled extension
 
 **问题与约束：** 同一个 wheel 可能携带多个 GPU 架构变体，加载时需要优先选择当前设备匹配的 compiled extension；直接按普通 import 名称查找容易拿到错误文件或 stub。
 
 **设计选择：** 当发现匹配文件时，用 `importlib.util.spec_from_file_location("common_ops", ops_path)` 从具体路径构造 module spec，再 `exec_module` 执行该 `.so`。
 
-**读法：** 这里刻意绕过普通 import 搜索路径，用已筛选出的 `.so` 路径加载模块。这样可以保证当前进程注册的是对应 GPU 架构的 op 实现。
+**读法：** 这里刻意绕过普通 import 搜索路径，用已筛选出的扩展文件加载模块。它保证加载的是所选目录里的文件，但不能保证该二进制一定含当前设备的 gencode；目录选择与编译覆盖是两份证据。
 
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/load_utils.py L84-L101
     if matching_files:
         ops_path = Path(matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
@@ -101,13 +99,11 @@ updated: 2026-07-10
 
 **为什么这样写：** GPU kernel 对 SM 架构敏感，错误变体可能能 import 但运行失败或性能不对。按路径加载使“选择哪个 `.so`”成为显式决策，也让日志能定位实际加载文件。
 
-**不变量与失败模式：** `matching_files[0]` 必须是经过优先级排序的 compiled extension；spec 和 loader 不能为空；`exec_module` 的副作用必须完成 op 注册。若路径选择错误，Python wrapper 仍能存在，但实际 kernel 可能在 launch 时崩溃。
+**不变量与失败模式：** `_filter_compiled_extensions` 只把 `.so/.pyd/.dll` 排到其他匹配文件之前，并不删除其他文件；spec 和 loader 不能为空；`exec_module` 的副作用必须完成 op 注册。若选中的候选不是可用扩展，可能在 import 阶段失败；二进制缺目标 gencode 时也可能拖到 launch 才失败。
 
 **要点：** 这一段是 sgl-kernel 的架构选择点：不是按 Python 包名加载，而是按硬件匹配后的文件路径加载。
 
-### 1.3 `_preload_cuda_library`：提前把 CUDA runtime 放进全局符号表
-
-来源：sgl-kernel/python/sgl_kernel/load_utils.py L234-L242
+### 1.3 `_preload_cuda_library`：在 `common_ops` 之后尝试把 CUDA runtime 放进全局符号表
 
 **问题与约束：** 扩展库动态链接可能依赖 `libcudart.so.12` 或 `libcudart.so.13`；在某些部署环境中，Python 能找到 wheel，却不能在 `.so` 加载时解析 CUDA runtime。
 
@@ -118,6 +114,7 @@ updated: 2026-07-10
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/load_utils.py L234-L242
     for base in candidate_dirs:
         for lib_version in lib_versions:
             candidate = base / f"libcudart.so.{lib_version}"
@@ -131,19 +128,17 @@ updated: 2026-07-10
 
 **代码逻辑：** 双层循环生成候选路径；路径存在时 resolve 成绝对路径，调用 `ctypes.CDLL` 以全局模式载入，记录日志后结束。
 
-**为什么这样写：** 运行环境的动态链接器搜索路径不总是和 PyTorch wheel 的 CUDA runtime 位置一致。显式预加载可以把“找不到 libcudart”的错误提前并局部化到 import 阶段。
+**为什么这样写：** 运行环境的动态链接器搜索路径不总是和 CUDA runtime 位置一致。以 `RTLD_GLOBAL` 加载 runtime 可以帮助随后导入的扩展解析符号；由于当前调用顺序较晚，它不能把 `common_ops` 自身的链接错误提前局部化。
 
 **不变量与失败模式：** 候选版本应匹配当前 PyTorch CUDA major；只在 CUDA 构建下调用；加载失败应继续尝试其他候选。若不使用 `RTLD_GLOBAL`，后续 `.so` 仍可能解析不到 runtime 符号。
 
-**要点：** 这是部署层防护：不改变任何 kernel 逻辑，只降低 import 后首次调用扩展库时的动态链接风险。
+**要点：** 这是部署层的后置尝试：不改变 kernel 逻辑，可能帮助后续扩展加载；但对前一步 `common_ops` 的首次链接错误来不及生效。
 
 ---
 
 ## 2. Attention wrapper
 
 ### 2.1 `merge_state_v2`：合并 partial attention state
-
-来源：sgl-kernel/python/sgl_kernel/attention.py L6-L26
 
 **问题与约束：** Split-KV 或 cascade attention 会产生多段 partial output 与 log-sum-exp state，需要数值稳定地合并；wrapper 还要支持调用方传入输出 buffer，减少临时分配。
 
@@ -154,6 +149,7 @@ updated: 2026-07-10
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/attention.py L6-L26
 def merge_state_v2(
     v_a: torch.Tensor,
     s_a: torch.Tensor,
@@ -181,13 +177,78 @@ def merge_state_v2(
 
 **为什么这样写：** Python wrapper 不重复实现 merge 数学，只负责 dtype 与 buffer 管理。这样既保留 kernel 性能，又让调用者可以控制输出内存生命周期。
 
-**不变量与失败模式：** `v_a/v_b` 与 `s_a/s_b` 的 shape 必须匹配 kernel 预期；传入输出 buffer 时 shape/dtype 必须可写；FP8 与非 CUDA fallback 在源码待办注释中仍是风险点。若 state 不转 float32，长序列 LSE 合并更容易数值不稳。
+**不变量与失败模式：** `v_a/v_b` 与 `s_a/s_b` 的 shape 必须匹配 kernel 预期；传入输出 buffer 时 shape/dtype 必须可写。wrapper 本身没有 fallback；FP8、非 CUDA 与不满足 pack-size 的情况由 SRT `merge_state()` 在调用前改走 Triton。
 
 **要点：** 这是典型的 sgl-kernel wrapper：Python 层处理少量 ABI 约束，计算交给 dispatcher 后面的扩展 op。
 
-### 2.2 `cutlass_mla_decode`：校验 DeepSeek MLA paged decode 形状
+### 2.2 `merge_state_v2` 的完整链：fallback、schema 与 kernel 各有所有者
 
-来源：sgl-kernel/python/sgl_kernel/attention.py L29-L55
+SRT 调用方先做能力门禁；只有 CUDA、dtype 受支持且 head dimension 满足 pack-size 约束时才进入 sgl-kernel，否则显式改走 Triton：
+
+```python
+# 来源：python/sglang/srt/layers/attention/merge_state.py L26-L45
+def merge_state(
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    output_lse: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if (
+        _is_cuda
+        and _supported_dtypes(prefix_output)
+        and _supported_headdim(prefix_output)
+    ):
+        return merge_state_v2(
+            prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
+        )
+    else:
+        # Fallback to Triton kernel
+        return merge_state_triton(
+            prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
+```
+
+扩展注册层把同名 schema 绑定到 CUDA dispatch key：
+
+```cpp
+// 来源：sgl-kernel/csrc/common_extension.cc L44-L45
+  m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+  m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
+```
+
+最终 C++ 入口才检查 contiguous、device、rank、shape，并按输出 dtype 发射 CUDA launcher：
+
+```cpp
+// 来源：sgl-kernel/csrc/attention/merge_attn_states.cu L184-L206
+void merge_state_v2(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+  // Input tensors must be contiguous
+  CHECK_INPUT(v_a);  // v_a prefix_output (seq_len, num_heads, head_dim)
+  CHECK_INPUT(s_a);  // s_a prefix_lse (seq_len, num_heads)
+  CHECK_INPUT(v_b);  // v_b suffix_output (seq_len, num_heads, head_dim)
+  CHECK_INPUT(s_b);  // s_b suffix_lse (seq_len, num_heads)
+  // v_merged output (seq_len, num_heads, head_dim)
+  // s_merged output_lse (seq_len, num_heads)
+  auto device = v_a.device();
+  CHECK_EQ(s_a.device(), device);
+  CHECK_EQ(v_b.device(), device);
+  CHECK_EQ(s_b.device(), device);
+  CHECK_DIM(3, v_a);
+  CHECK_DIM(2, s_a);
+  CHECK_DIM(3, v_b);
+  CHECK_DIM(2, s_b);
+  CHECK_SHAPE(v_a, v_b);
+  CHECK_SHAPE(s_a, s_b);
+  CHECK_EQ(v_a.size(0), s_a.size(0));
+  CHECK_EQ(v_a.size(1), s_b.size(1));
+  DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
+}
+```
+
+因此一次失败的定位顺序应是：先看 SRT 是否进入 custom-op 分支，再看 wrapper 输出 buffer，再看 dispatcher 是否有 CUDA kernel，最后才看 C++ checks 与 launch。把所有问题笼统归为“sgl-kernel 不支持”会丢失真正的责任层。
+
+### 2.3 `cutlass_mla_decode`：校验 DeepSeek MLA paged decode 形状
 
 **问题与约束：** MLA decode 的 query 被拆成 latent 与 rope 两部分，KV cache 又把 latent KV 与 rope K 合并存储；CUTLASS kernel 对维度常量有固定假设。
 
@@ -198,6 +259,7 @@ def merge_state_v2(
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/attention.py L29-L55
 def cutlass_mla_decode(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -241,8 +303,6 @@ def cutlass_mla_decode(
 
 ### 3.1 `moe_align_block_size`：把 token-expert 分配对齐到 block
 
-来源：sgl-kernel/python/sgl_kernel/moe.py L6-L25
-
 **问题与约束：** MoE grouped GEMM 需要按 expert 分组并按 block size 对齐的 token 布局；这些输出 buffer 通常由上层预分配，kernel 应原地填充以减少额外分配。
 
 **设计选择：** wrapper 接收 `topk_ids`、expert 数、block size 与多个输出 buffer，直接调用 `torch.ops.sgl_kernel.moe_align_block_size.default`，不返回新对象。
@@ -252,6 +312,7 @@ def cutlass_mla_decode(
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/moe.py L6-L25
 def moe_align_block_size(
     topk_ids,
     num_experts,
@@ -284,8 +345,6 @@ def moe_align_block_size(
 
 ### 3.2 `topk_sigmoid`：sigmoid gating 的 top-k 路由
 
-来源：sgl-kernel/python/sgl_kernel/moe.py L57-L85
-
 **问题与约束：** DeepSeek 风格 MoE routing 可能使用 sigmoid gating、top-k expert 选择、renormalize 和 per-expert correction bias；输出需要写入预分配的 weights/ids buffer。
 
 **设计选择：** wrapper 用 docstring 明确输入输出形状与 `correction_bias` dtype 约束，并把参数直接转给 `torch.ops.sgl_kernel.topk_sigmoid.default`。
@@ -295,6 +354,7 @@ def moe_align_block_size(
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/moe.py L57-L80
 def topk_sigmoid(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -335,8 +395,6 @@ def topk_sigmoid(
 
 ### 4.1 `gemm.py`：INT8/FP8 scaled matmul 的轻量转发
 
-来源：sgl-kernel/python/sgl_kernel/gemm.py L14-L35
-
 **问题与约束：** 量化推理需要 INT8/FP8 矩阵乘，并携带 activation/weight scale、输出 dtype 和可选 bias；Python 层不应重写矩阵乘逻辑。
 
 **设计选择：** `int8_scaled_mm`、`fp8_blockwise_scaled_mm`、`fp8_scaled_mm` 都作为薄 wrapper，把输入矩阵、scale、dtype 和 bias 原样传给对应 `torch.ops.sgl_kernel` op。
@@ -346,6 +404,8 @@ def topk_sigmoid(
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/gemm.py L13-L42
+def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.int8_scaled_mm.default(
         mat_a,
         mat_b,
@@ -368,6 +428,13 @@ def fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype):
 
 def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.fp8_scaled_mm.default(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        out_dtype,
+        bias,
+    )
 ```
 
 **代码逻辑：** 代码段展示了 INT8 scaled matmul 的 op 调用，以及 FP8 blockwise/per-tensor 两个 wrapper 的函数边界和参数转发。
@@ -380,9 +447,7 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
 ### 4.2 `transfer_kv_per_layer`：单层 K/V 按 index 迁移
 
-来源：sgl-kernel/python/sgl_kernel/kvcacheio.py L14-L35
-
-**问题与约束：** PD disaggregation 或 KV cache 迁移需要按 index 把单层 K/V 从源 buffer 拷贝到目标 buffer；不同平台的 warp 配置不同，还需要限制 block quota。
+**问题与约束：** host cache、HiCache、layout conversion 或 disaggregation 的本地 copy 环节，需要按 index 把单层 K/V 从源 buffer 拷贝到目标 buffer；不同平台的 warp 配置不同，还需要限制 block quota。这个 wrapper 本身不包含远端传输协议。
 
 **设计选择：** wrapper 接收 source/destination K/V、源/目标 indices、item size、block quota 和平台相关 `num_warps_per_block`，直接调用 `transfer_kv_per_layer` op。
 
@@ -391,6 +456,8 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/kvcacheio.py L13-L34
+def transfer_kv_per_layer(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,
     src_v: torch.Tensor,
@@ -428,8 +495,6 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
 ### 5.1 `tree_speculative_sampling_target_only`：target-only 验证的可变输出
 
-来源：sgl-kernel/python/sgl_kernel/speculative.py L4-L24
-
 **问题与约束：** 树形投机解码需要根据 draft tree、target/draft 概率和随机数接受或拒绝 token，并把预测结果、接受位置和接受数量写回调用方提供的 buffer。
 
 **设计选择：** wrapper 把 `predicts`、`accept_index`、`accept_token_num` 明确标为 mutable，并把 tree 结构、随机数、概率与阈值参数传给 `tree_speculative_sampling_target_only` op。
@@ -439,6 +504,7 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/speculative.py L4-L35
 def tree_speculative_sampling_target_only(
     predicts: torch.Tensor,  # mutable
     accept_index: torch.Tensor,  # mutable
@@ -460,29 +526,39 @@ def tree_speculative_sampling_target_only(
         accept_index,
         accept_token_num,
         candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        threshold_single,
+        threshold_acc,
+        deterministic,
+    )
 ```
 
 **代码逻辑：** 函数签名列出三类输入：可变输出 buffer、draft tree 遍历结构、概率/随机数/阈值参数。函数体开始调用扩展 op，并把可变输出作为前几个参数传入。
 
 **为什么这样写：** 投机验证要更新多个结果数组，用多个返回 tensor 会增加分配和同步。mutable buffer 让调用方控制内存，并与后续 accept/reject 流程共享结果。
 
-**不变量与失败模式：** mutable buffer 必须提前按 batch/tree 大小分配；tree 结构数组之间的索引语义必须一致；`deterministic` 与随机样本参数不能冲突。若 buffer shape 不足，kernel 可能越界写；若 tree index 不一致，接受路径会错乱。
+**不变量与失败模式：** mutable buffer 必须提前按 batch/tree 大小分配；tree 结构数组之间的索引语义必须一致；即使 `deterministic=True`，wrapper 仍原样传入两组 uniform samples，具体使用规则属于 kernel 与 SRT 调用契约，不能由签名猜测。若 buffer shape 不足或 tree index 不一致，结果可能错误或 launch 失败。
 
 **要点：** 这里的 wrapper 明确展示了 speculative sampling 的 ABI：不是返回一个对象，而是原地更新多组状态数组。
 
-### 5.2 `_top_k_renorm_probs_internal` 与 `top_k_renorm_probs`：概率先升精度再截断归一
+### 5.2 `top_k_renorm_probs`：先选 FlashInfer 或内部 op，再谈 dtype 归一
 
-来源：sgl-kernel/python/sgl_kernel/sampling.py L18-L28
+**问题与约束：** 采样前的概率分布需要 top-k 截断并重新归一化，但公开 API 不固定落到 sgl-kernel op：可选依赖和设备类型先决定实现。
 
-**问题与约束：** 采样前的概率分布需要 top-k 截断并重新归一化；半精度概率在截断与求和时容易出现精度问题，top-k 还可能是 per-row tensor。
+**设计选择：** MUSA 或 FlashInfer 不可用时，internal helper 把 `probs` 转 float32、top-k tensor 转 int，分配输出后调用内部 op；其他情况直接委托 FlashInfer。
 
-**设计选择：** internal helper 先把 `probs` 转成 float32，把可选 `maybe_top_k_arr` 转成 int，再创建 `renorm_probs` 输出并调用 `top_k_renorm_probs` op；公开函数从下一行开始定义。
-
-**读法：** wrapper 先把 dtype 归一化，再把截断归一交给 GPU op。这样调用者可以传半精度概率，但 kernel 看到的是更稳定的 float32 概率。
+**读法：** “升到 float32”只属于内部 fallback 分支。FlashInfer 分支的 dtype 与 kernel 行为应按 FlashInfer 自身契约判断，不能把 internal helper 的行为推广到公开 API 的所有调用。
 
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/sampling.py L18-L26
 ) -> torch.Tensor:
     probs = probs.float()
     maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
@@ -491,22 +567,27 @@ def tree_speculative_sampling_target_only(
         probs, renorm_probs, maybe_top_k_arr, top_k_val
     )
     return renorm_probs
+```
 
+公开函数再做实现分流：
 
-def top_k_renorm_probs(
+```python
+# 来源：sgl-kernel/python/sgl_kernel/sampling.py L56-L59
+    if probs.device.type == "musa" or not _has_flashinfer:
+        return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
+    else:
+        return _flashinfer_sampling.top_k_renorm_probs(probs, top_k)
 ```
 
 **代码逻辑：** 代码段位于 internal helper 末尾：输入概率转 float，top-k 数组转 int，分配同 shape 输出，调用扩展 op 写结果，然后返回 renormalized 概率。
 
-**为什么这样写：** top-k 后需要重新除以保留概率的总和；用 float32 可以降低 underflow 和归一化误差。`maybe_top_k_arr` 支持每行不同 top-k，统一转 int 可简化 kernel ABI。
+**为什么这样写：** wrapper 复用已安装的 FlashInfer 主路径，同时为 MUSA 或缺失依赖保留内部 op。`maybe_top_k_arr` 支持每行不同 top-k，统一转 int 简化内部 kernel ABI。
 
-**不变量与失败模式：** `probs` 应是二维概率分布；`maybe_top_k_arr` 若存在应能广播或按 batch 对齐；输出 shape 与输入一致。若不转 float，低概率 token 在截断/归一中更容易出现数值不稳定。
+**不变量与失败模式：** 先记录实际分支，再比较数值或性能；debug wrapper 只包住公开 `top_k_renorm_prob`，但内部是否出现 `torch.ops.sgl_kernel` 仍由 `_has_flashinfer` 与设备决定。
 
-**要点：** 采样 wrapper 的核心是 dtype 与输出 buffer 管理；真正的 top-k 截断由 `sgl_kernel` op 完成。
+**要点：** 采样 wrapper 的核心先是实现选择；只有内部分支才由 `sgl_kernel` op 完成 top-k 截断，FlashInfer 分支不经过该 op。
 
 ### 5.3 `fast_topk_v2`：ragged/paged score 的 top-k 接口契约
-
-来源：sgl-kernel/python/sgl_kernel/top_k.py L18-L35
 
 **问题与约束：** Attention score 可能是 ragged 或 paged layout，每行有效区间长度不同；top-k 只能作用在每行 `[row_starts[i], row_starts[i] + lengths[i])` 的有效范围内。
 
@@ -517,6 +598,9 @@ def top_k_renorm_probs(
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/top_k.py L16-L42
+def fast_topk_v2(
+    score: torch.Tensor,
     lengths: torch.Tensor,
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
@@ -535,33 +619,39 @@ def top_k_renorm_probs(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
+    assert (
+        topk == 2048
+    ), "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+    topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
+    torch.ops.sgl_kernel.fast_topk(score, topk_indices, lengths, row_starts)
+    return topk_indices
 ```
 
 **代码逻辑：** 代码段展示函数参数与返回约定：`score` 是 `[B, L]`，`lengths` 是每行有效长度，`row_starts` 只在 ragged key 中需要，返回 `[B, topk]` 的 indices。
 
 **为什么这样写：** 稀疏或分页布局中，无效位置不能参与 top-k；把有效区间写进接口，比要求调用者提前 materialize dense mask 更省内存，也更接近 kernel 的实际访问模式。
 
-**不变量与失败模式：** `lengths` 长度必须等于 batch size；ragged layout 必须提供正确 `row_starts`；返回的是 indices 而不是 values。若有效区间边界错，top-k 会把 padding 或其他请求的 score 当成候选。
+**不变量与失败模式：** 当前 wrapper 硬断言 `topk == 2048` 且 `score` 为二维，因此它是 DeepSeek v3.2 专用入口，不是任意 k 的通用 ragged top-k。`lengths` 必须按 batch 对齐，ragged layout 还要提供正确 `row_starts`；边界错会把 padding 或其他请求的 score 当成候选。
 
-**要点：** 这段 docstring 是接口级源码证据：`fast_topk_v2` 服务的是 ragged/paged score，不是普通 vocab top-k。
+**要点：** 这段函数体同时证明 layout 契约和 `topk == 2048` 硬门禁：`fast_topk_v2` 服务 DeepSeek v3.2 的 ragged/paged score，不是普通 vocab top-k。
 
 ---
 
-## 6. ROCm AllReduce 与调试包装
+## 6. CUDA/ROCm AllReduce 与调试包装
 
-### 6.1 `init_custom_ar`：ROCm 自定义 allreduce 初始化
+### 6.1 `init_custom_ar`：同名 API 下的两套 allreduce ABI
 
-来源：sgl-kernel/python/sgl_kernel/allreduce.py L7-L17
-
-**问题与约束：** ROCm 路径下，小 tensor TP allreduce 可能需要绕过通用通信库的固定开销；自定义 AR 需要用 IPC handles、offsets、rank 等信息初始化一个后续调用可复用的句柄。
+**问题与约束：** custom allreduce 初始化要建立跨 rank 共享资源，但 CUDA 与 ROCm 所需的 handle、offset 和后续执行接口不同。
 
 **设计选择：** 在 `torch.version.hip is not None` 分支内定义 `init_custom_ar`，把 meta、rank data、handles、offsets、rank 与 full_nvlink 标志传给 `torch.ops.sgl_kernel.init_custom_ar.default`，并返回 int handle。
 
-**读法：** 这个函数只在 HIP 平台暴露。返回的整数句柄是后续 registered/unregistered allreduce wrapper 的上下文入口。
+**读法：** 这里展示的是 HIP 分支；文件的 `else` 还定义 CUDA 版 `init_custom_ar(ipc_tensors, rank_data, rank, full_nvlink)`。两者都返回整数句柄，但不能交换参数或后续调用协议。
 
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/allreduce.py L7-L17
     def init_custom_ar(
         meta: torch.Tensor,
         rank_data: torch.Tensor,
@@ -575,17 +665,29 @@ def top_k_renorm_probs(
         )
 ```
 
+CUDA 分支保留同名入口，但参数已经不同：
+
+```python
+# 来源：sgl-kernel/python/sgl_kernel/allreduce.py L95-L102
+else:
+
+    def init_custom_ar(
+        ipc_tensors: List[int], rank_data: torch.Tensor, rank: int, full_nvlink: bool
+    ) -> int:
+        return torch.ops.sgl_kernel.init_custom_ar.default(
+            ipc_tensors, rank_data, rank, full_nvlink
+        )
+```
+
 **代码逻辑：** 函数接收通信元数据和 IPC 信息，转调扩展 op，并把 op 返回的 handle 交给调用方保存。
 
 **为什么这样写：** 自定义 allreduce 的资源准备和后续执行是分离的。初始化时集中建立共享内存/IPC 上下文，后续 allreduce 调用就能只传 handle 与 tensor。
 
-**不变量与失败模式：** 该 wrapper 只在 HIP 分支定义；handles 与 offsets 必须覆盖参与 rank；返回 handle 必须在后续调用中保持有效。若 CUDA 环境误用该符号，可能根本没有对应定义或 op。
+**不变量与失败模式：** HIP 的 handles/offsets 必须覆盖参与 rank，CUDA 的 `ipc_tensors` 必须符合另一套注册约定；返回 handle 都要保持到 dispose。平台判断错时通常不是“符号不存在”，而是 ABI 与后续方法集合不匹配。
 
-**要点：** AllReduce wrapper 体现了平台分叉：ROCm 下暴露自定义通信路径，CUDA 路径不一定有同名 Python API。
+**要点：** AllReduce wrapper 体现的是同名入口下的平台分叉：CUDA 与 ROCm 都有 custom path，ROCm 额外暴露 deterministic、registered/unregistered 与 quick-allreduce 族。
 
 ### 6.2 `_DEBUG_EXPORT_NAMES`：批量给导出函数套 debug wrapper
-
-来源：sgl-kernel/python/sgl_kernel/__init__.py L216-L220
 
 **问题与约束：** sgl-kernel re-export 了大量函数，如果逐个手写 debug wrapper，容易遗漏；但只有实际存在于 `globals()` 的符号才能被包装，平台差异符号不能强行引用。
 
@@ -596,6 +698,7 @@ def top_k_renorm_probs(
 **源码锚点：**
 
 ```python
+# 来源：sgl-kernel/python/sgl_kernel/__init__.py L216-L220
     for _name in _DEBUG_EXPORT_NAMES:
         if _name in globals():
             globals()[_name] = maybe_wrap_debug_kernel(
@@ -607,7 +710,7 @@ def top_k_renorm_probs(
 
 **为什么这样写：** 平台和可选依赖会影响实际导出符号。先检查 `globals()` 可以避免 debug 包装阶段因为缺失符号失败，同时让新增导出只需加入名单即可获得统一日志。
 
-**不变量与失败模式：** 被包装对象必须是可调用 kernel wrapper；不存在的名字必须跳过；包装后函数签名与返回语义应保持透明。若直接索引 globals，平台特有符号缺失会导致 import 阶段崩溃。
+**不变量与失败模式：** 被包装对象必须可调用，不存在的名字必须跳过；返回语义是否完全透明取决于 SRT 的 `debug_kernel_api` 实现，不能只凭这里断言。若直接索引 globals，平台特有符号缺失会导致 import 阶段崩溃。
 
 **要点：** debug 包装放在 import 收尾阶段，保证所有 re-export 已完成，再按当前平台实际符号集合批量增强。
 
@@ -623,9 +726,9 @@ rg -n "torch.ops.sgl_kernel|maybe_wrap_debug_kernel|merge_state_v2|grouped_gemm|
 
 预期信号：
 
-- `attention.py`、`moe.py`、`gemm.py`、`kvcacheio.py` 等 wrapper 仍直接转调 `torch.ops.sgl_kernel`。
+- `attention.py`、`moe.py`、`gemm.py`、`kvcacheio.py` 中相应 wrapper 仍能追到 `torch.ops.sgl_kernel`；同时应识别 sampling 分流、纯 PyTorch fast path 与 GPTQ typo 等例外。
 - `__init__.py` 仍集中 re-export 并在末尾做 debug wrapper 包装。
 - `top_k.py` 仍能看到 ragged/paged top-k 的专用接口。
 - `allreduce.py` 仍体现 CUDA / ROCm 平台分叉。
 
-如果 wrapper 不再直接转调 `torch.ops.sgl_kernel`，本文应从“薄 Python 包装层”改写为新的调度/注册模型。
+如果某个专题结论依赖的 wrapper、schema、dispatch key 或 SRT 门禁发生变化，应沿该算子的五层链重新核对；不能因为其他 wrapper 仍是薄转发就保留旧结论。

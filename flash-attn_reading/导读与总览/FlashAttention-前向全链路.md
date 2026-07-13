@@ -9,15 +9,15 @@ tags:
   - framework/flash-attn
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # FlashAttention 前向全链路
 
-> 这篇只追主包 FA2 的 fixed-length forward：一次 `flash_attn_func(q, k, v)` 如何把 HBM 里的 Q/K/V tensor，变成 C++ 参数包、CUDA launch、CTA tile、寄存器里的 online softmax，最后写回 `out` 与 `softmax_lse`。FA3、FA4、varlen、KV cache、backward 是后续分支，不在这条主线里展开。
+> 这篇只追 FA2 **CUDA compiled backend** 的 fixed-length standard forward：一次 `flash_attn_func(q, k, v)` 如何把 HBM 里的 Q/K/V tensor 变成 C++ 参数包、CUDA launch、CTA tile、寄存器里的 online softmax，最后写回 `out` 与 `softmax_lse`。ROCm CK/Triton、FA3、FA4、varlen、KV cache、backward 是其他分支，不在这条主线里展开。
 
 ## 长文读法
 
-这篇按 fixed-length forward 的七段边界读：Python API 把普通函数变成可反传算子，custom op 接 extension，C++ 入口检查并装配参数，dispatch 把运行时形状变成模板实例，kernel 主循环在 tile 内完成 QK、mask、online softmax、PV，最后只写回 `out` 和 `softmax_lse`。
+这篇按 fixed-length forward 的七段边界读：Python API 把普通函数变成可反传算子；PyTorch 2.4+ 经 custom op，旧版本经普通 wrapper；确认 backend 是 CUDA compiled 后，pybind/C++ 检查并装配参数，dispatch 把运行时形状变成模板实例，kernel 主循环在 tile 内完成 QK、mask、online softmax、PV，最后写回主路径需要的 `out` 和 `softmax_lse`。
 
 | 你的任务 | 先读 | 抓住什么 |
 |----------|------|----------|
@@ -26,7 +26,7 @@ updated: 2026-07-10
 | 排查参数限制 | C++ 入口、参数包 | dtype、head dim、stride、scale、mask 最终都落到参数包 |
 | 排查 dispatch | Dispatch | 运行时 shape / dtype / causal 等开关在这里变成模板组合 |
 | 理解 kernel 主循环 | Kernel 主循环、Online softmax、写回 | `S/P` 只在 tile 内生成和消费，长期 HBM 状态是 `O/LSE` |
-| 做迁移阅读 | 读完后的迁移 | 再去 FA03、FA04、FA07、FA05、FA06 分支深入 |
+| 做迁移阅读 | 读完后的迁移 | 再去 Python API、FA2 Forward、Backward、KV Cache、Hopper/CuTe 分支深入 |
 
 ## 读者先拿到什么
 
@@ -34,9 +34,9 @@ updated: 2026-07-10
 
 | 读者问题 | 这篇给出的答案 |
 |----------|----------------|
-| `flash_attn_func` 为什么看起来只是 Python 函数，却能跑 CUDA kernel？ | Python API 经 autograd Function、custom op、pybind 进入 `mha_fwd`，最终由 launch template 实例化 kernel。 |
+| `flash_attn_func` 为什么看起来只是 Python 函数，却能跑 CUDA kernel？ | 在 CUDA compiled backend 下，Python API 经 autograd Function、版本化 wrapper、pybind 进入 `mha_fwd`，最终由 launch template 实例化 kernel。 |
 | dtype、headdim、contiguous last dim、Ampere+ 这些限制从哪来？ | 它们不是表面 API 习惯，而是 C++ 参数检查、向量化访存、tile layout、shared memory 和模板实例的前置条件。 |
-| FlashAttention 为什么不把完整 attention matrix 写回显存？ | kernel 只在 tile 内生成局部 score，马上做 mask、online softmax、`P @ V` 累积；常规输出只写 `out` 和每行 `softmax_lse`。 |
+| FlashAttention 为什么不把完整 attention matrix 写回显存？ | kernel 只在 tile 内生成局部 score，马上做 mask、online softmax、未归一化指数权重与 V 的累积；常规输出只写 `out` 和每行 `softmax_lse`。 |
 | 出错或性能异常时先看哪里？ | 先分辨问题卡在 Python 包装、C++ 检查、dispatch 组合，还是 kernel tile 循环。 |
 
 ## 源码阅读依据
@@ -58,7 +58,10 @@ flowchart TB
     QKV["HBM tensor<br/>q/k/v: B,S,H,D"]
     API["Python API<br/>flash_attn_func"]
     AUTO["Autograd Function<br/>FlashAttnFunc.forward"]
-    OP["custom op<br/>_flash_attn_forward"]
+    VER{"PyTorch >= 2.4?"}
+    OP["custom op / torch.ops"]
+    DIRECT["普通 Python wrapper"]
+    BACKEND{"CUDA compiled?"}
     CPP["C++ extension<br/>mha_fwd"]
     PARAM["Flash_fwd_params<br/>ptr/stride/shape/scale/dropout/mask"]
     DISPATCH["dispatch<br/>dtype + headdim + causal + splitKV"]
@@ -66,7 +69,11 @@ flowchart TB
     TILE["CTA tile<br/>Q block scans K/V blocks"]
     REG["register state<br/>acc_s / row_max / row_sum / acc_o"]
     OUT["HBM output<br/>out + softmax_lse"]
-    QKV --> API --> AUTO --> OP --> CPP --> PARAM --> DISPATCH --> LAUNCH --> TILE --> REG --> OUT
+    QKV --> API --> AUTO --> VER
+    VER --> OP --> BACKEND
+    VER --> DIRECT --> BACKEND
+    BACKEND -->|本文主线| CPP --> PARAM --> DISPATCH --> LAUNCH --> TILE --> REG --> OUT
+    BACKEND -->|ROCm CK/Triton| OTHER["转到对应 backend 文档"]
 ```
 
 把一次 fixed-length forward 想成一条搬运和压缩链：
@@ -77,7 +84,7 @@ flowchart TB
 4. kernel 层让一个 CTA 负责一块 query 行，沿 K/V 维度扫 tile；score 矩阵只在寄存器和 shared memory 的局部片段中短暂停留。
 5. epilogue 层把累积好的 `acc_o` 归一化、转回 fp16/bf16，并把 `softmax_lse` 写回 HBM，供 backward 和测试使用。
 
-这条链的关键不是“调用栈很长”，而是每一层都在丢掉不该长期保存的东西：Python 丢掉框架语义，C++ 丢掉 tensor 对象外壳，kernel 丢掉完整 attention matrix，只留下输出和每行归一化需要的 LSE。
+这条链的关键不是“调用栈很长”，而是表示逐层收紧：Python 把用户意图整理成 API/autograd 协议，C++ 把 tensor 元数据冻结为地址、stride、shape 和 flag，kernel 不物化完整 attention matrix，只长期保留主输出与每行归一化摘要。
 
 ## 贯穿场景
 
@@ -105,15 +112,15 @@ Python tensor q/k/v
 
 ## custom op 层：把 PyTorch 调用接到扩展模块
 
-文件开头先导入 `flash_attn_2_cuda as flash_attn_gpu`；如果走 ROCm/Triton AMD 路径才会换实现。`maybe_contiguous` 只修最后一维，因为 kernel 的向量化 load 需要 `stride(-1) == 1`。来源：flash_attn/flash_attn_interface.py L1-L28
+文件开头先做 backend 路由：普通 CUDA 直接导入 `flash_attn_2_cuda`；HIP 默认尝试 compiled extension，失败才 fallback 到 Aiter Triton；显式 Triton 环境直接选择 Aiter。普通 CUDA import 失败不会自动 fallback。`maybe_contiguous` 只修最后一维，以满足下一层末维 stride 为 1 的契约。来源：flash_attn/flash_attn_interface.py L1-L28
 
 `_flash_attn_forward` 是 PyTorch custom op 包装层。它先对 Q/K/V 调 `maybe_contiguous`，再调用 `flash_attn_gpu.fwd(...)`，返回 `out, softmax_lse, S_dmask, rng_state`。PyTorch 2.4 之后 `_wrapped_flash_attn_forward` 会指向 `torch.ops.flash_attn._flash_attn_forward`，否则退回普通 Python 函数包装。来源：flash_attn/flash_attn_interface.py L84-L150
 
-这一层容易误读：它不是在 Python 里“实现 attention”，而是在建立 PyTorch dispatcher 与 C++ extension 的边界。真正的 shape 检查和 kernel 选择还没发生。
+这一层容易误读：它不是在 Python 里“实现 attention”，而是在建立 PyTorch dispatcher 与所选 backend 的边界。只有确认 `flash_attn_gpu` 是 CUDA compiled extension 后，本文才继续进入下方 C++；ROCm CK/Triton 不能照搬后续文件链。
 
 ## C++ 入口：把 tensor 外壳剥成参数包
 
-pybind 表把 Python 侧的 `fwd` 绑定到 `mha_fwd`，同一个 extension 还暴露 `varlen_fwd`、`bwd`、`varlen_bwd`、`fwd_kvcache`。因此看到 `flash_attn_gpu.fwd` 时，主线应直接跳到 `mha_fwd`，不要把 varlen 或 KV cache 混进当前 fixed-length 场景。来源：csrc/flash_attn/flash_api.cpp L1481-L1488
+在 CUDA compiled 分支，pybind 表把 Python 侧的 `fwd` 绑定到 `mha_fwd`，同一个 extension 还暴露 `varlen_fwd`、`bwd`、`varlen_bwd`、`fwd_kvcache`。只有在这个分支看到 `flash_attn_gpu.fwd`，才能跳到 `mha_fwd`；同时不要把 varlen 或 KV cache 混进当前 fixed-length 场景。来源：csrc/flash_attn/flash_api.cpp L1481-L1488
 
 `mha_fwd` 先用 `CUDAGuard` 固定当前设备，然后检查计算能力至少是 Ampere，dtype 只能是 fp16/bf16，Q/K/V dtype 必须一致，并要求三个输入都在 CUDA 上。接着它检查最后一维 contiguous、head dim 不超过 256、head dim 是 8 的倍数、K/V heads 能整除 Q heads。来源：csrc/flash_attn/flash_api.cpp L350-L395
 
@@ -152,7 +159,7 @@ kernel 不再理解 PyTorch tensor，只理解这些地址和整数。
 
 `mha_fwd` 最后在 `seqlen_k > 0` 时取当前 CUDA stream，并调用 `run_mha_fwd(params, stream)`；如果 `seqlen_k == 0`，它直接把 `out` 置零、`softmax_lse` 填成 infinity。来源：csrc/flash_attn/flash_api.cpp L497-L511
 
-`run_mha_fwd` 用三层 switch 把运行时参数变成编译期模板：输入 dtype、head dim、是否 causal。然后根据 `num_splits` 选择普通 forward 或 split-KV forward。我们的贯穿场景 `num_splits <= 1`，所以进入普通 `run_mha_fwd_`。来源：csrc/flash_attn/flash_api.cpp L243-L255
+`run_mha_fwd` 用三层 switch 把运行时参数变成编译期模板：输入 dtype、head dim、是否 causal。然后根据 `num_splits` 选择普通 forward 或 split-KV forward。本文普通 dense 场景的 `num_splits=0`，所以进入 standard `run_mha_fwd_`；不要把 KV-cache forced split 或 aligned single-split 套进来。来源：csrc/flash_attn/flash_api.cpp L243-L255
 
 launch template 再继续细分：`run_flash_fwd` 计算 `num_m_block`，设置 grid 为 `(query block, batch, head)`，判断 `is_even_MN`、`is_even_K`、是否返回 softmax、local/alibi/softcap，然后选出一个 `flash_fwd_kernel<...>` 模板实例并 launch。来源：csrc/flash_attn/src/flash_fwd_launch_template.h L32-L99
 
@@ -173,14 +180,14 @@ head dim 的选择不是装饰性分支。比如 `D=64`、无 dropout 时走 `12
 | `acc_s` | `Q @ K^T` 的当前 score tile，fp32 accumulator。 |
 | `Mask` | 对越界、causal、local window、alibi 做局部修正或置 `-INFINITY`。 |
 | `Softmax.row_max/row_sum` | 维护到目前为止每行的 online softmax 归一化状态。 |
-| `acc_o` | 已处理过的所有 K/V block 对 output 的累计贡献。 |
-| `rP` | 当前 score tile 经 softmax 后转回 fp16/bf16，用来乘 V。 |
+| `acc_o` | 已处理 K/V blocks 的重标定输出分子，epilogue 前尚未最终归一化。 |
+| `rP` | 当前 score tile 经 online update 后形成的未最终归一化指数权重，转回 fp16/bf16 后乘 V。 |
 
 源码顺序是：加载 V tile，做 `gemm` 得到 `acc_s`，可选 softcap，mask，预取下一个 K tile，调用 `softmax_rescale_o` 更新 `row_max/row_sum` 并重缩放 `acc_o`，把 `acc_s` 转成 `rP`，可选记录/dropout，然后 `gemm_rs(acc_o, P, V)` 累积输出。来源：csrc/flash_attn/src/flash_fwd_kernel.h L301-L367
 
 第一段循环处理必须 mask 的 block，例如 K 长度不是 tile 整数倍、causal 尾部、local window 边界；第二段循环处理不需要复杂 masking 的 block，但仍会调用 mask 的统一入口来处理 local 或非整齐边界。来源：csrc/flash_attn/src/flash_fwd_kernel.h L290-L430
 
-这里要纠正一个常见误解：FlashAttention 不是“不算 attention matrix”，而是不把完整 attention matrix 长期物化到 HBM。`acc_s/rP` 仍然是局部 attention score/probability tile，但它的生命周期只覆盖当前 K/V block，马上被折叠进 `acc_o`。
+这里要纠正一个常见误解：FlashAttention 不是“不算 attention score”，而是不把完整 `Sq×Sk` score/probability 矩阵长期物化到 HBM。`acc_s` 是局部 score，online update 后承载未归一化指数权重；`rP` 是其低精度副本。它们的生命周期只覆盖当前 K/V block，马上被折叠进尚未最终归一化的 `acc_o`。
 
 ## Online softmax：为什么 LSE 能替代完整概率矩阵
 
@@ -196,15 +203,15 @@ mask 的实现也发生在 tile 内。普通越界 mask 看列号是否超过 `m
 
 主循环结束后，kernel 进入 epilogue。它调用 `normalize_softmax_lse` 得到 `lse` 并归一化 `acc_o`，把 `acc_o` 转成输入元素类型 fp16/bf16，先写到 shared memory 的输出 tile，再拷到 global memory 的 `out`。同时它把每行 `lse` 写入 `softmax_lse` 对应位置。来源：csrc/flash_attn/src/flash_fwd_kernel.h L431-L494
 
-最终固定输出是：
+CUDA backend 内部固定产生 out/LSE 协议对象；公开 API 默认只返回 out：
 
 ```text
 out:          B x Sq x H x D
 softmax_lse: B x H x Sq
-p/S_dmask:   只有 return_softmax 且 dropout_p > 0 时才有真实矩阵
+p/S_dmask:   只有 return_softmax 且 dropout_p > 0 时分配；testing only，不保证是标准概率
 ```
 
-这也解释了为什么 `return_attn_probs=True` 不是日常调试开关。Python 文档已经说明它是 testing only；C++ 还要求 `return_softmax` 时 dropout 必须大于 0，目的是减少编译组合和运行时开销。来源：flash_attn/flash_attn_interface.py L1203-L1215；来源：csrc/flash_attn/flash_api.cpp L441-L447
+这也解释了为什么 `return_attn_probs=True` 不是日常观测接口。Python 文档已经说明它是 testing only；Python 只有在 dropout>0 时向 backend 请求 softmax 调试输出，C++ 也只在 `return_softmax && p_dropout > 0` 时分配 `p`，以避免无用 buffer 与模板组合。来源：flash_attn/flash_attn_interface.py L1203-L1215；来源：csrc/flash_attn/flash_api.cpp L441-L447
 
 ## 运行验证
 
@@ -239,18 +246,33 @@ print((out - ref).abs().max())
 | 传入 `D > 256` | C++ 入口报 head dim 上限错误。来源：csrc/flash_attn/flash_api.cpp L392-L395 |
 | 用 profiler 看 kernel | 能看到 `flash_fwd_kernel` 或对应实例；不同 `D/causal/dropout` 会改变模板组合。来源：csrc/flash_attn/src/flash_fwd_launch_template.h L79-L92 |
 
-上游还专门有 race condition 测试：固定随机种子，多次运行 `flash_attn_func(..., return_attn_probs=True)`，要求 `out` 和 `lse` 重复一致。这类测试说明 `lse` 不只是附带输出，它是 forward 稳定性和 backward 复现的重要观测点。来源：tests/test_flash_attn.py L2197-L2228
+上游还专门有 race condition 测试：固定随机种子，多次运行 `flash_attn_func(..., return_attn_probs=True)`，要求 `out` 和 `lse` 重复一致。它证明该测试覆盖的 forward 输出/LSE 重复性；不能仅凭这段测试外推所有 dropout、backward 或 backend 的确定性。来源：tests/test_flash_attn.py L2197-L2228
 
 ## 常见卡点
 
 | 症状 | 先看哪里 | 判断方式 |
 |------|----------|----------|
-| import 失败或没有 CUDA 扩展 | Python 文件开头的 `flash_attn_2_cuda` 导入 | 判断是不是 ROCm/Triton AMD fallback 或安装未编译 extension。 |
+| import 失败或没有 CUDA 扩展 | Python 文件开头的 backend 路由 | 先区分 CUDA、ROCm CK、ROCm Triton；普通 CUDA 不自动 fallback。 |
 | 报 dtype/device/contiguous 错 | `mha_fwd` 参数检查 | 这些错误在 launch 之前发生，不要去 kernel 里找。 |
-| `return_attn_probs=True` 没返回期望矩阵 | Python 文档与 C++ `return_softmax` 条件 | 它是测试选项，且 C++ 只在 dropout 路径分配真实 `p`。 |
+| `return_attn_probs=True` 没返回期望矩阵 | Python 文档与 C++ `return_softmax` 条件 | 它是测试选项；dropout=0 第三项为空，dropout>0 的 `p/S_dmask` 也不保证是标准概率。 |
 | 性能随 head dim 或 causal 改变很大 | head-dim launch helpers | tile shape、warps、shared memory 组合会变。 |
 | 以为 varlen 也走同一组 stride | `set_params_fprop` 的 `cu_seqlens_*` 分支 | fixed-length 用 batch stride，varlen 用累计长度。 |
 | 想找完整 attention matrix | kernel 主循环和 epilogue | 常规路径只保留局部 tile、`acc_o`、`softmax_lse`，不写完整矩阵。 |
+
+无可加载 CUDA backend 时，执行静态替代：
+
+```powershell
+@'
+import ast
+from pathlib import Path
+ast.parse(Path("flash-attn/flash-attention/flash_attn/flash_attn_interface.py").read_text(encoding="utf-8"))
+print("Python interface AST: PASS")
+'@ | python -
+
+rg -n 'mha_fwd|set_params_fprop|run_mha_fwd|softmax_rescale_o|normalize_softmax_lse' flash-attn/flash-attention/csrc/flash_attn
+```
+
+预期能静态定位 CUDA compiled 主线的 C++ 入口、参数冻结、dispatch、online update 与 epilogue。它不证明实际 backend、ABI、GPU 数值或性能。
 
 ## 读完后的迁移
 

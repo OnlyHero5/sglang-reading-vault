@@ -1,14 +1,14 @@
 ---
 title: "AI Infra Reading Vault"
-type: readme
+type: reference
 framework: cross-framework
 topic: "项目说明"
 learning_role: reference
 tags:
   - framework/cross-framework
-  - content/readme
+  - content/reference
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # AI Infra Reading Vault
@@ -32,6 +32,8 @@ updated: 2026-07-10
 | 维护层 | 命名规范、写作标准和自动审计 |
 
 读者不需要按目录顺序读完全部笔记。核心课程负责形成连续学习体验，框架专题作为深入和查阅材料。
+
+三套源码在知识库中承担不同尺度的教学任务，不应被误读为固定运行依赖：FlashAttention 用于解释 attention kernel，并不保证某次 SGLang 运行实际命中本仓库实现；真实 backend 需由版本、配置、dispatch 和 profiler 共同确认。
 
 ## 入口
 
@@ -80,6 +82,7 @@ sglang/ slime/ flash-attn/  upstream 只读基线
 node maintenance/audit_wikilinks.mjs
 node maintenance/audit_source_evidence.mjs
 node maintenance/audit_markdown_quality.mjs
+git -c core.autocrlf=false diff --check
 ```
 
 详细规则见 [Obsidian知识库规范.md](maintenance/Obsidian知识库规范.md) 和 [源码阅读写作标准.md](maintenance/源码阅读写作标准.md)。

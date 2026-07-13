@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 模型初始化 · 源码走读
 
@@ -62,7 +62,7 @@ flowchart TD
 设计选择：actor 的 `init` 调 `initialize_model_and_optimizer`，随后备份 actor 权重、按需加载 ref/teacher/old_actor，再根据 colocate/delta/full 选择 weight updater。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L83-L168
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L83-L168
 self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
     args,
     role=self.role,
@@ -87,6 +87,7 @@ self.weight_updater = update_weight_cls(
 执行逻辑：
 
 - `loaded_rollout_id` 来自 checkpoint iteration，外层会用它对齐恢复训练。
+- actor 返回的是 `loaded_rollout_id + 1`；只有 `args.start_rollout_id` 仍为 `None` 时，placement 层才采用这个返回值。Bridge/HF 参数校验通常已显式写成 0，因此不能把 actor 返回值无条件等同于最终起点。
 - `weights_backuper` 和 `weight_updater` 都依赖同一个初始化后的 model。
 - ref/teacher/old_actor 是在 actor 模型装配完成后加载到同一个备份系统里。
 
@@ -97,7 +98,7 @@ self.weight_updater = update_weight_cls(
 设计选择：`_get_model_provider_func` 按优先级返回 provider：custom path 优先，其次 Bridge，最后 legacy/MCore GPTModel。
 
 ```python
-# 来源：slime/backends/megatron_utils/model_provider.py L61-L123
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model_provider.py L61-L123
 if getattr(args, "custom_model_provider_path", None):
     def wrapped_model_provider(...):
         custom_model_provider = load_function(args.custom_model_provider_path)
@@ -116,7 +117,7 @@ if args.megatron_to_hf_mode == "bridge":
     return provider.provide
 ```
 
-不变量：custom provider 如果用于 critic，必须能提供 `model.config.hidden_size`，否则无法替换 value head。
+不变量：custom provider 如果用于 critic，必须能提供 `model.config.hidden_size`，否则无法替换 value head。当前 wrapper 只向用户 provider 传 `pre_process/post_process` 和可选 `vp_stage`；即使底层函数声明 `config` 或 `pg_collection`，外层包装签名也不会把它们透传，接新版 Megatron provider 协议时要实测。
 
 ## 3. legacy provider 构建 GPTModel，并按 role 替换 output layer
 
@@ -125,7 +126,7 @@ if args.megatron_to_hf_mode == "bridge":
 设计选择：有 `args.spec` 时加载自定义 spec；有 MoE 时用 decoder block spec；否则按 TransformerEngine/local spec 构造。critic 只在 post-process stage 替换 output layer。
 
 ```python
-# 来源：slime/backends/megatron_utils/model_provider.py L125-L240
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model_provider.py L125-L240
 config = core_transformer_config_from_args(args)
 ...
 if args.spec is not None:
@@ -146,7 +147,7 @@ if post_process and role == "critic":
 `LinearForLastLayer` 输出 float value，并在 sequence parallel 时 gather：
 
 ```python
-# 来源：slime/backends/megatron_utils/model_provider.py L25-L58
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model_provider.py L25-L58
 logits = super().forward(input_)
 logits = logits.float()
 if self.sequence_parallel:
@@ -161,7 +162,7 @@ return logits, None
 设计选择：`get_model_provider_func` 总是把真实 provider 包进 `wrap_model_provider_with_freeze`。
 
 ```python
-# 来源：slime/backends/megatron_utils/model_provider.py L245-L286
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model_provider.py L245-L286
 def get_model_provider_func(args, role="actor"):
     return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
 
@@ -181,6 +182,8 @@ def freeze_model_params(model, args):
 
 源码入口：来源：slime/utils/arguments.py L1977-L1978
 
+失败边界：正则不在参数阶段编译，非法表达式会延迟到模型构造；allowlist 零命中会冻结所有参数，blocklist 零命中会静默 no-op。初始化日志至少应记录 trainable parameter count，并抽样参数名。
+
 ## 5. setup_model_and_optimizer 把 provider 交给 Megatron
 
 系统压力：Slime 不直接 new DDP chunks，而是交给 Megatron `get_model`，这样 PP/VPP/TP/EP 的切分仍由 Megatron 管理。
@@ -188,7 +191,7 @@ def freeze_model_params(model, args):
 设计选择：`setup_model_and_optimizer` 调 `get_model(provider)`，再按 args 生成 `OptimizerConfig`、Megatron optimizer 和 scheduler。
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L270-L318
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model.py L270-L318
 assert not args.moe_use_upcycling
 assert args.load is not None or args.pretrained_checkpoint is not None
 
@@ -208,6 +211,8 @@ opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
 
 读者抓手：如果 optimizer 包含了不该训练的参数，回到 provider freeze；如果模型 chunk 数不对，回到 Megatron parallel args 和 provider。
 
+还要核对 load 的真实门禁：setup 虽接受 `pretrained_checkpoint` 非空，但 initialize 后续的 Slime loader 无条件读取 `args.load` 并要求目录存在且非空。生产配置必须审计解析后的 `args.load`，不能只凭 setup 断言判断可加载。
+
 ## 6. scheduler 的步数来自估算，训练时按实际 step 推进
 
 系统压力：LR schedule 需要初始化时知道衰减步数，但 RL 训练中真实样本数可能被过滤、动态 batch 或自定义采样改变。
@@ -215,7 +220,7 @@ opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
 设计选择：初始化时估算 `train_iters` 和 decay steps；训练时 `opt_param_scheduler.step(increment=step_global_batch_size)` 按实际 step 推进。
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L182-L235
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model.py L182-L235
 args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
 if args.lr_decay_iters is None:
     args.lr_decay_iters = args.train_iters
@@ -236,10 +241,10 @@ opt_param_scheduler = OptimizerParamScheduler(
 
 系统压力：actor 从 LM checkpoint 恢复很自然，但 critic output head 可能不存在或 shape 不同。不能静默使用错误 head。
 
-设计选择：load 前先检查 critic output layer metadata，load 后必要时重置 critic head，并在 fp16/bf16 下 reload optimizer model params。
+设计选择：对带 `.metadata` 的分布式 checkpoint，load 前检查 critic output layer metadata，load 后必要时重置 critic head，并在 fp16/bf16 下 reload optimizer model params。
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L125-L180
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model.py L125-L180
 if role != "critic" or args.load is None:
     return False
 ...
@@ -256,7 +261,7 @@ return True
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L968-L1007
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model.py L968-L1007
 model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
 model[0].role = role
 reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
@@ -270,6 +275,10 @@ clear_memory()
 return model, optimizer, opt_param_scheduler, iteration
 ```
 
+这条补救有严格边界：没有 `.metadata` 就直接判定“不需要重置”；真正重置又发生在 load 成功之后。若 loader 对 LM head→value head 的 shape mismatch 先行报错，控制流到不了 reinit。HF Bridge 则只加载 HF 权重并返回 iteration 0，不恢复 optimizer/scheduler/RNG；Megatron checkpoint 才委托上游完整恢复。
+
+`checkpoint.py` 还在 import 时全局替换 `EnumerableShardingSpec.__post_init__` 与 `ShardedTensor._init_from_local_shards_and_global_metadata`，跳过部分跨 rank metadata 验证以降低大模型加载开销。这是性能—完整性取舍，不应被“checkpoint load 成功”一句话掩盖。
+
 ## 8. forward_only 复用模型但不进入 backward
 
 系统压力：advantage 阶段需要 old/ref/teacher logprob 和 critic values，但这些 forward 不应更新参数，也不应保存训练梯度。
@@ -277,7 +286,7 @@ return model, optimizer, opt_param_scheduler, iteration
 设计选择：`forward_only` 加 `torch.no_grad()`，切 eval，运行 Megatron pipeline `forward_only=True`，用 callback 生成结果，只在 last PP stage 聚合。
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L344-L506
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/model.py L344-L506
 for iterator in data_iterator:
     iterator.reset()
 ...
@@ -302,6 +311,8 @@ return rollout_data
 ```
 
 `store_prefix` 决定输出键名，例如 `ref_log_probs`、`teacher_log_probs` 或普通 `log_probs`。
+
+异常安全边界：模型先统一 `eval()`，成功结束才统一 `train()`，中间没有 `try/finally`。hook、forward 或聚合异常会留下 mode 漂移。动态 batch 重排也使用 `zip(strict=False)`，仅在 `micro_batch_indices` 是数量相等、无重复且范围合法的 permutation 时才保证顺序恢复；空 `forward_data_store` 会在 `[0]` 处直接失败。
 
 ## 运行验证
 

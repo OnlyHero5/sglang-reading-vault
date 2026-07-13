@@ -9,11 +9,11 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # gRPC-Proto · 源码走读
 
-本篇只追一条主线：网关发起 `TextGenerate(stream=true)`，SGLang 如何把它从 Proto stream 接到 Python `TokenizerManager.generate_request`，再把 chunk 变回 gRPC stream。
+本篇只追 Native Rust 实现的一条主线：网关发起 `TextGenerate(stream=true)`，SGLang 如何把它从 Proto stream 接到 Python `TokenizerManager.generate_request`，再把 chunk 变回 gRPC stream。它解释的是 `sglang.srt.grpc._core.start_server` 可以启动的实现，不代表当前默认 HTTP 分支或 legacy `--grpc-mode` 已经调用这条入口。
 
 ## 读者任务
 
@@ -83,11 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-这个选择和运行方式一致：SGLang 进程内嵌 Rust gRPC server，外部客户端由别的语言或网关生成。
+这个 crate 不生成 Rust client stub，只生成 server stub。外部客户端仍可使用同一份 proto，在 Rust、Go、Java、Python 或其他支持 gRPC 的语言中自行生成客户端；“本 crate 不生成”不等于“Rust 客户端不可生成”。
 
 ## 2. Python 调 `start_server` 后，Rust 自己开 Tokio runtime
 
-`start_server` 是 PyO3 暴露给 Python 的入口。它拿到 `runtime_handle`，但并不在 Python event loop 上跑 Tonic，而是建立单独 Tokio runtime 和后台线程。
+`start_server` 是 Native 扩展暴露给 Python 的可调用入口。当前源码已经实现它，但默认 HTTP 启动链尚未消费 `ServerArgs.enable_grpc/grpc_port`，legacy `--grpc-mode` 也委托外部 servicer；因此这一节只证明实现机制，不证明线上 listener 已自动启动。它拿到 `runtime_handle` 后，不在 Python event loop 上跑 Tonic，而是建立单独 Tokio runtime 和后台线程。
 
 ```rust
 # 来源：rust/sglang-grpc/src/lib.rs L150-L159
@@ -285,7 +285,7 @@ pub(crate) fn build_text_generate_dict(
 Python 侧 `RuntimeHandle` 持有 `tokenizer_manager`，并确保 TokenizerManager 的 handle loop 已建立：
 
 ```python
-# 来源：python/sglang/srt/entrypoints/grpc_bridge.py L55-L80
+# 来源：python/sglang/srt/entrypoints/grpc_bridge.py L55-L79
 class RuntimeHandle:
     """Thin Python handle that the Rust gRPC server calls into.
 
@@ -627,11 +627,11 @@ Python 侧看到 `Pending` 后，会等 Rust on-ready 唤醒；如果 300 秒没
         return True
 ```
 
-这就是“慢客户端不会让 Python 无限堆 chunk”的源码证据。
+这就是“慢客户端不会让 Python 无限堆 chunk”的源码证据。准确状态机是：channel 有空间时 `Ready`；首次满时 park 一个 chunk 并返回 `Pending`；Python 应等待 on-ready；若 parked chunk 尚未 drain，producer 又发送第二个 chunk，bridge 才以 `ChannelFull` 关闭并 abort。bounded channel 和一个 parked send 共同构成上限。
 
-## 9. 客户端断开会传播 abort
+## 9. 四种终止路径必须分开
 
-stream 被 drop 时，`RequestAbortGuard` 会调用 `bridge.abort`，再由 Python 转给 `TokenizerManager.abort_request`。
+客户端丢弃 Tonic stream 时，`RequestAbortGuard` 会调用 `bridge.abort`，再由 Python 转给 `TokenizerManager.abort_request`。但它只是异常终止的一条路径：receiver closed 会记录 `ClientDisconnected`，等待 chunk 超时会主动 `abort_now`，显式 `Abort` RPC 则直接进入 abort handler；正常 `Finished` 和已经封装成 `ResponseChunk::Error` 的 Python 终态会 disarm guard。
 
 ```rust
 # 来源：rust/sglang-grpc/src/server.rs L88-L139
@@ -764,7 +764,7 @@ fn resolve_max_message_size() -> usize {
 }
 ```
 
-认证还没有和 HTTP 对齐，因此源码注释明确不能默认暴露：
+Native Tonic listener 的认证还没有和 HTTP 对齐，因此源码注释明确不能默认暴露。这个安全结论不能自动扩展到外部 `smg-grpc-servicer`，后者需按安装版本单独核验：
 
 ```rust
 # 来源：rust/sglang-grpc/src/server.rs L973-L1007
@@ -807,13 +807,16 @@ pub async fn run_grpc_server(
 
 ## 运行验证
 
-可以用三类现象验证这条主线：
+先用静态检查确认“实现存在”和“启动接线存在”是两回事，再按环境补编译或运行验证：
 
 | 验证点 | 方法 | 预期现象 |
 |--------|------|----------|
-| `--grpc-mode` 启动路径 | 启动时传 `--grpc-mode` | 进入 `serve_grpc`，若缺 `smg-grpc-servicer` 会在 import 阶段报错 |
-| Native Rust 扩展存在 | `python -c "import sglang.srt.grpc._core as c; print(hasattr(c, 'start_server'))"` | 安装 wheel 包含 Rust 扩展时输出 `True` |
-| backpressure/abort | 客户端发起 stream 后停止读取或断开 | Rust 侧出现 channel/abort 相关日志，Python 侧调用 `abort_request` |
+| legacy 分发 | `rg -n "grpc_mode|serve_grpc" sglang/python/sglang/launch_server.py` | `grpc_mode` 分支早于默认 HTTP 分支，并导入 `entrypoints.grpc_server` |
+| Native 配置是否已接线 | 搜索 `enable_grpc|grpc_port|start_server` 的生产调用点 | 能看到 `ServerArgs` 解析和扩展定义，但默认 HTTP 启动链没有消费调用 |
+| Python bridge 语法 | 对 `grpc_bridge.py`、`grpc_server.py` 运行 `python -m py_compile` | 四个入口文件编译通过；若 import SGLang 失败，应区分语法检查与 Windows/POSIX 依赖问题 |
+| Rust crate | `cargo test --manifest-path "sglang/rust/sglang-grpc/Cargo.toml"` | toolchain、protoc 和依赖齐全时完成编译/测试；失败先按构建依赖定位，不冒充 listener smoke test |
+| Native Rust 扩展存在 | `python -c "import sglang.srt.grpc._core as c; print(hasattr(c, 'start_server'))"` | 只有安装产物包含 Rust 扩展且 SGLang 依赖可导入时才输出 `True` |
+| backpressure/abort | 合格 Linux 环境中让 client 停止读取或断开 | `Pending/on-ready` 或 disconnect/abort 日志能沿同一 `rid` 对齐，活动请求最终释放 |
 
 ## 复盘
 

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 分布式权重同步 · 源码走读
 
@@ -222,7 +222,7 @@ def get_updatable_engines_and_lock(self):
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L268-L314
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L284-L314
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L284-L314；省略默认 GPU count 与 rank-offset 注释）
 master_address = ray._private.services.get_node_ip_address()
 with socket.socket() as sock:
     sock.bind(("", 0))
@@ -257,6 +257,8 @@ return model_update_groups
 
 读者抓手：如果 engine 重启或 fault tolerance 创建新 engine，`num_new_engines > 0` 会触发重新 connect。
 
+重连不是无状态替换：updater 先覆盖 `self.rollout_engines`，再在旧 process group 存在时调用 disconnect，因此 destroy RPC 面向的是新列表。若 fault tolerance 真正替换旧 actor，必须额外确认旧 group 已随 actor 退出或被显式清理。
+
 ## 6. update_weights 是 pause → send → continue
 
 系统压力：推理请求不能在权重更新过程中继续消费旧 KV 或半更新参数；量化模型还可能需要加载前后的 post-process。
@@ -266,7 +268,7 @@ return model_update_groups
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L102-L134
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L107-L134
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L107-L134；省略量化参数换行）
 self.weight_version += 1
 
 if dist.get_rank() == 0:
@@ -297,6 +299,8 @@ dist.barrier(group=get_gloo_group())
 
 失败模式：如果 pause 成功但 continue 前异常，engine 会停在暂停状态；排查时同时看训练 actor 日志和 engine HTTP 日志。
 
+此外 `weight_version` 在 pause 前就递增，整个方法没有 `try/finally`。失败后版本不回退，generation、量化 restore/post-process 和末尾 barrier 也不保证收尾；它是分阶段协议，不是原子切换。
+
 ## 7. 非 expert bucket：TP gather 后立即转换成 HF
 
 系统压力：Megatron tensor 可能是 TP shard；SGLang engine 需要 HF 命名的完整 tensor。一次性转换全模型会有峰值显存和通信压力。
@@ -306,7 +310,7 @@ dist.barrier(group=get_gloo_group())
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L153-L176
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L153-L176
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L153-L176；省略类型标注与尾部 flush）
 def _iter_non_expert_chunks(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
     buffer_size = 0
     buffer: list[tuple[str, torch.Tensor]] = []
@@ -329,6 +333,8 @@ def _iter_non_expert_chunks(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
 ```
 
 源码入口：来源：slime/backends/megatron_utils/update_weight/common.py L15-L50
+
+bucket 阈值只决定何时 flush 已有 buffer。若单个 `hf_chunk` 本身大于 `update_weight_buffer_size`，源码不会继续拆 tensor，仍会发送超限 bucket；所以配置值不能当成显存峰值硬上限。
 
 ## 8. Expert bucket：先 TP，再 EP，再转换
 
@@ -392,6 +398,8 @@ converted_named_tensors.clear()
 ray.get(self.rollout_engine_lock.release.remote())
 pbar.update(1)
 ```
+
+这一段没有 `try/finally` 和 acquire timeout。update RPC、NCCL handle 或 engine ref 任一失败，都可能留下永久占用的 Ray lock；`converted_named_tensors.clear()` 也只有成功路径执行。
 
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L326-L355
 
@@ -466,7 +474,7 @@ def update_weights_from_distributed(
 源码入口：来源：slime/backends/megatron_utils/actor.py L625-L648
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L625-L648
+# 定位骨架（基于 slime/backends/megatron_utils/actor.py L625-L648；省略内存日志与 old-actor 分支细节）
 with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
     print_memory("before update_weights")
     self.weight_updater.update_weights()
@@ -489,6 +497,8 @@ with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             self.weights_backuper.backup("old_actor")
 ```
 
+CI 只随机抽一个 engine；抽查通过不能证明所有 engine、所有 PP stage 都完成。生产验收若要证明无混权重，应枚举全部 engine version，并结合每个 bucket 的 metadata/broadcast 完成记录。
+
 ## 运行验证
 
 - 开启 `--ci-test`：预期每轮更新后不会触发 `Weight version mismatch`。
@@ -503,3 +513,5 @@ with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
 - PP source rank 发权重，非 source rank 仍参与 collective。
 - `rollout_engine_lock` 保护 engine recv 顺序，不是装饰性锁。
 - `weight_version` 是闭环验收信号，能把训练侧和 rollout 侧连起来。
+- 它不是原子 commit id：发送前递增、失败不回退、CI 只做单 engine 随机抽查。
+- pause/continue、Ray lock 与旧 group 清理没有统一回滚，失败恢复必须逐项审计。

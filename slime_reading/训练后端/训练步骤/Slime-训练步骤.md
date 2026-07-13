@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练步骤
 
@@ -27,10 +27,12 @@ RolloutManager 已经把一次 rollout 的样本放进 Ray Object Store。Train 
 - 动态 batch 下 `num_microbatches` 和 `global_batch_sizes` 对不上。
 - rollout log-prob、ref log-prob、actor train log-prob 口径混淆。
 - offload、routing replay、pipeline last stage 造成的训练分支误判。
+- actor/critic 使用不同 TP/PP/CP/DP 配置时，为什么 values 可能送到错误 worker，甚至 rollout 分片配置被 critic 覆盖。
+- 训练异常后为什么不能默认原地重试，以及 async 模式的 policy lag 到底有几层。
 
 ## 一句话模型
 
-Train Step 是一个 **两遍训练转换器**：第一遍把 rollout 包恢复成 GPU 上的训练字段，并补齐 log-prob/value/advantage；第二遍把这些字段交给 Megatron pipeline 做 backward、optimizer step 和日志。
+Train Step 是一个 **分阶段训练事务**：先恢复 rank-local 数据，再按配置执行零到多次 aux forward，补齐 value/log-prob/advantage，最后进入一个或多个 Megatron optimizer step。它没有统一回滚；任何阶段失败，都可能留下 iterator、模型 mode、DDP hook、梯度、offload 或环境变量状态。
 
 ```mermaid
 flowchart LR
@@ -73,7 +75,7 @@ sequenceDiagram
   T->>A: async_train(rollout_id, ref, external_data=value_refs)
   A->>M: logprob forward + policy train
   A-->>T: done
-  T->>R: update_weights
+  T->>R: sync 模式每轮；async 模式按 interval update_weights
 ```
 
 源码入口：来源：train.py L63-L89
@@ -83,7 +85,8 @@ sequenceDiagram
 - Ray 边界：主进程只拿 ObjectRef，不直接训练。
 - DP 边界：每个 Megatron DP rank 只取自己的 `Box`。
 - PP 边界：只有 pipeline last stage 产出 `values/log_probs/advantages`。
-- 闭环边界：actor train 完成后，下一步才把权重推回 rollout engines。
+- 闭环边界：同步主循环在 actor train 后立即推权重；async 主循环按 interval 推送，不能把 optimizer 完成等同于 rollout engine 已更新。
+- 拓扑边界：critic refs 按 worker 序号交给 actor，RolloutManager 的训练并行配置又会被最后调用 `set_rollout_manager` 的 critic rank 0 覆盖；启用 critic 时不能只保证 GPU 总数相同，还要核对 TP/PP/CP/DP 与 PP-last-stage rank 映射。
 
 ## 与上下游的关系
 
@@ -101,4 +104,6 @@ sequenceDiagram
 - PPO + Critic：看 `tests/test_qwen3_4B_ppo.py`，关注 `--use-critic`、`--num-critic-only-steps`、`--advantage-estimator ppo`。
 - Debug 复放：用 rollout debug 数据验证 `_get_rollout_data → train_actor`，不用重新跑 SGLang。
 - 日志：关注 `train/step`、`train/*global_batch_size`、`train/ppo_kl`、`train/kl_loss`、`train/train_rollout_logprob_abs_diff`。
+- 状态：异常前后记录 iterator offset、`model.training`、`config.no_sync_func/param_sync_func`、GC enabled、grad buffer 和 offload 状态；当前训练路径没有事务式恢复。
+- async policy lag：记录 rollout 生成时的权重版本、训练完成版本和实际同步版本；`update_weights_interval=N` 表示 rollout engine 最多跨多个 actor step 才更新，且 interval 边界会先等待已启动的下一轮生成，再同步权重。
 - 审计：本专题的源码引用应通过 `node maintenance\audit_source_evidence.mjs --note ...`。

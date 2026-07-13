@@ -26,6 +26,8 @@ updated: 2026-07-10
 | GPU slot 满、eviction 异常、pinned adapter 饥饿 | LoRAMemoryPool / eviction policy |
 | MoE LoRA shape mismatch | MemoryPool 的 EP/TP expert buffer 规则 |
 | embedding 或 lm_head LoRA 行为不符合预期 | LoRAManager target modules 与 mem_pool 加载分支 |
+| load/unload 返回失败后状态怪异 | registry、`lora_ref_cache`、worker CPU 字典、GPU pool 四方对账 |
+| lm_head + input logprobs 才崩 | Triton per-pass `lm_head_batch_info` 构造 |
 
 ## 1. 请求带了 LoRA，为什么直接报没有启用
 
@@ -75,7 +77,7 @@ updated: 2026-07-10
 
 ## 3. 动态加载为什么在 DP 下不可用
 
-当前动态 load/unload 路径在 TokenizerManager 里有硬断言：`dp_size` 必须为 1。这是源码现状，不是文档漏写。
+当前动态 load/unload 路径在 TokenizerManager 里有硬断言：`dp_size` 必须为 1。这是源码现状，不是文档漏写。还要注意该断言抛 `AssertionError`，而方法尾部只捕获 `ValueError`；因此不能保证 API 总能返回结构化 `success=false`，实际可能表现为未处理异常/5xx。
 
 ```python
 # 来源：python/sglang/srt/managers/tokenizer_control_mixin.py L554-L558
@@ -187,7 +189,7 @@ LoRA 准入看的是 adapter 种类和 slot，不只是 token 或 request 数。
             )
 ```
 
-验证方法：打印 `running_loras` 和候选 request 的 `req.lora_id`。如果唯一 adapter 数超过 `max_loras_per_batch`，它不会进入本轮 batch。
+验证方法：打印 `running_loras` 和候选 request 的 `req.lora_id`。如果唯一 uid 数（包括 base 的 `None`）超过 `max_loras_per_batch`，它不会进入本轮 batch。
 
 ## 8. pinned adapter 为什么可能让普通 adapter 饿死
 
@@ -254,7 +256,7 @@ LoRA 准入看的是 adapter 种类和 slot，不只是 token 或 request 数。
 
 ## 10. strict loading 到底控制什么
 
-当 adapter 里有权重名匹配不上当前 target modules，memory pool 会构造 warning 或 error。`lora_strict_loading=True` 时直接失败；否则 warning 后跳过。
+当 adapter 里有权重名匹配不上当前 target modules，memory pool 的预检会构造 warning 或 error。`lora_strict_loading=True` 时直接失败；非 strict 时虽然先 warning，但当前实现随后仍在真实加载循环中无条件调用 `get_target_module_name`。因此“warning 后可靠跳过”不是当前基线能兑现的契约，真正未知的 layer weight 仍可能导致 load 失败。
 
 ```python
 # 来源：python/sglang/srt/lora/mem_pool.py L814-L826
@@ -273,7 +275,7 @@ LoRA 准入看的是 adapter 种类和 slot，不只是 token 或 request 数。
                 logger.warning(msg)
 ```
 
-验证方法：如果输出质量异常但没有 load 失败，查日志里是否有 skipped weights warning。生产建议对新 adapter 先用 strict loading 做验收。
+验证方法：如果看到 skipped weights warning，继续观察最终 load 结果和 worker 状态，不要把 warning 当作已成功跳过。生产验收应优先修正 adapter/base target-module 对齐；strict 模式只负责更早失败，并不能修复非 strict 后续再次解析的问题。
 
 ## 11. MoE LoRA 在 EP/TP 下为什么容易 shape mismatch
 
@@ -342,18 +344,44 @@ lm_head LoRA B 分支：
 
 验证方法：排查 embedding 或 lm_head adapter 时，不要只看普通 Linear LoRA 的 A/B 切片规则。要分别看 embedding、lm_head 和 PP rank 所在分支。
 
+## 13. load 返回失败，为什么 worker 内仍可能残留状态
+
+动态加载至少有两层非事务边界。worker 内部先把 config 写入 `self.configs`，再加载权重；异常只返回失败，没有 rollback。控制面则先让 backend 成功，再 register；若 register/LRU 收口失败，也不会撤销 backend 已完成的加载。
+
+验证方法：失败后同时检查 `LoRARegistry.get_all_adapters()`、`lora_ref_cache`、各 worker 返回的 `loaded_adapters`，以及 `LoRAManager.configs/loras/lora_refs`。不要仅凭 HTTP status 推断所有 rank 都回到旧状态。
+
+## 14. unload 成功或失败后，GPU slot 为什么还看得到旧 ID
+
+`LoRAManager.unload_lora_adapter` 只删除 CPU 字典和 pinned 计数，没有删除 `memory_pool.uid_to_buffer_id`。旧 GPU slot 会留作冷 cache，直到后续 batch 需要 slot 时被 eviction。显式 unload 也不删除 TokenizerManager 的 `lora_ref_cache`，所以未来同名请求可以隐式 reload，并生成新的动态 ID。
+
+验证方法：区分“名称当前不可 acquire”“worker CPU adapter 已删除”“GPU slot 已擦除”三个命题。前两者成功也不能推出第三个；reload 后还应确认请求使用新 ID，而不是旧 pool uid。
+
+## 15. 为什么 pool 映射缺失时可能不是报错，而是读到 slot 0
+
+`LoRAManager.prepare_lora_batch` 把 `weight_indices` 初始化为全 0；若 uid 不在 `uid_to_buffer_id`，循环直接 continue。正常调度应先 fetch/等待 overlap event，但一旦控制面与 pool 状态失配，这里没有 fail fast。slot 0 可能属于 base，也可能属于其他 adapter。
+
+验证方法：出现疑似串 adapter 时同时打印 `forward_batch.lora_ids`、`uid_to_buffer_id`、`buffer_id_to_uid` 和最终 `weight_indices`。发现 uid 缺失时应在进入 kernel 前停止，而不是把 0 当作合法 base 默认值。
+
+## 16. lm_head 只在 input logprobs 分块时崩，查哪里
+
+Triton backend 的 per-pass 构造创建局部空列表，却向 `self.lm_head_pass_batch_infos` append；首轮该成员为 `None`。触发条件是 lm_head 被 LoRA target、extend 请求需要 input logprobs、启用 logits processor chunking，且 pruned token 数超过 chunk size。普通 decode、无 lm_head LoRA 或短 prefill 都可能绕过，所以基础 smoke test 不足以发现。
+
+验证方法：构造长 prompt + `return_logprob`/input logprobs，令 pruned token 数跨过 `SGLANG_LOGITS_PROCESSER_CHUNK_SIZE`；预期当前基线可在 `_prepare_lm_head_batch_info` 观察到 `NoneType.append`。修复后应验证每个 pass 的 `expected_tokens` 与实际 hidden-state chunk 一致。
+
 ## 排障入口矩阵
 
 | 你看到的现象 | 第一断点 | 预期变量 |
 |--------------|----------|----------|
-| 请求直接 400 | `TokenizerManager._validate_and_resolve_lora` | `enable_lora`、`obj.lora_path` |
-| 动态 load 400 | `TokenizerManager.load_lora_adapter` | `dp_size`、`result.success` |
+| 请求直接 4xx | `TokenizerManager._validate_and_resolve_lora` | `enable_lora`、`obj.lora_path` |
+| 动态 load 4xx/5xx | `TokenizerManager.load_lora_adapter` | `dp_size`、异常类型、`result.success` |
 | adapter 加载后请求仍找不到 | `LoRARegistry.acquire` | `_registry` 是否含请求 name |
 | batch 进不去 | `Scheduler._can_schedule_lora_req` | `running_loras`、`new_lora_set` |
 | slot 满 | `LoRAMemoryPool.prepare_lora_batch` | `cur_uids`、`candidates` |
 | 输出串 adapter | `Req.__init__` | `extra_key` 是否含 `lora_id` |
 | kernel 读错 slot | `LoRAManager.prepare_lora_batch` | `uid_to_buffer_id`、`weight_indices` |
 | MoE shape mismatch | `LoRAMemoryPool.__init__` | `moe_tp_size`、`moe_ep_size` |
+| load/unload 后状态分叉 | control mixin + `LoRAManager` | registry/cache/CPU dict/pool uid 四方状态 |
+| lm_head logprobs 分块崩溃 | Triton `_prepare_lm_head_batch_info` | `pass_segments`、局部/成员 list、`expected_tokens` |
 
 ---
 
@@ -371,5 +399,6 @@ rg -n "_validate_and_resolve_lora|LoRARegistry|load_lora_adapter|_can_schedule_l
 - Scheduler 仍负责 batch 准入时的 LoRA 约束。
 - `lora_manager.py` 与 `mem_pool.py` 仍负责 adapter 加载、slot 分配、strict loading、MoE TP 规则。
 - `schedule_batch.py` 仍能体现 `lora_id` 参与请求缓存隔离。
+- 当前基线的 non-strict unknown weight、缺失 uid 默认 slot 0、lm_head pass list 三处边界应保留为显式检查项，直到 upstream 修复并有回归测试。
 
 如果排障入口被挪到新组件，应先更新排障入口矩阵，再检查核心概念和数据流页是否仍准确。

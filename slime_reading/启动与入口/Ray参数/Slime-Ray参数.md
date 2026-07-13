@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Ray参数
 
@@ -32,7 +32,7 @@ flowchart LR
     SG["sglang_parse_args<br/>推导 SGLang TP 默认值"]
     MEG["megatron_parse_args<br/>合并 Slime 参数"]
     VAL["slime_validate_args<br/>改写资源事实"]
-    EXT["external discovery<br/>读取 /server_info"]
+    EXT["validator 内的 external discovery<br/>读取 /server_info"]
     PG["create_placement_groups<br/>切 actor / rollout 视图"]
     RUN["RolloutManager / SGLangEngine<br/>启动运行对象"]
 
@@ -41,8 +41,7 @@ flowchart LR
     PRE --> MEG
     SG --> VAL
     MEG --> VAL
-    VAL --> EXT
-    EXT --> VAL
+    VAL --> EXT --> PG
     VAL --> PG
     PG --> RUN
 ```
@@ -79,14 +78,14 @@ flowchart LR
 | 不变量 | 为什么重要 |
 |--------|------------|
 | `rollout_num_gpus=None` 不是最终事实 | colocate 会在 validate 中默认到 actor GPU，external 会由 discovery 写回；普通 decoupled 运行应显式给出数字 |
-| `--colocate` 是共享物理 GPU 的语义 | placement group 的 actor/rollout offset 会同为 0 |
+| `--colocate` 是资源视图重叠的语义 | rollout offset 为 0；两侧规模不等时重叠的是前缀，不代表双方使用完全相同数量的 GPU |
 | `--offload` 是便利开关 | validate 后会删除 `offload` 字段，只留下 `offload_train` 与 `offload_rollout` |
 | external engines 的 GPU 数来自远端 `/server_info` | 用户 CLI 不是 external GPU 拓扑的最终来源 |
 | `rollout_num_gpus_per_engine` 同时影响 SGLang TP 默认值和 engine 数推导 | 改它会改变单 engine 并行度，也会改变 router 背后的 engine 数 |
 
 ## 运行验证入口
 
-优先跑三类轻量测试：
+优先跑三类 CPU/单元测试；仍需安装各测试导入的 Ray、HTTP 等依赖：
 
 ```powershell
 python -m pytest slime/tests/test_placement_group.py -q
@@ -99,6 +98,8 @@ python -m pytest slime/tests/test_external_sglang_engines.py -q
 - placement group 测试能把 colocate、external、debug、zero rollout 的布局固定下来。
 - argument validation 测试能证明 `rollout_num_gpus=0`、larger rollout、delta + colocate 的边界。
 - external tests 能证明 `/server_info` 会写回 `rollout_num_gpus` 与 `rollout_num_engines`。
+
+当前 Windows 轻量环境中，`test_megatron_argument_validation.py` 14 项通过；placement/external 两组在 collection 阶段分别缺 `ray`、`httpx`。缺依赖时只能静态核对测试矩阵，不能记为测试通过。
 
 ## 衔接
 

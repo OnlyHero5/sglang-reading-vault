@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Megatron-Actor初始化 · 数据流
 
@@ -52,8 +52,8 @@ sequenceDiagram
 | `args` | driver | 每个 actor | Ray 参数序列化 | debug/offload/colocate 分支必须一致 |
 | PyTorch world | actor 内 | 所有 train ranks | `dist.init_process_group` | backend、端口、rank 不一致会卡住 |
 | Megatron 子组 | PyTorch world | Megatron `mpu` | `initialize_model_parallel` | TP/PP/DP/CP/EP 维度配置错会 shape 或通信错误 |
-| HF config/tokenizer | 磁盘/HF cache | 每个 actor | node 内串行读 + gloo barrier | 并发 cache 竞态 |
-| checkpoint iteration | checkpoint | driver | actor 返回 `loaded_rollout_id + 1` | rank 间不一致会触发 assert |
+| HF config/tokenizer | 磁盘/HF cache | 每个 actor | 节点内按 local slot 串行、节点间并发 + 全局 gloo barrier | 首个 reader 失败会拖住所有 rank |
+| checkpoint iteration | checkpoint | driver | actor 返回 `loaded_rollout_id + 1` | 只校验所选 role 的 rank 列表；显式 start id 可覆盖 |
 | rollout manager 引用 | driver | actor group | `set_rollout_manager` | init 阶段没有这个引用，不能推权 |
 
 ## 进程边界：Ray 创建 actor 与 actor init 是两步
@@ -61,7 +61,7 @@ sequenceDiagram
 Ray 创建 actor 时只完成进程、GPU 和环境变量准备；模型还没加载。
 
 ```python
-# 来源：slime/ray/actor_group.py L105-L119
+# 定位骨架（非逐行摘录）：slime/ray/actor_group.py L105-L119
 self._actor_handlers = []
 master_addr, master_port = None, None
 for rank in range(world_size):
@@ -81,7 +81,7 @@ for rank in range(world_size):
 `init` 是后续远程方法调用：
 
 ```python
-# 来源：slime/ray/actor_group.py L121-L128
+# 定位骨架（非逐行摘录）：slime/ray/actor_group.py L121-L128
 def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
     self.args = args
     return [
@@ -120,7 +120,7 @@ Megatron 子组之后由 `initialize.init` 创建。两者的关系是“先 wor
 本专题不展开 provider 和 optimizer 细节，只看对象如何进入 actor 生命周期。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L83-L101
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L83-L101
 self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
     args, role
 )
@@ -155,7 +155,7 @@ def set_rollout_manager(self, rollout_manager):
 init 阶段只创建 `weight_updater` 对象，并把 `rollout_engines` 初始化为 `None`。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L162-L180
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L162-L180
 self.weight_updater = update_weight_cls(
     self.args,
     self.model,
@@ -172,7 +172,7 @@ self.rollout_engines = None
 真正跨到 rollout 侧发生在 `update_weights()`：
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L592-L620
+# 定位骨架（非逐行摘录）：slime/backends/megatron_utils/actor.py L592-L620
 (
     rollout_engines,
     rollout_engine_lock,
@@ -192,7 +192,7 @@ if num_new_engines > 0 or reconnect_rollout_engines:
     )
 ```
 
-因此“init 成功但推权失败”通常不是本专题内部错误，而是 rollout manager、engine lock、NCCL group 或 updater 实现的问题。
+因此“init 成功但推权失败”要继续看 rollout manager、engine lock、NCCL group 与 updater；同时也要检查 actor 是否在 init 后正确收到 `rollout_manager`、offload process groups 是否恢复。不能仅凭 updater 对象已构造就排除 actor 生命周期问题。
 
 ## offload 边界：同一个 actor 在两种资源状态间切换
 
@@ -235,6 +235,8 @@ def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
     return result
 ```
 
+这条自动处理没有 finally：数据预处理、critic/actor train 任一异常都会跳过末尾 sleep。save 与 update_weights 也有同类边界，资源状态不是事务式切换。
+
 group 级也提供批量接口：
 
 ```python
@@ -253,3 +255,4 @@ def offload(self):
 - rollout 样本数据在后续 `train(rollout_data_ref)` 进入，见 [[Slime-训练步骤]]。
 - rollout engines 在 `update_weights()` 时由 rollout manager 提供，不在 init 内绑定。
 - offload 改变的是 actor 的资源状态，不改变 checkpoint 语义。
+- init 与 offload 都没有通用失败回滚；distributed/HF/tag load 中途失败后，旧 actor 不能被视为干净初始态。

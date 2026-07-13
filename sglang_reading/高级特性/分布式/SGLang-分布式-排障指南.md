@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 分布式 · 排障指南
 
@@ -38,9 +38,11 @@ updated: 2026-07-10
         )
 ```
 
-**判断方法：** 不要把 `dp_size` 直接乘进这个等式。这里校验的是单个模型并行 worker 内部的 WORLD，DP Controller 会另起多个 worker 做请求分发。
+**判断方法：** 不要把 `dp_size` 直接乘进这个等式。这里校验的是当前 scheduler 模型 WORLD。普通 DP 会启动多个模型 worker 组；DP-Attention 则在 TP rank 空间中表达 attention DP，二者都不能用“部署总 GPU = 这一处 world_size”替代源码作用域。
 
-**修复方向：** 先核对启动进程数、`tp_size`、`pp_size`。如果你以为 `dp_size=2,tp=4,pp=1` 应该对应 `world_size=8`，那已经把请求 DP 和模型 TP/PP 混在一起了。
+**操作：** 记录报错进程的 `world_size/tp_size/pp_size`，确认它属于哪个 scheduler/DP-Attention 启动分支，再验证 `world_size == tp_size * pp_size`。
+
+**预期：** 当前模型 WORLD 内等式成立；外层 `dp_size` 只影响 worker/rank 布局，不直接进入这条异常消息。
 
 ## 症状 2：DCP 配置看似合理，但初始化失败
 
@@ -70,7 +72,9 @@ updated: 2026-07-10
 
 **判断方法：** DCP 是在 TP group 内部切 decode context，不是跨所有 GPU 任意切。因此先看 `tp_size % dcp_size == 0`。
 
-**修复方向：** 先把 DCP 退回 1 跑通，再提高 DCP；同时确认硬件平台满足 CUDA 或 HIP 条件。
+**操作：** 先设 DCP 为 1 验证基线，再检查平台为 CUDA/HIP 且 `tp_size % dcp_size == 0`，随后一次只提高一个 DCP 配置。
+
+**预期：** DCP=1 可启动；合法平台和整除组合通过前置校验，非法组合在模型加载前给出明确异常。
 
 ## 症状 3：模型层 all-reduce 偶发 graph 或 backend 问题
 
@@ -116,9 +120,11 @@ updated: 2026-07-10
             return input_
 ```
 
-**判断方法：** 不要只问“是不是 NCCL”。先在 `all_reduce` 看 `self.ca_comm`、`self.qr_comm`、`self.pymscclpp_comm`、`self.torch_symm_mem_comm`、`is_in_tc_piecewise_cuda_graph()` 的状态。
+**判断方法：** 不要只问“是不是 NCCL”。先记录 getter 返回的 coordinator `unique_name` 和对象 id，排除 `_ATTN_TP = _TP`、`_MOE_EP = _TP` 等 alias；再看 `ca_comm`、`qr_comm`、`pymscclpp_comm`、`torch_symm_mem_comm`、对称内存与 piecewise graph 状态。
 
-**修复方向：** 让 layer 走 `communication_op.py` helper；如果临时绕过 helper，graph custom op、group name、in-place/out-of-place 语义都可能失配。
+**操作：** 先用对应 `communication_op.py` helper 重现，并暂时只切换一个 backend/graph 条件做对照。
+
+**预期：** helper 进入语义正确的 coordinator；关闭某个优化 backend 后若故障消失，才继续定位该 communicator 的尺寸、注册或 capture 条件。
 
 ## 症状 4：有人在 layer 里裸调 `torch.distributed`
 
@@ -142,7 +148,9 @@ def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Te
 
 **判断方法：** 裸调 `torch.distributed.all_reduce(tensor)` 默认不表达“这是 TP、Attention TP、MoE TP 还是 MoE EP”。源码里的 helper 用函数名把语义绑定到对应 group。
 
-**修复方向：** 模型层优先选择 `communication_op.py` 中对应语义的 helper。只有 PD poll 这类明确传入 CPU/gloo group 的路径，才是不同通道。
+**操作：** 将裸调用替换为语义对应的 helper，并记录 getter 返回的 group membership；若是 PD poll 等状态同步，则保留其显式 coordination-group 调用链。
+
+**预期：** 模型层 collective 进入正确 coordinator 并保留 graph/backend 选路；状态同步不被误接到模型 TP helper。
 
 ## 症状 5：DP 请求没有落到期望 worker
 
@@ -178,7 +186,9 @@ def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Te
 
 **判断方法：** 先看请求对象上是否带 `routed_dp_rank`。如果带，它会直接覆盖普通调度策略；如果策略是 `FOLLOW_BOOTSTRAP_ROOM`，再看 `bootstrap_room` 是否存在且稳定。
 
-**修复方向：** 不要直接把请求打到 prefill/decode 实例；PD 场景应经过 router，让 bootstrap room 保持同一请求族的 locality。
+**操作：** 记录 `routed_dp_rank`、`bootstrap_room`、计算出的 target rank 与 `status[target]`。PD 场景经 router 产生会合字段；若使用外部直达 rank，先验证范围与健康状态。
+
+**预期：** 请求落到预期 worker。注意当前 external-rank 与 room 分支本身不跳过 inactive status，上层健康路由错误不能靠 Controller 自动修复。
 
 ## 症状 6：`TOTAL_REQUESTS` 或 `TOTAL_TOKENS` 下负载仍然倾斜
 
@@ -208,13 +218,15 @@ def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Te
 
 **判断方法：** 如果 snapshot 太旧或刷新过频，预算可能不能反映 burst 内的已分发请求。源码通过节流和投机加一缓解这个问题。
 
-**修复方向：** 查看 load snapshot 生产是否正常、DP Controller 是否拿到所有 worker 的新 timestamp、请求是否被外部 `routed_dp_rank` 覆盖。
+**操作：** 查看 load snapshot 是否持续更新、所有 worker timestamp 是否前进，并确认请求未被 `routed_dp_rank` 或 `FOLLOW_BOOTSTRAP_ROOM` 绕过负载策略。
+
+**预期：** burst 内 speculative budget 会递增，约 20ms 后由新快照校准；若仍倾斜，应能定位为快照陈旧、强制路由或 worker health，而不是泛称算法失效。
 
 ## 症状 7：PD poll 卡住或状态不一致
 
 **现象：** PD transfer 状态在部分 rank 上变成成功，部分 rank 仍在 transferring；或者 poll 阶段等待异常。
 
-**源码入口：** `poll_and_all_reduce` 使用 CPU tensor 和传入的 gloo group。
+**源码入口：** `poll_and_all_reduce` 使用 CPU tensor 和调用者传入的 coordination group。
 
 ```python
 # 来源：python/sglang/srt/disaggregation/utils.py L138-L140
@@ -223,9 +235,11 @@ def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Te
     return tensor_to_reduce.tolist()
 ```
 
-**判断方法：** PD poll 的 group 参数应该是 CPU/gloo group。不要把这个问题当作 TP NCCL all-reduce 调优问题。
+**判断方法：** 普通 backend 下 coordination group 通常是 Gloo；Mooncake group 的 `cpu_group` 实际为 `mooncake-cpu`。还要检查 metadata gate：metadata 未落地时会把局部 Success 降回 Transferring。
 
-**修复方向：** 检查传入的 attn CP/TP CPU group 是否覆盖了所有需要收敛状态的 rank，特别是开启 Attention CP/DP 后。
+**操作：** 打印 group backend/membership、每 rank 原始 poll、metadata buffer 的 bootstrap room，以及 MIN 后结果。
+
+**预期：** 所有 TP×CP 参与者最终看到相同状态；任一 rank 未 ready 或 metadata 未到时，不应提前 commit。
 
 ## 症状 8：Ascend / NPU 上 MoE collective OOM 或 HCCL buffer 异常
 
@@ -255,7 +269,9 @@ def get_torch_distributed_pg_options(group_name=None):
 
 **判断方法：** 先看当前 group name 是否含 `moe`，再看 `DEEPEP_HCCL_BUFFSIZE` 或 `HCCL_BUFFSIZE`。
 
-**修复方向：** 对 MoE 相关 group 调整 buffer size；非 MoE group 不会走这段 options。
+**操作：** 记录实际 `group_name` 与环境变量来源，先在受控环境调整 `DEEPEP_HCCL_BUFFSIZE`/`HCCL_BUFFSIZE`，并比较初始化日志与峰值内存；不要把同一参数无差别应用到非 MoE group。
+
+**预期：** MoE group 读取预期 buffer 配置；非 MoE 命名 group 返回 `None` options。具体数值必须按模型、拓扑和 NPU 环境实测。
 
 ## 症状 9：Elastic EP recovery 看起来没生效
 
@@ -297,7 +313,9 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
 **判断方法：** 如果函数返回 `False`，问题还在 relaunched rank 的 peer state；如果返回 `True` 但 MoE 行为异常，再看 `_refresh_ep_members` 和 EP buffer。
 
-**修复方向：** 确认 Mooncake backend 已安装并启用；rejoin rank 需要先 join backend，再由 live ranks recovery。
+**操作：** 确认仅在当前支持的 CUDA/CPU Elastic EP 环境使用该路径，记录 rejoin rank 的 `join_process_groups`、live rank 的 WORLD peer state、各 derived group local-rank 映射与 `_refresh_ep_members`。
+
+**预期：** peer 未 ready 时 `try_recover_ranks` 返回 `False`；ready 后依次恢复 WORLD、相关 device/coordination group，最后刷新 EP members。
 
 ## 症状 10：rejoin 时只有本 rank active
 
@@ -323,12 +341,26 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
 **判断方法：** 这不是普通运行期健康状态，而是 rejoin 期间的临时状态。
 
-**修复方向：** recovery 完成后看 active ranks 是否被刷新；不要把 rejoin capture 阶段的 mask 误判成永久丢 rank。
+**操作：** 分别在 rejoin capture 前、recovery 后记录 `active_ranks/last_active_ranks/active_ranks_cpu`。
+
+**预期：** rejoin capture 阶段仅本 rank active 是设计行为；恢复后 membership 状态应由控制流更新，若没有更新再查 recovery/active-rank 广播。
 
 ## 复盘排障顺序
 
 1. 启动失败先看 `world_size`、TP、PP、DCP 的硬校验。
 2. 模型 collective 失败先看 helper、getter、`GroupCoordinator.all_reduce`。
 3. 请求分发异常先看 `routed_dp_rank`、`bootstrap_room`、load budget。
-4. PD 状态不同步先看 CPU/gloo group。
+4. PD 状态不同步先看 CPU status tensor、coordination-group backend/membership 与 metadata gate。
 5. Elastic EP 先看 Mooncake peer state，再看 live group recovery 和 EP member refresh。
+
+## 无 GPU 静态检查
+
+```powershell
+rg -n "world_size != tensor_model_parallel_size|_ATTN_TP = _TP|routed_dp_rank|bootstrap_room %|_apply_metadata_gate|elastic_ep_rejoin" `
+  sglang/python/sglang/srt/distributed/parallel_state.py `
+  sglang/python/sglang/srt/managers/data_parallel_controller.py `
+  sglang/python/sglang/srt/disaggregation/utils.py `
+  sglang/python/sglang/srt/elastic_ep/elastic_ep.py
+```
+
+预期六类入口均有命中。静态检查只能确认分支位置；collective timeout、性能和 recovery 时序仍需目标多卡环境。

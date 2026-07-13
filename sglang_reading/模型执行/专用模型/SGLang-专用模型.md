@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 专用模型
 
@@ -17,7 +17,7 @@ updated: 2026-07-10
 
 本专题回答三件事：
 
-1. 为什么 `deepseek_v2.py` 一个文件能承载 DeepSeek V2、V3、V3.2。
+1. 为什么 `deepseek_v2.py` 一个文件能承载 DeepSeek V2、V3、V3.2，以及三个空子类究竟没有改变什么。
 2. 一条请求进入 DeepSeek 模型后，哪些地方从通用 decoder 变成 MLA/MoE/CP 特化路径。
 3. 出现 MLA 回退、expert 数不对、PP/CP 输出异常、权重名找不到时，应先查哪条源码链。
 
@@ -53,9 +53,9 @@ flowchart LR
 | 账本 | 入口 | 关键判断 | 常见症状 |
 |------|------|----------|----------|
 | 类账 | `EntryClass`、`DeepseekV2ForCausalLM` | V2/V3/V3.2 共用实现，按类名注册 | architecture 命中但行为不像预期 |
-| Attention 账 | `dispatch_attn_forward_method` | 当前 backend、forward mode、CP/DSA 决定 MHA/MLA/DSA | MLA 没走、prefill OOM、NPU 路径不同 |
-| Expert 账 | `DeepseekV2MoE`、`_is_layer_sparse` | 哪些层 sparse，shared expert 是否 fused，DeepEP 如何扩 expert slot | `tp_size > n_routed_experts`、expert 数量不对 |
-| 权重账 | `DeepseekV2WeightLoaderMixin` | PP stage skip、shared expert remap、NextN、fused QKV A proj、indexer fusion | 参数缺失、shared expert 错槽、DSA indexer 权重异常 |
+| Attention 账 | `dispatch_attn_forward_method`、handler registry | runner/backend 字符串、forward mode、图模式、CP/DSA 与后端专属策略共同决定 method | 未知 backend 静默落到 Triton、MLA 没走、prefill OOM、NPU 路径不同 |
+| Expert 账 | `DeepseekV2MoE`、`_is_layer_sparse` | 哪些层 sparse，shared expert 是独立、普通 fused 还是强制 DeepEP fused，EPLB 冗余 slot 如何叠加 | TP 拓扑不受支持、expert slot 数量不对 |
+| 权重账 | `DeepseekV2WeightLoaderMixin` | PP stage skip、shared expert remap、NextN、成对 fusion、异步完成、量化感知 post-load | 参数缺失、shared expert 错槽、DSA indexer 或 fused A-proj 只到半边 |
 
 ## 核心源码证据
 
@@ -136,11 +136,11 @@ MLA/MHA/DSA 不是靠读者猜。Attention 入口先根据当前 batch 的 backe
 
 ## 判断标准
 
-- 看到 DeepSeek V3/V3.2 行为差异，先查 config 和 `EntryClass` 命中的类，不要假设文件 fork。
-- 看到 prefill 走 MHA 而 decode 走 MLA，先查 `AttentionBackendRegistry` handler 和 `forward_mode`。
-- 看到 expert 数量多出 shared slot，先分清普通 fusion、DeepEP fusion 和 disabled fusion。
-- 看到 CP 相关 shape 异常，先查 `forward_batch.attn_cp_metadata` 是否在 ForCausalLM 入口设置。
-- 看到权重名缺失，先查 `DeepseekV2WeightLoaderMixin` 的 stage skip、shared expert remap、NextN 改名、fused indexer 规则。
+- 看到 DeepSeek V3/V3.2 行为差异，先查 config 与 server args；三个注册类本身是空子类，没有各自覆写 forward。
+- 看到 prefill 走 MHA 而 decode 走 MLA，先确认 backend key 实际命中哪个 handler，再逐项核对图模式、deterministic、CP、prefix 与 speculative mode。
+- 看到 expert 数量多出 slot，先分清普通 fusion、被强制开启的 DeepEP fusion、EPLB redundant experts 和独立 shared expert；DeepEP 默认并不启用 fusion。
+- 看到 CP 相关 shape 异常，除 metadata 与 split/gather 外，还要验证 attention DP/TP 是否都为 1；入口本身不会在“不再满足 split”时显式清空旧 metadata。
+- 看到权重名缺失，先查 stage skip、shared/NextN remap、成对 fused A-proj/indexer 是否齐全，以及所有 async future 是否已在 post-load 前完成。
 
 ## 相邻专题
 

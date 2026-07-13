@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Attention · 排障指南
 
@@ -19,9 +19,9 @@ updated: 2026-07-10
 
 这篇按症状排障。每个问题都回到源码入口，而不是只给经验结论。
 
-## Q1：我设置了 `--attention-backend`，为什么 prefill 和 decode 还是可能不同？
+## Q1：命令行写了一个 backend，为什么实际运行不是它？
 
-因为通用 backend 只是默认值，prefill/decode 专用 flag 会覆盖它。
+因为 flag 是输入，不是最终事实。post-init 会先做设备/模型默认选择和兼容性处理；prefill/decode 专用字段又可能覆盖通用字段，未指定的一侧才回退到归一后的通用字段。
 
 ```python
 # 来源：sglang/python/sglang/srt/server_args.py L6922-L6933
@@ -39,9 +39,9 @@ updated: 2026-07-10
         return prefill_attention_backend_str, decode_attention_backend_str
 ```
 
-排障动作：查启动日志里 resolved prefill/decode 名字，不要只查命令行里有没有 `--attention-backend`。
+排障动作：依次记录原始命令行、`ServerArgs` post-init 后三个字段、`get_attention_backends()` 返回的两个名字、最终对象类型。若 page size、Graph 配置或 backend 被改写，再回到 `_handle_attention_backend_compatibility()` 查触发条件。
 
-## Q2：什么时候会创建 `HybridAttnBackend`？
+## Q2：日志说 Hybrid，为什么我仍找不到真正执行 kernel 的对象？
 
 只有两个最终 backend 名不同才创建 Hybrid；相同则创建单后端。
 
@@ -84,7 +84,9 @@ updated: 2026-07-10
             )
 ```
 
-排障动作：如果你期待 Hybrid，但日志没有出现 hybrid backend，说明两个最终名字相同，或 draft worker 被 `speculative_draft_attention_backend` 覆盖。
+这张卡只说明 per-mode `HybridAttnBackend` 的创建条件。每个子 backend 在进入它之前已经过 `attn_backend_wrapper()`，混合线性模型可能先成为 `HybridLinearAttnBackend`；外层还可能再套 TBO，PDMux 则会创建主对象和多份 decode workspace。
+
+排障动作：打印或断点展开对象树，至少检查 `prefill_backend`、`decode_backend`、`full_attn_backend`、`linear_attn_backend`、TBO children/PDMux group。若你期待 per-mode Hybrid 但日志没有出现，才检查两个 resolved 名是否相同，或 draft worker 是否被 `speculative_draft_attention_backend` 覆盖。
 
 ## Q3：`TARGET_VERIFY` 到底走 prefill 还是 decode？
 
@@ -127,7 +129,7 @@ updated: 2026-07-10
         """
 ```
 
-排障动作：把动态 metadata 刷新移动到 `init_forward_metadata_out_graph`，再对比禁用 CUDA Graph 后是否恢复。
+排障动作：把 host/dynamic 计划留在 `init_forward_metadata_out_graph`，图内只保留静态 shape GPU op；同时确认 capture 已记录的 tensor 地址没有在 replay 前被重新赋值，动态数据应写回固定 buffer。禁用 Graph 只用于判断错误是否转入 eager，并不能单独证明根因就在 metadata。
 
 ## Q5：为什么 FlashInfer merge state 有时会 fallback 到 Triton？
 
@@ -149,9 +151,9 @@ DP attention 可能让 `num_heads` 变大，FlashInfer merge state 的 CUDA bloc
         return merge_state_triton(v_a, s_a, v_b, s_b)
 ```
 
-排障动作：如果日志或 profiling 显示 merge state 走 Triton，不要立即认为 backend 配置错了；先计算 DP attention 下的 head 数是否触发安全 fallback。
+排障动作：如果 profiling 显示 merge state 走 Triton，不要立即认为整个 backend 配置被替换；先计算 DP attention 下的 head 数是否触发安全 fallback。这个 fallback 只替换 cascade merge 这一个辅助 kernel。
 
-## Q6：为什么 decode 也要写 KV cache？
+## Q6：decode 写 KV 时，`out_cache_loc` 能否直接当物理 slot？
 
 decode 每步生成一个新 token，这个 token 的 K/V 必须写入 paged KV pool，下一步才会成为历史 KV。
 
@@ -192,23 +194,15 @@ decode 每步生成一个新 token，这个 token 的 K/V 必须写入 paged KV 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 ```
 
-排障动作：出现“第一步正常，后续 token attention 错”的问题时，同时检查本步写入 `out_cache_loc` 和 wrapper 读取的 KV buffer。
+不能无条件这样理解。`out_cache_loc` 是 generic write location；普通 pool 中可与物理位置一致，Unified 下可为 virtual。SWA/full pool 还可能分别使用 `KVWriteLoc.swa_loc` 与 `full_loc`；cross-attention 改用 `encoder_out_cache_loc`。
 
-## Q7：FlashInfer 和 Triton 的差异在哪里？
+排障动作：出现“第一步正常，后续 token 错”时，同时记录 pool 类型、generic 位置、翻译后的 physical 位置、实际 `set_kv_buffer` 分支与 wrapper 的读取索引流。不要只盯一个 tensor 数值。
 
-文件头说明了 SGLang 的默认判断：FlashInfer 通常更快，Triton 更容易定制；两者都支持 extend 和 decode。
+## Q7：应该无条件优先 FlashInfer，还是优先 Triton？
 
-```python
-# 来源：sglang/python/sglang/srt/layers/attention/flashinfer_backend.py L5-L10
-"""
-Support different attention backends.
-Now there are two backends: FlashInfer and Triton.
-FlashInfer is faster and Triton is easier to customize.
-Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
-"""
-```
+没有脱离环境的正确答案。当前 SGLang 后端集合还包括 FA3/FA4、MLA、DSA/DSV4、TensorRT-LLM、AMD、Ascend、Intel 等实现；某个旧文件头里“只有两个 backend”的注释已不能代表仓库架构。backend 选择同时受模型架构、GPU/加速器、page size、KV dtype、head 形状、Graph、speculative decoding、SWA 与 cross-attention 约束。
 
-排障动作：生产吞吐优先时先理解 FlashInfer wrapper 和 Graph；改 mask、新硬件、新实验 kernel 时先读 Triton metadata 和 kernel。
+排障动作：先确认 workload 与功能约束，再验证候选 factory 的断言和兼容性处理；最后在固定模型、硬件、batch、context、dtype 与 Graph bucket 下实测。不能把“第三方 wrapper”或“容易改 kernel”直接翻译成生产性能结论。
 
 ## Q8：新增一个 backend 最容易漏什么？
 
@@ -244,14 +238,26 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 ```
 
-排障动作：新 backend 先跑 eager extend/decode，再跑 decode CUDA Graph，再跑 target verify 或 SWA/cross-attention 场景。只过单步 eager 不够。
+排障动作：新 backend 先跑 eager extend/decode，再按其声明能力跑 Graph capture/replay、target verify、SWA/cross-attention、Unified 地址翻译和 DP padding。若某能力不支持，应在 resolver/factory 尽早拒绝，而不是等到深层 kernel 才崩。
+
+## Q9：为什么我明明改了 `HybridAttnBackend.forward`，运行行为却没变？
+
+先检查是否改到了文件中第一个同名定义。当前类体里有两个 `forward`，Python 会让后定义覆盖前定义；前一个支持 `mixed_qkv/a/b` 的版本在运行时不可达。混合线性模型真正的按层能力来自 `attn_backend_wrapper()` 返回的 `HybridLinearAttnBackend`。
+
+排障动作：不要只用 `rg 'def forward'` 后停在第一个命中。检查类定义末尾、运行时 `type(obj)`、`type(obj).__dict__['forward']`，再沿 wrapper 委托链找到实际绑定方法。
+
+## Q10：Graph replay 或 multi-step draft 为什么会读到旧 metadata？
+
+先判断 metadata 是否已被专用 planner 预先生成。`forward_metadata_ready` 会记录计划时 batch size 与 token 数；DP padding 后 shape 可能变化。只有标记了 `replan_equivalent=True` 的预计划，普通 forward 才能在失效时安全重建；其他路径重建会覆盖专用 wrapper metadata。
+
+排障动作：记录“谁调用了 plan、何时 mark ready、计划 shape、进入模型时最终 shape、是否允许等价 replan”。Graph 路径还要确认 replay 前只是原地刷新 capture-stable buffer，而不是替换对象。
 
 ## 运行验证
 
 Attention backend 的排障先确认三层边界：配置如何拆成 prefill/decode、`HybridAttnBackend` 如何分派、具体 backend 是否同时实现 metadata、extend、decode 和 KV 写入。
 
 ```powershell
-rg -n 'def get_attention_backends|def init_attention_backend|class HybridAttnBackend|class AttentionBackend|class FlashInferAttnBackend|def init_forward_metadata|def forward_decode|def forward_extend|decode_wrapper|set_kv_buffer|KVWriteLoc' sglang/python/sglang/srt/server_args.py sglang/python/sglang/srt/model_executor/model_runner.py sglang/python/sglang/srt/layers/attention/hybrid_attn_backend.py sglang/python/sglang/srt/layers/attention/base_attn_backend.py sglang/python/sglang/srt/layers/attention/flashinfer_backend.py
+rg -n '_handle_attention_backend_compatibility|def get_attention_backends|def init_attention_backend|attn_backend_wrapper|class HybridAttnBackend|class HybridLinearAttnBackend|forward_metadata_ready|needs_forward_metadata_init|def init_forward_metadata|decode_wrapper|set_kv_buffer|KVWriteLoc' sglang/python/sglang/srt/server_args.py sglang/python/sglang/srt/model_executor/model_runner.py sglang/python/sglang/srt/model_executor/forward_batch_info.py sglang/python/sglang/srt/layers/attention
 ```
 
-读输出时先看 `server_args.py` 的 backend 拆分，再看 `model_runner.py` 的初始化；如果命中 `HybridAttnBackend`，就继续看它如何按 `ForwardMode` 分派。最后在 `flashinfer_backend.py` 里确认 `forward_extend` 和 `forward_decode` 都会在需要时 `set_kv_buffer`，否则 decode 侧可能读到旧 KV。
+读输出时先看 resolver，再展开 wrapper 树；然后确认 metadata 是本轮新计划还是预计划，最后才下钻具体 backend 的 KV 写入、索引更新与 kernel 调用。这个顺序能把“选错对象”“复用旧计划”“地址翻译错”和“kernel 数学错”分成四类问题。

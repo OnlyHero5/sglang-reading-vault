@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Scheduler · 排障指南
 
@@ -24,7 +24,7 @@ updated: 2026-07-10
 源码入口：normal loop 是串行的，overlap loop 把当前 forward 和上一轮 result processing 分开。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1521-L1548
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L1521-L1548
 def event_loop_normal(self):
     """A normal scheduler loop."""
     while True:
@@ -48,7 +48,7 @@ def event_loop_normal(self):
 ```
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1551-L1613
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L1551-L1613
 def event_loop_overlap(self):
     """A scheduler loop that overlaps the CPU processing and GPU computation."""
     self.result_queue: Deque[
@@ -79,7 +79,7 @@ def event_loop_overlap(self):
                 pop_and_process()
 ```
 
-判断：overlap 的设计目标是吞吐，不是简化状态。它让 CPU result processing 和 GPU forward 并行，但读日志时要记住 `last_batch` 与 `cur_batch` 不同。
+判断：overlap 让 CPU result processing 和 GPU forward 并行。读日志时至少区分 `cur_batch`、live `last_batch`、`result_queue` 的受限 batch snapshot、`copy_done` 和 FutureMap relay；只比较 `last_batch` 与 `cur_batch` 仍不足以定位错位。
 
 验证：用同一模型分别启动默认模式和 `--disable-overlap-schedule`。若状态错乱只在默认模式出现，优先查 `result_queue`、FutureMap、D2H copy、batch 生命周期。
 
@@ -90,7 +90,7 @@ def event_loop_overlap(self):
 源码入口：`is_disable_overlap_for_batch` 会在连续 prefill 或 spec+grammar+decode 场景返回 true。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1618-L1649
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L1618-L1649
 def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
     # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
     if self.require_mlp_sync:
@@ -129,7 +129,7 @@ def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
 源码入口：decode 前 `update_running_batch` 调 `batch.check_decode_mem()`；失败时 `retract_decode()` 释放部分请求并重新入队。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3026-L3114
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L3026-L3114
 def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     initial_bs = batch.batch_size()
 
@@ -194,7 +194,7 @@ def init_ipc_channels(self, port_args: PortArgs):
 ```
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L141-L201
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler_components/request_receiver.py L141-L201
 def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
     if self.server_args.enable_dp_attention:
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -233,7 +233,7 @@ def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
 源码入口：`PrefillAdder` 不是 FIFO pop，而是综合 token/KV/LoRA/priority/HiCache/chunked prefill 决定本轮准入。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2804-L2879
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L2804-L2879
 adder = PrefillAdder(
     self.page_size,
     self.tree_cache,
@@ -276,7 +276,7 @@ for req in self.waiting_queue:
 源码入口：事件循环在 `process_input_requests` 后检查 `_engine_paused`，pause handler 设置该标志。`in_place` 模式不 drain 当前状态，等待 resume 后走标准路径。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3966-L4015
+# 定位：python/sglang/srt/managers/scheduler.py L3966-L4015（pause 分支摘录）
 def pause_generation(self, recv_req: PauseGenerationReqInput):
     self._engine_paused = True
 
@@ -298,7 +298,7 @@ def pause_generation(self, recv_req: PauseGenerationReqInput):
 ```
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1566-L1570
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L1566-L1570
 recv_reqs = self.request_receiver.recv_requests()
 self.process_input_requests(recv_reqs)
 if self._engine_paused:
@@ -331,7 +331,7 @@ if disaggregation_mode == DisaggregationMode.NULL:
 ```
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_pp_mixin.py L67-L168
+# 定位：python/sglang/srt/managers/scheduler_pp_mixin.py L67-L168（PP 循环骨架）
 def event_loop_pp(self: Scheduler):
     """
     A scheduler loop for pipeline parallelism.
@@ -355,9 +355,9 @@ def event_loop_pp(self: Scheduler):
                 result, self.launch_event = self._pp_launch_batch(...)
 ```
 
-判断：PP 的 overlap 目标是 stage 间流水线填充，不是 default loop 的 `result_queue` 两拍流水。排障时看 request/proxy/output 通信顺序。
+判断：普通 PP 的目标是 stage/microbatch 流水，不是 default loop 的 `result_queue` 两拍流水。排障时同时看 request pyobj、typed proxy/output tensor dict、microbatch id、D2H event 与 pending P2P work；PD PP 还要看共识 rid 集合。
 
-验证：检查 `pp_loop_size`、`pp_async_batch_depth`、proxy send/recv、last rank output preprocess。
+验证：检查 `pp_loop_size=pp_size+pp_async_batch_depth`、typed inbox、proxy/output send/recv、last-rank queue、D2H event；若是 XPU 等 backend，还检查奇偶 rank 的 send/recv 顺序。
 
 ## 症状 8：chunked prefill 中间 chunk 没有完整输出回传
 
@@ -390,7 +390,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 源码入口：retract 在 Scheduler decode KV 检查中触发；PD prefill retry 在 disaggregation prefill 逻辑中受 `prefill_retry_count` 和 `is_retracted` 限制。
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3076-L3103
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L3076-L3103
 self.new_token_ratio_tracker.current = new_token_ratio
 ...
 logger.warning(msg_prefix + msg_details)

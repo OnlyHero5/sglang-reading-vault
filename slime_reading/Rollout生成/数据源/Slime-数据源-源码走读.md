@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 数据源 · 源码走读
 
@@ -77,7 +77,7 @@ sequenceDiagram
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L650-L653
+# 定位骨架（据 `slime/ray/rollout.py` L650-L653 删节）：
         if self.args.load_debug_rollout_data:
             data = self._load_debug_rollout_data(rollout_id)
         else:
@@ -103,7 +103,7 @@ sequenceDiagram
 设计选择：`RolloutDataSource.__init__` 初始化四个游标；如果有全局 dataset，则立刻构建 `Dataset` 并可选 shuffle。
 
 ```python
-# 来源：slime/rollout/data_source.py L50-L88
+# 定位骨架（据 `slime/rollout/data_source.py` L50-L88 删节）：
 class RolloutDataSource(DataSource):
     def __init__(self, args):
         self.args = args
@@ -148,7 +148,7 @@ class RolloutDataSource(DataSource):
 
 - `sample_offset` 不能拿来当 sample 的全局 id。
 - `sample_index` 会按 `n_samples_per_prompt` 增长。
-- `dataset=None` 时 `__len__` 为 0，默认 SGLang rollout 仍会要求全局 dataset。
+- `dataset=None` 时 `__len__` 为 0；默认 SGLang rollout 只断言 global 模式，不断言 `prompt_data` 存在，父类会改为生成空 `Sample()`。
 
 ## 步骤三：Dataset 把文件行转换成 prompt 阶段 Sample
 
@@ -157,7 +157,7 @@ class RolloutDataSource(DataSource):
 设计选择：`read_file` 统一产出 dict；`Dataset.__init__` 对每条 dict 构造包含 `prompt`、`label`、`metadata`、`multimodal_inputs` 的 `Sample`。
 
 ```python
-# 来源：slime/utils/data.py L25-L68
+# 来源：slime/utils/data.py L25-L58
 def read_file(path):
     path, row_slice = _parse_generalized_path(path)
     reader = None
@@ -217,6 +217,8 @@ def read_file(path):
 - 文件必须存在，扩展名必须是 `.jsonl` 或 `.parquet`。
 - 至少要有 `input_key` 对应字段，否则 prompt 会是 `None`，后续 tokenizer 或 processor 会失败。
 - parquet 环境没有 `pyarrow` 时会在加载期直接报错。
+- 路径解析正则接受负 start/end，但 `itertools.islice` 不接受负索引；`@[-10:]` 会先解析成功、再在迭代时报 `ValueError`。
+- jsonl 坏行全部被跳过时可能形成空 dataset；若启用长度过滤，后续 `origin_samples[0]` 会先触发 `IndexError`。
 
 ## 步骤四：多模态和 chat template 在 dataset 边界收束
 
@@ -225,7 +227,7 @@ def read_file(path):
 设计选择：`_build_messages` 先把字符串 prompt 包成 user message，再按 `multimodal_keys` 把 placeholder 替换为 image/video item。
 
 ```python
-# 来源：slime/utils/data.py L130-L174
+# 定位骨架（据 `slime/utils/data.py` L130-L174 删节）：
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
     prompt = data.get(prompt_key)
 
@@ -279,6 +281,7 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 - placeholder 数量不能多于数据数量。
 - 如果 prompt 已是 content list，当前代码只 warning，不做进一步加工。
 - 如果不开 chat template 且 prompt 是 list，长度过滤会跳过，见下一步。
+- `multimodal_keys` 已配置但某条记录没有任何实际媒体字段时，`multimodals` 为空，`pattern` 却变成 `()`；字符串 content 会被空正则切成逐字符 text item。
 
 ## 步骤五：长度过滤只在可可靠估长时执行
 
@@ -287,7 +290,7 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 设计选择：`filter_long_prompt` 对字符串 prompt 做 tokenizer/processor 长度检查；对未模板化的 list prompt 直接 warning 并跳过检查。
 
 ```python
-# 来源：slime/utils/data.py L81-L127
+# 定位骨架（据 `slime/utils/data.py` L81-L127 删节）：
 def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_length: int | None) -> list[Sample]:
     if max_length is None:
         return origin_samples
@@ -343,7 +346,7 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 设计选择：先按 `sample_offset` 切 dataset，不足时跨 epoch 补齐；随后每个 prompt deepcopy 成一组 Sample，写入 `group_index` 和 `index`。
 
 ```python
-# 来源：slime/rollout/data_source.py L90-L118
+# 定位骨架（据 `slime/rollout/data_source.py` L90-L118 删节）：
     def get_samples(self, num_samples):
         if self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
@@ -384,6 +387,8 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 不变量与失败模式：
 
 - 如果 `num_samples` 大于 dataset 长度很多，当前实现只跨一个 epoch，不是任意多轮循环。
+- 这不仅是“少取一些”的温和退化：3 条 dataset 请求 10 组时会返回 6 组并留下 `sample_offset=7`，offset 超出合法范围。
+- dataset 为空时每次返回空 groups；默认 rollout 的补水 while 没有 EOF 分支，会反复调用 source 而无法进入等待完成任务的阶段。
 - `Dataset.shuffle` 必须与 `epoch_id` 一起恢复，否则 offset 指错 prompt。
 - `group_index` 相同、`index` 不同是后续 group 算法的基础。
 
@@ -394,7 +399,7 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 设计选择：buffer 子类先调用 `_get_samples_from_buffer`，不足部分再调用父类 `get_samples`。默认 `pop_first` 是 FIFO。
 
 ```python
-# 来源：slime/rollout/data_source.py L168-L196
+# 定位骨架（据 `slime/rollout/data_source.py` L168-L196 删节）：
 class RolloutDataSourceWithBuffer(RolloutDataSource):
     def __init__(self, args):
         super().__init__(args)
@@ -440,6 +445,7 @@ def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) ->
 不变量与失败模式：
 
 - 自定义 `buffer_filter` 必须修改 buffer 或以别的方式避免重复返回同一组。
+- 自定义 filter 还必须保证返回数不超过 `num_samples`；超额时剩余数变负，父类调用可能把 `sample_offset` 向后移动。
 - `rollout_id` 当前传入 `None`，不能假设这里有真实 rollout id。
 - buffer group 可以比 fresh prompt group 字段更多，但形状必须一样。
 
@@ -450,7 +456,7 @@ def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) ->
 设计选择：`generate_rollout_async` 不断拉取 `over_sampling_batch_size` 组并提交 task，直到 `data` 收满 `rollout_batch_size` 组。被 dynamic filter drop 的组只减少 pending 计数，不进入训练，也默认不回写 buffer。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L401-L439
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L401-L439 删节）：
     target_data_size = args.rollout_batch_size
 
     data = []
@@ -500,7 +506,7 @@ def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) ->
 设计选择：`abort` 设置 `state.aborted=True`，等待 pending task 收束；如果开启 `partial_rollout`，把完成的 group 收集到 `aborted_samples`，给带 buffer 的 data source 回写。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L336-L372
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L336-L372 删节）：
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     aborted_samples = []
 
@@ -597,14 +603,21 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 - 续训需要 `args.load` 指向含有 `rollout/global_dataset_state_dict_{rollout_id}.pt` 的目录。
 - shuffle 的 determinism 来自 `Dataset.shuffle(seed + epoch_id)`。
 - buffer 内容不在这个 state dict 里。
+- shuffle 通过模块级 `random.seed` 实现，会重置进程全局 Python RNG；同进程的随机 RM 或插件会受影响。
+
+## 步骤十一：fully-async 复用接口，但不复用默认控制面
+
+fully-async 后台 worker 持续调用 `data_buffer.get_samples(1)`，完成后放入跨 step 输出队列，aborted group 则回灌。它直接调用 `generate_and_rm_group`，不会经过默认主循环的 dynamic filter、drop metrics、over-sampling 和 all-samples hook；全局 worker 首次创建后还固定首份 args 与 data source。
+
+若 source 持续返回空列表，worker 每秒重试，前台 `_generate_rollout_async` 没有 deadline，会一直等待 `rollout_batch_size`。因此“实现了相同 DataSource 接口”只证明取样形状兼容，不证明默认 rollout 的质量闸门和终止语义仍然存在。
 
 ## 运行验证
 
 可以先不启动完整训练，用插件契约测试确认接口形状：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -q
 ```
 
 预期现象：

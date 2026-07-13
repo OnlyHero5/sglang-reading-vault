@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 磁盘权重同步 · 核心概念
 
@@ -37,7 +37,7 @@ updated: 2026-07-10
 源码入口把 delta 固定到 disk，并明确禁止 colocate + delta：
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L139-L149
+# 定位骨架（基于 slime/backends/megatron_utils/actor.py L139-L149；省略 import 与 updater 构造）
 if self.args.colocate:
     assert (
         self.args.update_weight_mode == "full"
@@ -95,12 +95,14 @@ def update_weights(self) -> None:
     dist.barrier(group=get_gloo_group())
 ```
 
+目录不是以临时目录整体 rename 的方式发布，而是直接在最终 `weight_vN` 下写入；正确性依赖 engine 直到 save barrier 后才收到 reload。共享文件系统还必须提供跨 host 的可见性，full disk 没有 delta 路径那样的 pre-push/pre-read hook。整个 pause→save→reload→cleanup→continue 也没有 `try/finally`。
+
 ## Delta Disk：把全量目录拆成 baseline + 版本链
 
 delta disk 的核心不在 SGLang，而在 Slime 侧：trainer 发布 `weight_vN` 的 diff，各 host 把 diff apply 到本地完整 HF 副本，然后 engine 仍然用普通 `update_weights_from_disk(local_dir)` reload。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L80-L96
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L80-L96；省略注释与尾部阶段）
 @torch.no_grad()
 def update_weights(self) -> None:
     if not self._baseline_captured:
@@ -119,10 +121,10 @@ def update_weights(self) -> None:
     self._record_metrics()
 ```
 
-首轮只 capture baseline 是刻意设计。baseline 从 `hf_checkpoint` 读取，因为各 host 的 local checkpoint 也是从同一个 HF 目录 materialize，二者 byte layout 必须一致。
+首轮只 capture baseline 是刻意设计。baseline 从 `hf_checkpoint` 读取，因为各 host 的 local checkpoint 也是从同一个 HF 目录 materialize，二者 byte layout 必须一致。这同时构成安全前提：第一次 rollout 使用的 engine base 必须与 actor 要同步的初始语义一致；若 actor 从另一个 Megatron checkpoint 恢复而 engine 仍是旧 HF base，首轮不会把差异推过去。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L98-L124
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L98-L124；省略日志与 barrier 尾部）
 def _capture_baseline(self) -> None:
     if dist.get_rank() == 0:
         shutil.rmtree(self.delta_dir, ignore_errors=True)
@@ -142,7 +144,7 @@ def _capture_baseline(self) -> None:
 
 ## Delta 编码：xor 与 overwrite 的取舍
 
-delta 是 byte-level，不关心 dtype。`xor` 线小、apply 快，但只能在正确 base 上应用一次；`overwrite` 记录位置和新值，更适合重试语义。
+delta 是 byte-level，不关心 dtype。`xor` 在压缩前保存完整逐 byte 差分、apply 是逐块异或；`overwrite` 只记录变化位置和新 byte。谁的 wire 更小取决于变化密度与 zstd 可压缩性，不能脱离指标预设结论；语义上 XOR 只能在正确 base 上应用一次，overwrite 更适合同版重放。
 
 ```python
 # 来源：slime/utils/disk_delta.py L29-L33
@@ -170,12 +172,16 @@ compressed = np.frombuffer(zstandard.ZstdCompressor(level=1).compress(diff), dty
 return name, new, compressed, checksum(self.checksum_algorithm, new), changed
 ```
 
+失败恢复差异比“幂等”更具体：apply 会原地修改 mmap，checksum 只在写后检查且没有回滚。XOR 若进程崩溃或部分 tensor 校验失败，本地文件可能处于半新半旧状态，再次完整 XOR 会把已经成功的区域翻回旧值；应从已知完整 base 重新 materialize。overwrite 可重复覆盖同一位置，但其 position 编码为 `<u4`，单 tensor byte offset 超过 2^32 时没有显式防护。
+
+trainer 侧也不是事务：`collect()` 在 delta 文件写入、commit hook、host apply 与 engine reload 之前就更新 `_snapshot`。后续阶段失败时，内存 snapshot 已前移而 host 可能仍在旧版本，不能在同一 updater 上盲目继续生成下一版。
+
 ## Host-Local Checkpoint：每台 rollout host 自己追版本
 
 delta 不要求 engine 理解 diff。每台 host 有一个本地 HF 副本，`.delta_sync/state.json` 记录已 apply 版本，`flock` 保证同 host 多 actor 串行 apply。
 
 ```python
-# 来源：slime/utils/disk_delta.py L111-L124
+# 定位骨架（基于 slime/utils/disk_delta.py L111-L124；省略日志与 page-cache 操作）
 def init_local_checkpoint(local_ckpt_dir: str, base_dir: str) -> None:
     """Copy the base HF checkpoint into local_ckpt_dir once if absent (run at engine start). Each
     later delta is applied on top of this copy in place."""
@@ -191,12 +197,16 @@ def init_local_checkpoint(local_ckpt_dir: str, base_dir: str) -> None:
         _write_applied_version(local_ckpt_dir, "000000")
 ```
 
+`state.json` 只在整版校验通过后原子更新，但权重文件本身不回滚也不 `msync`；状态落后并不保证文件仍是旧版本。该实现依赖 Linux `fcntl.flock`、`mmap.madvise`/POSIX 文件语义，不是 Windows 可执行路径。
+
+delta 版本目录不会读取 `update_weight_disk_keep_files` 做逐版清理；只在下一次 baseline capture 时清空整个 delta root。长任务要自行规划保留策略或由 commit hook 外部归档/清理，同时确保尚未追平的 host 仍能读取完整版本链。
+
 ## Colocate Tensor：不是磁盘路径，但必须对照
 
 colocate full 不写 checkpoint。它把 HF tensor chunk 转成 flattened bucket，经 Gloo `gather_object` 收到对应 engine 的 src rank，再用 Ray IPC 发给 SGLang。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py L234-L287
+# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py L245-L287
 for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
     flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
     metadata = flattened_tensor_bucket.get_metadata()
@@ -241,6 +251,8 @@ if dist.get_rank() == ipc_gather_src:
         }
         refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 ```
+
+纯 colocate 路径会等待 Ray refs 后释放长寿命 tensor 并调用 `torch.cuda.ipc_collect()`；但异常路径没有 finally。混合远端模式中，`self.rollout_engines` 被切成 colocated 子集，pause/flush/continue 与 compressed-tensors post-process 只覆盖该子集，远端 engine 仅走 distributed send。
 
 ## 复盘
 

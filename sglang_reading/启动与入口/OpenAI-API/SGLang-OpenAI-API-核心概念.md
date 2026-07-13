@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # OpenAI-API · 核心概念
 
@@ -325,9 +325,11 @@ Chat 的转换多了消息模板、tool constraint、multimodal payload 和 reas
 
 这里的关键不是字段多，而是所有外部协议差异最后都被压进一个内部请求对象。
 
-## 流式输出：内部累积态到外部增量态
+但“生成约束已建立”不等于“响应一定会被还原成 OpenAI `tool_calls`”。required/named tool choice 在没有 parser-specific constraint 时可以退回 JSON schema；当前出站 tool-call 分支仍要求配置 `tool_call_parser`。完全没有 parser 时，受约束 JSON 可能作为普通 `content` 返回，客户端不能只凭 `tool_choice="required"` 推断一定拿到结构化 `tool_calls`。
 
-TokenizerManager 的 chunk 更像“当前状态快照”。OpenAI SDK 期待的是 delta。兼容层必须为每个 choice 维护 offset。
+## 流式输出：先识别上游 chunk 语义，再生成外部 delta
+
+默认非增量模式下，TokenizerManager 的 chunk 是“当前累积状态快照”，OpenAI SDK 期待的是 delta，兼容层必须为每个 choice 维护 offset。打开 `incremental_streaming_output` 后，TokenizerManager 已直接给出互不重叠的分段；Chat handler 会显式切换到直接透传该分段，不能再套用累积 offset。
 
 ```python
 # 来源：python/sglang/srt/entrypoints/openai/serving_chat.py L356-L361
@@ -339,7 +341,7 @@ TokenizerManager 的 chunk 更像“当前状态快照”。OpenAI SDK 期待的
             stream_offsets[index] = len(content["text"])
 ```
 
-Completion 也使用同样的差分思路。
+Completion 当前仍无条件使用累积文本切片，没有像 Chat 一样检查 `incremental_streaming_output`。
 
 ```python
 # 来源：python/sglang/srt/entrypoints/openai/serving_completions.py L316-L318
@@ -348,7 +350,7 @@ Completion 也使用同样的差分思路。
                 stream_offsets[index] = len(content["text"])
 ```
 
-所以重复文本问题优先检查 offset，而不是先怀疑 tokenizer 或 scheduler。
+所以重复或漏字问题要先同时检查两件事：TokenizerManager 当前产出的是累积快照还是分段 delta，以及对应 adapter 是否采用了匹配的 offset 策略。特别是 Completion 与 Ollama，在启用 `--incremental-streaming-output` 时不能直接假设兼容层已经正确适配。
 
 ## 复盘迁移
 

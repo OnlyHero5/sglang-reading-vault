@@ -24,8 +24,8 @@ updated: 2026-07-10
 | 专题 | 角色 | 关注点 |
 |------|------|--------|
 | [[SGLang-多模态]] | VLM | Processor 注册、ViT、特殊 token |
-| [[SGLang-LoRA]] | 动态 LoRA | LoRAAdapter、MemoryPool、eviction |
-| [[SGLang-sgl-kernel]] | CUDA 算子 | attention / MoE / quant custom op |
+| [[SGLang-LoRA]] | 动态 LoRA | adapter CPU 缓存、固定形状 GPU pool、逐 batch metadata |
+| [[SGLang-sgl-kernel]] | 算子与 dispatch | attention / MoE / quant kernel 及 Python 调用封装 |
 | [[SGLang-model-gateway]] | 路由网关 | PD 池、负载均衡、Rust gateway |
 | [[SGLang-前端语言]] | 编程接口 | `@function`、控制流、Remote |
 | [[SGLang-多模态生成]] | 扩散 runtime | 独立 diffusion 子系统 |
@@ -46,21 +46,20 @@ flowchart TB
  KERN["sgl-kernel<br/>torch.ops.sgl_kernel"]
  GW["Gateway<br/>HTTP 路由"]
  FE["Frontend<br/>sglang.lang"]
- DIFF["multimodal_gen<br/>独立 CLI"]
+ DIFF["multimodal_gen<br/>并列 diffusion runtime"]
  TM --> MM
  MR --> LORA
  MR --> KERN
  GW --> TM
  FE --> TM
- DIFF -.->|"独立进程"| DIFF
 ```
 
-这张图的读法是：Multimodal 与 LoRA 深度集成在 SRT 内（TokenizerManager mixin、ModelRunner layer）。sgl-kernel 被 SRT 层 import 调用，本身无 Python 推理逻辑。Gateway 是集群前置路由，对 client 暴露统一 endpoint。Frontend 是客户端 SDK，通过 HTTP 调 SRT。multimodal_gen 与 LLM serving 并行，共用 monorepo 但启动路径不同（见 [[SGLang-启动链路]] 的 diffusion 分支）。
+这张图按“扩展插在哪一侧”阅读：Multimodal 改造请求预处理与模型输入；LoRA 替换 ModelRunner 内的目标 module，并在 batch 前准备 adapter metadata；`sgl-kernel` 提供热点 kernel 与 Python dispatch 封装，但不拥有 serving 调度；Gateway 位于 worker 集群之前；Frontend 位于请求发起侧；`multimodal_gen` 与文本 SRT 是同仓库中的并列 runtime，不应画成 SRT 内部的一次函数调用。
 
-**源码锚点：**
+下面的源码卡只证明 LoRA manager 的两个构造期动作：选择 kernel backend，并初始化可变 adapter/pool 状态。
 
 ```python
-## 来源：python/sglang/srt/lora/lora_manager.py L98-L115
+# 来源：python/sglang/srt/lora/lora_manager.py L98-L112
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
@@ -76,22 +75,19 @@ flowchart TB
             target_modules=target_modules,
             lora_paths=lora_paths,
         )
-
-    def init_cuda_graph_batch_info(
-        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
 ```
 
 读法：
 
-- 动态加载不重启 server；MemoryPool 满时 eviction（见 [[SGLang-LoRA-源码走读]]）。
-- API 层 `/load_lora_adapter` 最终调到此 manager。
-- MoE 模型有专用 LoRA backend 路径（见 [[SGLang-LoRA-排障指南]]）。
+- adapter 配置与权重先进入 manager 的 CPU 侧字典；请求运行前，GPU memory pool 再为当前与 running adapter 准备 slot。
+- pool 形状由 `max_lora_rank`、target modules、TP 与 embedding/MoE 形式共同约束；新 adapter 不兼容时会在加载阶段拒绝，不能假设任何 adapter 都可热插入。
+- pinned adapter 不能占满全部 slot，源码会保留未 pinned adapter 与 base model 的可用空间；具体淘汰策略再进入 [[SGLang-LoRA-源码走读]]。
 
 ---
 
 ## 一句话边界
 
-多模态和 LoRA 改造请求与模型执行，`sgl-kernel` 下沉热点算子，Gateway 位于 worker 之前，Frontend 位于请求发起侧，`multimodal_gen` 则是并列的扩散生成 runtime。先判断扩展位于哪一侧，再进入内部实现。
+多模态和 LoRA 改造请求或模型执行对象，`sgl-kernel` 下沉热点算子与 dispatch，Gateway 位于 worker 之前，Frontend 位于请求发起侧，`multimodal_gen` 则是并列的扩散生成 runtime。先判断状态由客户端、网关、TokenizerManager、ModelRunner、kernel wrapper 还是独立 runtime 持有，再进入内部实现。
 
 ---
 
@@ -120,9 +116,9 @@ flowchart TB
 
 ## 验证建议（零基础可试）
 
-1. **LoRA：** `/load_lora_adapter` 后带 `lora_path` 请求，对比 base 输出差异。
-2. **VLM：** 带 image_url 的 chat 请求，日志应有 multimodal processor 路径。
-3. **Gateway：** 本地起 prefill+decode 双节点 + gateway，观察 routing_key（27）。
+1. **LoRA：** 用服务支持的 adapter 名称/路径加载接口加载兼容 adapter，再分别发送 base 与 LoRA 请求；预期加载结果列出 adapter，且两次请求都成功。输出是否变化取决于 adapter，不能作为唯一成功判据。静态替代是检查 `validate_new_adapter → load_lora_weights → lora_refs` 的提交顺序。
+2. **VLM：** 用匹配模型发送带 `image_url` 的 chat 请求；预期 processor 产出的多模态输入与占位 token 数一致，并成功进入模型 forward。无 VLM checkpoint 时只做 processor/输入对象静态追踪。
+3. **Gateway：** 启动与当前模式匹配的 worker 池和 gateway，连续发送带 request id 的请求；预期从 gateway 日志还原选路与失败重试对象。PD 模式还要分别观察 Prefill/Decode endpoint，不能用一个固定 `routing_key` 数值当正确性标准。
 
 ---
 

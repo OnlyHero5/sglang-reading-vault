@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Ray参数 · 源码走读
 
@@ -28,7 +28,7 @@ updated: 2026-07-10
 | 排查 SGLang TP/PP | 步骤五 | `sglang_tp_size` 默认来自 `rollout_num_gpus_per_engine / pp_size` |
 | 排查 debug rollout-only | 步骤六到七 | debug rollout-only 会重写 actor 资源，并关闭 colocate/offload |
 | 排查 colocate/offload | 步骤八 | colocate 会默认打开 train/rollout offload，并在必要时补 rollout GPU 数 |
-| 排查 external engines | 步骤九到十一 | 远端 `/get_server_info` 会反向覆盖 rollout engine 数和 GPU 总量，PG 只看最终结果 |
+| 排查 external engines | 步骤九到十一 | 远端 `/server_info`（失败时回退 `/get_server_info`）会写回 rollout engine 数和 GPU 总量，PG 只看最终结果 |
 
 读的时候不要把 parser default 当运行拓扑。真正决定 Ray placement group 的，是 validate 与 external discovery 后的最终 args。
 
@@ -65,7 +65,8 @@ sequenceDiagram
     PRE->>MEG: Megatron + Slime parser
     SG-->>VAL: sglang_* namespace
     MEG-->>VAL: actor / rollout / colocate namespace
-    VAL->>EXT: external 时读取远端 server_info
+    VAL->>EXT: validator 内部在 external 时读取 server_info
+    EXT-->>VAL: 写回 engine infos / GPU / engine count
     VAL-->>PG: 最终 args
     PG-->>CLI: num_gpus, rollout_offset
 ```
@@ -123,7 +124,7 @@ def add_cluster_arguments(parser):
 设计选择：先注册用户自定义参数，再注册 cluster、train、rollout、data、algo、debug 等 Slime 参数，最后重置少量 Megatron 字段。
 
 ```python
-# 来源：slime/utils/arguments.py L1495-L1525
+# 来源：slime/utils/arguments.py L1495-L1523
 # Add custom arguments in front to prevent overwritten some slime arguments.
 if add_custom_arguments is not None:
     parser = add_custom_arguments(parser)
@@ -164,7 +165,7 @@ reset_arg(parser, "--padded-vocab-size", type=int, default=None)
 设计选择：`_pre_parse_mode` 只读能改变解析路径的字段；`parse_args` 根据它决定是否跳过 `sglang_parse_args`。
 
 ```python
-# 来源：slime/utils/arguments.py L1530-L1559
+# 定位骨架（非逐行摘录）：来源 slime/utils/arguments.py L1530-L1559
 def _pre_parse_mode():
     """Pre-parse CLI to extract arguments that control parsing flow.
 
@@ -272,7 +273,11 @@ return args
 ```python
 # 来源：slime/backends/sglang_utils/arguments.py L141-L154
 def validate_args(args):
+    args.sglang_dp_size = args.sglang_data_parallel_size
     args.sglang_pp_size = args.sglang_pipeline_parallel_size
+    args.sglang_ep_size = args.sglang_expert_parallel_size
+
+    # Compute effective TP size considering PP size
     if args.sglang_pp_size > 1:
         assert args.rollout_num_gpus_per_engine % args.sglang_pp_size == 0, (
             f"rollout_num_gpus_per_engine ({args.rollout_num_gpus_per_engine}) must be divisible by "
@@ -430,7 +435,7 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/external.py L107-L120
+# 来源：slime/backends/sglang_utils/external.py L107-L119
 def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
     addrs = args.rollout_external_engine_addrs
@@ -517,13 +522,15 @@ python -m pytest slime/tests/test_megatron_argument_validation.py -q
 python -m pytest slime/tests/test_external_sglang_engines.py -q
 ```
 
-预期现象：
+依赖齐全时的预期现象：
 
 - `normal_non_colocate` 固定为 `(48, 16)`。
 - colocate 8/16/32 rollout GPU 分别验证 `max(actor, rollout)`。
 - `rollout_num_gpus=0` 在 validate 里保留为 0。
 - external PD 两个 server 会写回 `rollout_num_gpus=6`、`rollout_num_engines=2`。
 - delta weight sync 在 colocate 下抛错。
+
+当前轻量环境实测：`test_megatron_argument_validation.py` 为 14 passed；placement group 与 external 两组分别因缺少 `ray`、`httpx` 在 collection 阶段失败。后两组可做静态契约核对，但不记为运行通过。
 
 ## 复盘迁移
 

@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 启动链路
 
@@ -31,8 +31,9 @@ updated: 2026-07-10
 flowchart LR
  SCRIPT["console script<br/>sglang"] --> MAIN["cli.main:main"]
  MAIN --> SERVE["cli.serve:serve"]
- SERVE --> PLUGINS["load_plugins"]
- SERVE --> TYPE["model type dispatch"]
+ SERVE -->|正常启动；help 路径跳过| PLUGINS["load_plugins"]
+ SERVE -.->|help| HELP["LLM help + diffusion help"]
+ PLUGINS --> TYPE["model type dispatch"]
  TYPE --> DIFF["diffusion parser"]
  TYPE --> LLM["prepare_server_args"]
  LLM --> SA["ServerArgs"]
@@ -43,7 +44,7 @@ flowchart LR
  RUN --> ENC["Encoder server"]
 ```
 
-这个模型里最重要的边界是：`cli/main.py` 不解释 `--model-path`；`cli/serve.py` 只做模型族分发；`ServerArgs` 才是 LLM 服务参数的正式载体；`run_server` 只根据已经成型的 `ServerArgs` 选择 runtime 入口。
+这个模型里最重要的边界是：`cli/main.py` 不解释 `--model-path`；`cli/serve.py` 只做模型族分发；`ServerArgs` 才是 LLM 服务参数的正式载体；`run_server` 只根据已经成型的 `ServerArgs` 选择 runtime 入口。还要记住一个容易踩坑的前置条件：`serve()` 在合并 YAML 之前就要窥探模型路径，因此模型路径不能只藏在 config 里。
 
 ## 阅读顺序
 
@@ -66,7 +67,7 @@ flowchart LR
 | `python/sglang/cli/serve.py` | `serve` 如何处理 help、插件、LLM/diffusion 分发和清理 |
 | `python/sglang/cli/utils.py` | 如何在完整 parser 之前早期读取 `--model-path` 并做 diffusion 检测 |
 | `python/sglang/srt/server_args.py` | LLM 服务参数如何从 argv 变成 `ServerArgs`，以及 runtime 衍生 `PortArgs` |
-| `python/sglang/srt/server_args_config_parser.py` | YAML config 如何合并进 CLI 参数 |
+| `python/sglang/srt/server_args_config_parser.py` | YAML config 如何合并进 CLI 参数，以及精确 `--config FILE` 语法的边界 |
 | `python/sglang/srt/plugins/` | 插件发现、白名单、平台过滤、hook 注册与 apply |
 | `python/sglang/launch_server.py` | `ServerArgs` 如何进入 HTTP/gRPC/Ray/Encoder 分支 |
 
@@ -152,7 +153,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 | 方向 | 专题 | 关系 |
 |------|------|------|
 | 下游 | [[SGLang-HTTP-Server]] | 默认 `run_server` 分支继续启动 HTTP server 和 SRT engine |
-| 下游 | [[SGLang-gRPC-Proto]] | `grpc_mode=True` 时进入 legacy gRPC 分支 |
+| 下游 | [[SGLang-gRPC-Proto]] | `grpc_mode=True` 时进入 legacy SMG gRPC 分支；不要与默认 HTTP 路径预留的 native Rust gRPC 能力混为一谈 |
 | 下游 | [[SGLang-分布式]] | `ServerArgs` 中的 TP/PP/DP/CP 字段决定分布式坐标 |
 | 下游 | [[SGLang-可观测性]] | 插件、日志、metrics 参数会影响可观测入口 |
 
@@ -161,7 +162,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 - 为什么 `sglang --help` 不应该展示 `--model-path`？
 - `--model-type` 为什么要在 `serve()` 层被剥离，而不是进入 `ServerArgs`？
 - `--config` YAML 和 CLI 显式参数冲突时，谁覆盖谁？
-- 插件 hook 为什么必须在 runtime 入口 import 前 apply？
+- 为什么当前主入口选择尽早加载插件，但真正的不变量是“每个相关进程在开始服务前完成注册与 apply”，而不是“目标模块绝不能提前 import”？
+- 为什么模型路径只写在 YAML config 里仍会在 `serve()` 的早期分发阶段失败？
 - `encoder_only=True` 和 `grpc_mode=True` 同时出现时，为什么不是普通 gRPC 分支？
 
 下一篇先读 [[SGLang-启动链路-核心概念]]。

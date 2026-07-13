@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Advantage计算
 
@@ -22,6 +22,8 @@ updated: 2026-07-10
 - 首次阅读：知道 reward、KL、value、mask 如何合成训练信号。
 - 排障：看到 `advantages` 缺失、KL 异常、CP shape mismatch、OPD teacher 缺失时能找到源码入口。
 - 改代码：新增 estimator 或自定义 advantage hook 时，知道必须填哪些字段，不能破坏哪些并行边界。
+- 优化 forward：判断“复用 policy-loss logprob”是否仍给 advantage 阶段留下可用于构造 token shape 的 `rollout_log_probs` 或 `values`。
+- 识别别名：REINFORCE++ baseline 的 `returns = advantages` 会让 OPD 对 list 的原地替换同时改变 returns，这与其他 estimator 不同。
 
 ## 核心模型
 
@@ -76,12 +78,14 @@ flowchart LR
 
 ## 首次阅读抓手
 
-先记住四个不变量：
+先记住六个不变量：
 
 - `compute_advantages_and_returns` 只在 pipeline last stage 写 `rollout_data`。
 - `kl_coef == 0` 时仍会构造零 KL 张量，因为 estimator 需要 shape 和 device。
 - PPO 需要 `values`，GRPO/GSPO/CISPO 不在 advantage 阶段区分算法差异。
 - `normalize_advantages` 使用 DP group 的 masked 统计，CP 下 mask 必须切到本地 response chunk。
+- 多处 estimator/helper 使用 `zip(..., strict=False)` 或只比较部分列表长度；sample 数、tensor shape、mask 和 permutation 必须由调用边界额外证明。
+- `reinforce_plus_plus_baseline` helper 当前接收 `loss_masks` 却不读取它；mask 仍在下游 reducer/whitening 生效，不能误称已在 helper 内屏蔽。
 
 ## 相关验证
 

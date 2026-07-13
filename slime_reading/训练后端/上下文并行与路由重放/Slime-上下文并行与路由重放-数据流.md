@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 上下文并行与路由重放 · 数据流
 
@@ -82,7 +82,7 @@ sequenceDiagram
 rollout engine 开关：
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L625-L627
+# 来源：slime/backends/sglang_utils/sglang_engine.py L625-L626
 if args.use_rollout_routing_replay:
     kwargs["enable_return_routed_experts"] = True
 ```
@@ -90,7 +90,7 @@ if args.use_rollout_routing_replay:
 rollout payload：
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L174-L182
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L174-L182 删节）：
 payload = {
     "sampling_params": sampling_params,
     "return_logprob": True,
@@ -104,7 +104,7 @@ if args.use_rollout_routing_replay:
 RoutingReplay 只应注入 actor，不应注入 critic。`RayTrainGroup` 创建 actor 时设置环境变量：
 
 ```python
-# 来源：slime/ray/actor_group.py L86-L89
+# 来源：slime/ray/actor_group.py L87-L88
 if self.args.use_routing_replay and self.role == "actor":
     env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 ```
@@ -140,6 +140,8 @@ if self.args.use_routing_replay and self.role == "actor":
 - 来源：slime/backends/megatron_utils/data.py L69-L148
 - 来源：slime/backends/megatron_utils/loss.py L151-L227
 
+`_allgather_cp_redistribute` 的“downstream 形态”具体是每样本 zigzag-local response list，不是继续保持 contiguous global-stream chunk。也因此，任何旁路字段若只照搬模型输入的 contiguous 切法，都不能直接与这些 response tensor 对齐。
+
 ## 不变量
 
 - 同一 sample 的 `total_length`、`response_length`、`loss_mask` 必须始终按同一顺序出现。
@@ -147,3 +149,6 @@ if self.args.use_routing_replay and self.role == "actor":
 - `rollout_mask_sums` 是 full denominator，不随 CP rank 改变。
 - `RoutingReplay.all_routing_replays` 的数量必须等于本 rank 上 MoE layer 数。
 - `fallthrough` 不写 replay buffer；`record` 和 `replay_*` 才改变或消费 buffer。
+- `fill_routing_replay` 当前只实现 zigzag CP/SP expert-id 切分；allgather-CP 与 rollout replay 的组合没有参数互斥，也没有同布局实现。
+- `ROUTING_REPLAY_STAGE`、全局 `ROUTING_REPLAY` 指针、两个游标和 `top_indices_list` 是一组进程内状态；异常退出时必须一起审计。
+- `get_sum_of_sample_mean`、`_allgather_cp_redistribute` 等多处 `strict=False` 不会证明字段覆盖集完整。

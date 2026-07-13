@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Sampling · 核心概念
 
@@ -25,7 +25,7 @@ updated: 2026-07-10
 | JSON schema 请求迟迟不进 batch | `GrammarManager` 编译队列 |
 | 结构化输出 token 被挡掉 | grammar vocab mask |
 | 重复惩罚或 presence/frequency 不生效 | penalty orchestrator |
-| greedy 和随机采样性能差异大 | `Sampler.forward` 的 greedy short path |
+| `temperature=0` 仍没走最快路径 | `__post_init__` 改写与 batch 级 greedy fast path |
 | 多 TP rank 约束解码 hang | grammar 后的 token id 同步 |
 
 ## 心理模型：下一 token 生产线
@@ -36,14 +36,27 @@ Sampling 不是一个单独函数，而是一条流水线：
 单请求参数
   -> 是否需要 grammar 编译
   -> batch 级张量和状态
-  -> logits 原地改写
+  -> penalty / grammar / bias / custom processor 原地改写 logits
   -> greedy 或概率采样
-  -> grammar/penalty 状态推进
+  -> token 提交、grammar 前进、下一步 penalty 累积
 ```
 
-### 1. 参数先被校验和规范化
+### 1. 参数先被构造、校验和规范化
 
-`verify` 会检查数值范围、logit bias token id 和 grammar 字段互斥关系。这里仍是 CPU 侧的请求语义检查。
+`__post_init__` 先处理特殊值，`verify` 再检查数值范围、logit bias token id 和部分 grammar 字段互斥关系，`normalize` 最后整理 stop 字段和 tokenizer 依赖。三者不是同义词。
+
+最重要的特殊值是 `temperature=0`：小于 `_SAMPLING_EPS` 的非负 temperature 会被改写成 `temperature=1.0、top_k=1`。因此后续 greedy 判断确实只看 `top_k`，但用户传入的零温度已经在更早阶段被翻译成了这个内部表示。
+
+```python
+# 来源：python/sglang/srt/sampling/sampling_params.py L168-L174
+        # Process some special cases
+        if 0 <= self.temperature < _SAMPLING_EPS:
+            # top_k = 1 means greedy sampling
+            self.temperature = 1.0
+            self.top_k = 1
+        if self.top_k == -1:
+            self.top_k = TOP_K_ALL  # whole vocabulary
+```
 
 ```python
 # 来源：python/sglang/srt/sampling/sampling_params.py L176-L232
@@ -106,7 +119,7 @@ Sampling 不是一个单独函数，而是一条流水线：
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
 ```
 
-注意 `structural_tag` 没在这个互斥列表里；后面 `GrammarManager` 会按 `json_schema -> regex -> ebnf -> structural_tag` 的顺序选 key。
+注意 `structural_tag` 没在这个互斥列表里；后面 `GrammarManager` 会按 `json_schema -> regex -> ebnf -> structural_tag` 的顺序选 key。这意味着 `structural_tag` 与前三者同时出现时不会在这里报“互斥”，而会被更高优先级字段静默遮蔽。空字符串则会通过外层 `is not None` 判断，却无法命中内部 truthy 分支，当前基线可能在使用未赋值的 `key` 时失败；调用方不应把“字段存在”和“非空有效”混为一谈。
 
 ### 2. Grammar 是请求准入前的异步关口
 
@@ -198,11 +211,11 @@ Scheduler 组 batch 后，`SamplingBatchInfo` 把每个 request 的温度、top-
         return ret
 ```
 
-`is_all_greedy` 是 batch 级开关：只要 batch 中有一行不是 greedy，整个 batch 就不能走纯 argmax fast path。
+`is_all_greedy` 是 batch 级开关：只要构造 batch 时有一行不是 greedy，整个 batch 就不能走纯 argmax fast path。当前基线在 `filter_batch()` 中只切张量，不重算 `is_all_greedy` 和三个 `need_*` 标志；所以非 greedy 行后来被过滤掉，也可能继续走较慢但语义仍正确的概率路径。`merge_batch()` 则会用 AND/OR 合并这些标志。
 
 ### 4. Logits 被原地改写
 
-`ModelRunner` 在调用 Sampler 前，会先更新 grammar mask，然后调用 `apply_logits_bias`。这个函数内部还会施加 penalty、grammar mask 和 logit bias。
+`ModelRunner` 在调用 Sampler 前，会先更新 grammar mask，然后调用 `apply_logits_bias`。这个名字只说了最后一步；完整顺序是：overlap 预累积 additive penalty → overlap scaling penalty → non-overlap orchestrator penalty → grammar mask → logit bias。overlap 与 non-overlap penalty 是两种承载方式，不是设计上要重复施加两遍。
 
 ```python
 # 来源：python/sglang/srt/model_executor/model_runner.py L3143-L3158
@@ -224,11 +237,11 @@ Scheduler 组 batch 后，`SamplingBatchInfo` 把每个 request 的温度、top-
         sampling_info.vocab_mask = None
 ```
 
-因此“某 token 为什么不可能被选中”要先看 logits 预处理，而不是只看最终 top-p 采样。
+随后 `Sampler._preprocess_logits` 才运行 custom logit processor，并清理非有限值。因此 custom processor 是 grammar mask 和 logit bias 之后的最后一个用户扩展点：如果它把被 mask 的位置重新写成有限值，就可能破坏结构约束。启用自定义 processor 时，不能只凭 `vocab_mask` 存在就断言最终候选集安全。
 
 ### 5. Sampler 决定 greedy 还是随机
 
-`Sampler.forward` 会先处理 custom logit processor 和 NaN，然后根据 `is_all_greedy` 分支。全 greedy 时直接 argmax；否则进入温度缩放、softmax 和概率采样路径。
+`Sampler.forward` 会先处理 custom logit processor 和 NaN，然后根据 `is_all_greedy` 分支。全 greedy 时直接 argmax；否则再在 Ascend、RL on-policy deterministic simple case、普通 softmax + backend 采样之间分叉。
 
 ```python
 # 来源：python/sglang/srt/layers/sampler.py L116-L145
@@ -264,7 +277,7 @@ Scheduler 组 batch 后，`SamplingBatchInfo` 把每个 request 的温度、top-
             logprobs_via_logsoftmax_kernel = None
 ```
 
-## 复盘迁移
+## 复盘
 
 读 Sampling 时可以把问题翻译成一句话：在下一 token 生产线的哪一站，候选 token 集合或分布被改变了。
 
@@ -272,8 +285,10 @@ Scheduler 组 batch 后，`SamplingBatchInfo` 把每个 request 的温度、top-
 |----------|------|
 | 参数无效或 alias 清理 | `SamplingParams` |
 | 请求暂不进入 batch | `GrammarManager` |
-| 每行参数变成 GPU tensor | `SamplingBatchInfo` |
+| 每行参数变成设备 tensor | `SamplingBatchInfo` |
 | 合法 token 集合被裁剪 | grammar vocab mask |
 | token 概率被惩罚或加 bias | penalty / logit bias |
+| mask 后的 logits 被再次改写 | custom logit processor |
 | 分布被抽样 | `Sampler.forward` |
-| grammar 状态推进 | result processor |
+| token 提交与 grammar 状态推进 | result processor |
+| 下一步 penalty 历史累积 | `ScheduleBatch.prepare_for_decode` |

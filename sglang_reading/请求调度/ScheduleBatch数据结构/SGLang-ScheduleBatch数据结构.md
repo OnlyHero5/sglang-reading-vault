@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ScheduleBatch数据结构
 
@@ -31,15 +31,17 @@ flowchart LR
     TOK["TokenizedGenerateReqInput<br/>TokenizerManager 发往 Scheduler"]
     REQ["Req<br/>单请求运行态"]
     SB["ScheduleBatch<br/>Scheduler 批次工作台"]
-    FB["ForwardBatch<br/>ModelRunner 执行快照"]
-    TID["BatchTokenIDOutput<br/>token 级回程"]
-    STR["BatchStrOutput<br/>字符串级回程"]
+    FB["ForwardBatch<br/>本轮执行视图"]
+    TID["BatchTokenIDOutput<br/>token / detokenize 窗口"]
+    STR["BatchStrOutput<br/>文本增量"]
 
     API --> TOK --> REQ --> SB --> FB
-    SB --> TID --> STR
+    SB --> TID
+    TID -->|"正常生成"| STR
+    TID -->|"skip-tokenizer-init"| API
 ```
 
-这条链的核心不是“字段很多”，而是“同一个请求在每个边界被收窄”：API 层允许文本、token、多模态、batch；IPC 层要求 msgspec 可编码；Scheduler 层变成可变生命周期对象；ModelRunner 层只保留 forward 所需张量。
+这条链的核心不是“字段很多”，而是“同一个请求在每个边界被收窄”：API 层允许文本、token、多模态、batch；IPC 层要求 msgspec 可编码；Scheduler 层变成可变生命周期对象；ModelRunner 层只保留 forward 所需张量。注意两处容易被一句话抹平的事实：`running_batch` 可以跨多个 decode iteration 原地演化；`ForwardBatch.init_new` 会消费一次性 override，因此它是执行视图的构造边界，不是完全无副作用的只读复制。
 
 ---
 
@@ -57,8 +59,10 @@ flowchart LR
 |------|----------------|
 | `python/sglang/srt/managers/io_struct.py` | HTTP/Tokenizer/Scheduler/Detokenizer 之间的 IPC 消息 |
 | `python/sglang/srt/managers/schedule_batch.py` | `Req` 与 `ScheduleBatch` 的生命周期和 batch 变形 |
-| `python/sglang/srt/model_executor/forward_batch_info.py` | `ScheduleBatch` 到 `ForwardBatch` 的执行快照 |
+| `python/sglang/srt/model_executor/forward_batch_info.py` | `ScheduleBatch` 到 `ForwardBatch` 的执行视图与 one-shot 消费 |
 | `python/sglang/srt/managers/scheduler.py` | `Req` 入队、prefill 组包、decode 更新的调用点 |
+| `python/sglang/srt/managers/scheduler_components/output_streamer.py` | 区分 detokenize 窗口、客户端 token 增量和其他输出元信息 |
+| `python/sglang/srt/managers/scheduler_components/ipc_channels.py` | 正常、skip-tokenizer 两种回程拓扑 |
 | `python/sglang/srt/managers/tokenizer_manager.py` | `GenerateReqInput` 到 `TokenizedGenerateReqInput` 的入口 |
 | `python/sglang/srt/managers/detokenizer_manager.py` | token 级输出到字符串输出的回程 |
 | `python/sglang/srt/managers/embed_types.py` | `PositionalEmbeds` 的跨模块嵌入覆盖结构 |
@@ -86,7 +90,7 @@ ScheduleBatch -> ForwardBatch
 """
 ```
 
-中文解释：`ScheduleBatch` 是调度侧的工作台，保留请求列表、prefix 命中、KV pool、采样状态、batch 是否满等决策信息；`ForwardBatch` 是执行侧快照，抽取 `input_ids`、`seq_lens`、`out_cache_loc`、`positions` 等张量给模型 forward。
+中文解释：`ScheduleBatch` 是调度侧的可变工作台，保留请求列表、prefix 命中、KV pool、采样状态、batch 是否满等决策信息。新 prefill batch 常按轮创建，而 `running_batch` 会跨 decode 轮次持续过滤、合并和重新 prepare；overlap 调度还会为延迟结果处理建立受限浅拷贝。`ForwardBatch` 则是本轮 forward 的执行视图，抽取或派生 `input_ids`、`seq_lens`、`out_cache_loc`、`positions` 等张量。
 
 ---
 
@@ -94,7 +98,7 @@ ScheduleBatch -> ForwardBatch
 
 | 顺序 | 文档 | 读者任务 |
 |------|------|----------|
-| 1 | [[SGLang-ScheduleBatch数据结构-核心概念]] | 建立“四层对象 + 两条对齐不变量”的心理模型 |
+| 1 | [[SGLang-ScheduleBatch数据结构-核心概念]] | 建立“五层对象 + 两条对齐不变量 + 两种回程”的心理模型 |
 | 2 | [[SGLang-ScheduleBatch数据结构-源码走读]] | 沿一条 generate 请求读真实调用链 |
 | 3 | [[SGLang-ScheduleBatch数据结构-数据流]] | 看跨进程、进程内、GPU 边界如何分工 |
 | 4 | [[SGLang-ScheduleBatch数据结构-排障指南]] | 排查常见混淆与失败模式 |
@@ -110,7 +114,8 @@ ScheduleBatch -> ForwardBatch
 2. 在 `Scheduler.handle_generate_request` 后观察 `Req.rid`、`origin_input_ids`、`positional_embed_overrides`。
 3. 在 `ScheduleBatch.prepare_for_extend` 后观察 `prefix_lens`、`extend_lens`、`seq_lens`、`out_cache_loc`。
 4. 在 `TpModelWorker.forward_batch_generation` 中确认进入 ModelRunner 的对象已经是 `ForwardBatch`。
-5. 在 Detokenizer 侧比较 `BatchTokenIDOutput.decode_ids` 与 `BatchStrOutput.output_strs`。
+5. 同时比较 `BatchTokenIDOutput.decode_ids`、`output_ids` 与 `BatchStrOutput.output_strs`：三者分别是 detokenize 窗口片段、客户端 output-token 增量、文本增量。
+6. 分别确认正常生成、`--skip-tokenizer-init` 和 embedding 请求的回程：经过 Detokenizer、直接回 TokenizerManager、无需字符串 detokenize。
 
 ---
 
@@ -122,6 +127,7 @@ ScheduleBatch -> ForwardBatch
 - `Req` 的哪些字段是生命周期状态，不能放进 `TokenizedGenerateReqInput`。
 - `ScheduleBatch.prepare_for_extend` 如何把 prefix hit 与本次 extend token 分开。
 - `filter_batch` 和 `merge_batch` 为什么必须同步处理 `reqs`、`req_pool_indices`、`seq_lens`、`sampling_info`。
-- `ForwardBatch.init_new` 为什么是 GPU 执行边界，而不是另一个 Scheduler 对象。
+- `ForwardBatch.init_new` 为什么是 GPU 执行边界，以及它消费哪些 one-shot override。
+- `decode_ids` 为什么可能包含 prompt surrounding context，不能当作纯生成 token 增量。
 
 ← [[SGLang-SchedulePolicy]] · → [[SGLang-Detokenizer]]

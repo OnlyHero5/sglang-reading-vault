@@ -26,7 +26,7 @@ updated: 2026-07-10
 | 排查首次 rollout 权重 | 步骤五 | actor 初始化后总是先 `update_weights`，再允许第一轮 generate |
 | 排查 eval-only | 步骤六 | `num_rollout == 0` 是主循环外出口，不会进入训练 step |
 | 理解同步 step | 步骤七到八 | 同步路径严格先 generate 再 train，step 尾部再保存、清显存、推权 |
-| 理解异步 step | 步骤九到十 | async 只重叠 generate / train，更新权重前必须等下一轮 generate 结束 |
+| 理解流水异步 step | 步骤九到十 | N+1 预取天然带来一拍 staleness；更新权重前必须等在途 generate 结束 |
 
 ## 贯穿场景
 
@@ -98,7 +98,7 @@ def train(args):
 设计选择：`_get_placement_group_layout` 返回总 GPU 数和 rollout 在 bundle 中的 offset；`create_placement_groups` 再按 offset 切出 actor 和 rollout 视图。
 
 ```python
-# 来源：slime/ray/placement_group.py L100-L137
+# 来源：slime/ray/placement_group.py L100-L117
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
@@ -120,7 +120,7 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
 ```
 
 ```python
-# 来源：slime/ray/placement_group.py L126-L137
+# 来源：slime/ray/placement_group.py L126-L133
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
@@ -144,7 +144,7 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
 设计选择：`create_rollout_manager` 创建 remote actor 后，必要时询问 `get_num_rollout_per_epoch`，并在 offload_rollout 下先 offload。
 
 ```python
-# 来源：slime/ray/placement_group.py L220-L246
+# 来源：slime/ray/placement_group.py L220-L237
 def create_rollout_manager(args, pg):
     from .rollout import RolloutManager
 
@@ -174,7 +174,7 @@ def create_rollout_manager(args, pg):
 设计选择：`create_training_models` 分别初始化 critic 和 actor，统一确认 start id，然后把 rollout manager 注入 train group。
 
 ```python
-# 来源：slime/ray/placement_group.py L191-L217
+# 来源：slime/ray/placement_group.py L191-L212
     actor_start_rollout_ids = ray.get(
         actor_model.async_init(
             actor_args,
@@ -278,6 +278,7 @@ def create_rollout_manager(args, pg):
 - `rollout_data_ref` 是 RolloutManager 已经整理好的训练数据引用。
 - critic 分支先产生 `value_refs`，actor 训练时把它作为 `external_data`。
 - critic-only 阶段只等待 critic，不启动 actor。
+- 但 step 尾部仍无条件调用 `actor_model.update_weights()`；这会发布 actor 当前状态，不能把“未训练”写成“未发布”。
 
 ## 步骤八：step 尾部先保存，再清显存，再推权
 
@@ -338,7 +339,7 @@ def create_rollout_manager(args, pg):
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 ```
 
-注意：这不是 [[Slime-其他Rollout路径]] 里的 fully-async rollout。这里仍是一轮一个完整 `generate.remote`，只是提前启动下一轮。
+注意：这不是 [[Slime-其他Rollout路径]] 里的 fully-async rollout。这里仍是一轮一个完整 `generate.remote`，只是提前启动下一轮。正因为 N+1 在 train N 结束前启动，即使每轮都发布，N+1 也由较旧 policy 生成。
 
 ## 步骤十：async update 前必须 drain
 
@@ -355,7 +356,7 @@ def create_rollout_manager(args, pg):
             actor_model.update_weights()
 ```
 
-失败边界：`update_weights_interval > 1` 会引入 policy staleness；这是吞吐和新鲜度的交换，不是无成本优化。
+失败边界：一步 ahead 预取本身就引入 policy staleness；`update_weights_interval > 1` 又增加连续训练多步才发布的窗口。这是吞吐和新鲜度的交换，不是无成本优化。
 
 ## 运行验证
 
@@ -365,4 +366,4 @@ def create_rollout_manager(args, pg):
 | async decoupled 主线 | `python -m pytest slime/tests/test_qwen2.5_0.5B_async_short.py -q` | `execute_train` 显式传入 `train_script="train_async.py"` |
 | critic-only | `python -m pytest slime/tests/test_qwen3_4B_ppo_train_critic_only.py -q` | PPO 前若干 rollout 只训练 critic |
 
-这些是端到端 smoke test，需要模型、数据、GPU 和下载环境。本地缺依赖时，至少用源码和配置确认分支是否覆盖。
+这些是端到端 smoke test，需要模型、数据、GPU 和下载环境。本地缺依赖时，静态阅读三个测试文件，确认 `--colocate`、`train_script="train_async.py"` 与 `--num-critic-only-steps` 分别覆盖对应分支；不能把未运行测试记为通过。

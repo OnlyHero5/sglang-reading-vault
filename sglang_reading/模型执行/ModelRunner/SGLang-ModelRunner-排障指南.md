@@ -9,13 +9,13 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ModelRunner · 排障指南
 
 ## 你为什么要读
 
-本页是 ModelRunner 排障入口。读完后，你应该能把“没有走 CUDA Graph”“prefill 仍是 eager”“PP rank 没 logits”“structured output 延迟采样”等症状分别落到 Worker 门面、ForwardBatch、runner 选路或结果处理边界。
+本页是 ModelRunner 排障入口。读完后，你应该能把“没有走 CUDA Graph”“prefill 仍是 eager”“metadata 过期”“PP rank 没 logits”“structured output 延迟采样”等症状分别落到 Worker、live batch、runner view、metadata owner 或结果生命周期边界。
 
 ## 1. Scheduler 为什么不直接调用 ModelRunner？
 
@@ -33,13 +33,13 @@ updated: 2026-07-10
 
 **症状：** 调试时同一个字段在 Scheduler 和 ModelRunner 两边都能看到，不清楚谁负责更新。
 
-**原因：** `ScheduleBatch` 是调度态，可能继续被 merge、filter、retract；`ForwardBatch` 是本次 forward 的执行快照，关注 tensor、索引、长度、KV 写入位置和采样信息。
+**原因：** `ScheduleBatch` 是调度态，可能继续被 merge、filter、retract；`ForwardBatch` 收窄到 tensor、索引、长度、generic KV 写入位置和采样信息，但它借用多个字段，并会被 padding、runner registry 或 Graph view 继续塑形。
 
 源码入口：来源：python/sglang/srt/model_executor/forward_batch_info.py L14-L26
 
 源码入口：来源：python/sglang/srt/model_executor/forward_batch_info.py L613-L722
 
-**验证：** 在 `ForwardBatch.init_new` 看 `seq_lens_cpu_cache` 的 shape 断言。如果 Scheduler 修改了 batch size 却复用旧 CPU mirror，这里会直接暴露。
+**验证：** 在 `ForwardBatch.init_new` 看 `seq_lens_cpu_cache` 的 shape 断言，再记录进入 `_prepare_eager_forward_batch` 前后 bs/token 数和 runner 最终 view。不要把通过这一个断言当成所有 metadata 都新鲜。
 
 ## 3. decode 为什么没有走 CUDA Graph？
 
@@ -52,6 +52,7 @@ updated: 2026-07-10
 - 当前 batch shape 不能匹配 capture bucket。
 - DP/attention TP/CP padding 约束过滤了目标 batch size。
 - 开了某些 backend 或高级模式后 runner 判定不能 replay。
+- `replace_embeds`、encoder lens、TBO、hidden capture mode、ngram shape、LoRA graph variant 等条件不兼容。
 
 源码入口：来源：python/sglang/srt/model_executor/model_runner.py L3048-L3141
 
@@ -59,7 +60,7 @@ updated: 2026-07-10
 
 源码入口：来源：python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py L930-L1045
 
-**验证：** 启动时找 `Capture target decode CUDA graph begin` 的 bs 列表，再对照运行时 batch size。若 bs 不在 capture 集合或被并行约束过滤，decode 会退到 eager。
+**验证：** 记录 capture bs、runtime raw bs、`num_tokens_per_bs`、padding bucket 和 `can_run_graph()` 各子条件。禁用 Graph 只证明路径转入 eager，不能单独证明根因或预言吞吐方向。
 
 ## 4. prefill 为什么还是 eager？
 
@@ -80,7 +81,15 @@ updated: 2026-07-10
 
 **验证：** 启动日志应出现 `Capture target prefill CUDA graph begin/end`。若出现 `Disable prefill CUDA graph`，按日志原因回到上面的条件排查。
 
-## 5. PP 非末 rank 为什么没有 logits？
+## 5. 为什么 metadata 被重复计划或复用了旧 shape？
+
+**症状：** multi-step/spec 场景第一轮正常，DP padding、Graph replay 或后续 step 出现索引/shape 错位。
+
+**原因：** attention metadata 可能已由 plan-stream、Graph loader 或专用 wrapper 预先生成。`forward_metadata_ready` 记录计划时 bs/token 数；只有 `replan_equivalent=True` 的路径允许普通 forward 在 shape 变化后重建。无条件初始化会覆盖专用计划，无条件跳过又可能复用 stale shape。
+
+**验证：** 记录 plan 调用点、`mark_forward_metadata_ready()`、计划 shape、最终 padded shape、`needs_forward_metadata_init()` 结果和实际 backend 对象。Graph replay 还要确认固定 buffer 是原地刷新而非换指针。
+
+## 6. PP 非末 rank 为什么没有 logits？
 
 **症状：** 某个 PP rank forward 返回了结果，但没有 `next_token_ids`。
 
@@ -90,7 +99,7 @@ updated: 2026-07-10
 
 **验证：** 在非末 rank 看 `GenerationBatchResult.pp_hidden_states_proxy_tensors`，在末 rank 看 `logits_output` 与 `next_token_ids`。
 
-## 6. structured output 下为什么延迟采样？
+## 7. structured output 下为什么延迟采样？
 
 **症状：** `forward_batch_generation` 返回后暂时没有 `next_token_ids`，但请求没有失败。
 
@@ -104,11 +113,11 @@ updated: 2026-07-10
 
 **验证：** 观察 `delay_sample_func` 被执行后应填入 `next_token_ids`，随后闭包被清空，`logits_output.next_token_logits` 被置空以释放显存。
 
-## 7. 在线更新权重后 graph 要不要重建？
+## 8. 在线更新权重后 graph 要不要重建？
 
 **症状：** 权重热更新成功，但后续 decode graph 行为不符合预期。
 
-**原因：** Worker 把更新请求转给 ModelRunner。对磁盘更新路径，只有请求参数 `recapture_cuda_graph` 为真且设备支持 graph 时，ModelRunner 才会重新初始化 decode graph。
+**原因：** Worker 把更新请求转给 ModelRunner。对磁盘更新路径，只有请求参数 `recapture_cuda_graph` 为真且设备支持 Graph 时才主动重建；另外，运行时要求的 hidden capture mode 高于/不同于当前 capture mode 时，decode Graph runner 也可能 cleanup 后 recapture。
 
 源码入口：来源：python/sglang/srt/managers/tp_worker.py L103-L108
 
@@ -116,7 +125,7 @@ updated: 2026-07-10
 
 **验证：** 更新请求里确认 `recapture_cuda_graph`，更新后看是否再次出现 decode graph capture 日志。
 
-## 8. embedding 请求为什么没有采样？
+## 9. embedding 请求为什么没有采样？
 
 **症状：** embedding 请求走了 ModelRunner，但没有 token 输出。
 
@@ -128,7 +137,7 @@ updated: 2026-07-10
 
 **验证：** 看 `EmbeddingBatchResult.embeddings` 与 `pooled_hidden_states`，不要追 generation 的采样字段。
 
-## 9. HiCache 或 HiSparse 问题该从哪里切入？
+## 10. HiCache 或 HiSparse 问题该从哪里切入？
 
 **症状：** KV 分层、host cache 或 sparse KV 相关行为和 forward 对不上。
 
@@ -144,18 +153,19 @@ updated: 2026-07-10
 
 ## 排障顺序
 
-1. 先看 `forward_mode`。
-2. 再看 PP rank 是否是末 rank。
-3. 再看 `_forward_raw` 的 graph 条件。
-4. 再看 Worker 是否延迟采样。
-5. 最后看 Scheduler result processor 是否按 mode 消费结果。
+1. 先看 runtime `forward_mode`，Graph 路径再区分 capture mode 与 actual mode。
+2. 记录 live batch、padding 后 batch 和 runner view 的 shape。
+3. 判断 metadata 是本轮新计划还是专用路径预计划。
+4. 再看 Graph eligibility 与实际 runner。
+5. 判断 PP rank、verify/prefill-only 和 delayed sampling。
+6. 最后核对 D2H、relay 与 result processor 的生命周期。
 
 ## 运行验证
 
 ModelRunner FAQ 的最小验证要覆盖 `forward_mode`、graph 条件、PP 输出、延迟采样、embedding 分支和 HiCache/HiSparse 入口。
 
 ```powershell
-rg -n 'forward_mode|_forward_raw|can_run_cuda_graph|PPProxyTensors|is_generation|sample\(|EmbeddingBatchResult|forward_batch_embedding|hicache_consumer_index|hisparse_coordinator|process_batch_result|GenerationBatchResult' sglang/python/sglang/srt/model_executor/model_runner.py sglang/python/sglang/srt/model_executor/forward_batch_info.py sglang/python/sglang/srt/managers/tp_worker.py sglang/python/sglang/srt/managers/scheduler.py
+rg -n 'forward_mode|actual_forward_mode|forward_metadata_ready|needs_forward_metadata_init|_forward_raw|can_run_graph|build_replay_fb_view|PPProxyTensors|sample\(|EmbeddingBatchResult|hicache_consumer_index|hisparse_coordinator|GenerationBatchResult|extra_keep_alive_refs' sglang/python/sglang/srt/model_executor sglang/python/sglang/srt/managers/tp_worker.py sglang/python/sglang/srt/managers/scheduler.py
 ```
 
-读输出时先按 `forward_mode` 判断 prefill/decode/embedding；再看 `_forward_raw` 是否满足 graph replay 条件。PP 问题看 `PPProxyTensors`，采样问题看 `tp_worker.py` 里何时调用 `sample`，embedding 问题看 `EmbeddingBatchResult`，KV 分层问题看 `hicache_consumer_index` 和 `hisparse_coordinator`。
+读输出时先把 live batch、runner view 与 metadata owner 分开，再判断 Graph/eager。PP 问题看 `PPProxyTensors`，采样问题看 Worker 立即/延迟/跳过三分支，embedding 问题看 `EmbeddingBatchResult`，KV 分层问题看 HiCache/HiSparse 状态如何一路注入执行对象。

@@ -19,8 +19,8 @@ updated: 2026-07-10
 
 - 为什么 API 分成 dense、packed、varlen、KV cache，而不是一个万能函数。
 - `maybe_contiguous`、custom op、fake tensor、autograd Function 分别解决什么边界问题。
-- `cu_seqlens`、`softmax_lse`、`S_dmask`、`rng_state` 在 Python 层各自扮演什么角色。
-- 哪些问题应停在 Python/API 层排查，哪些必须继续进入 C++/CUDA。
+- `cu_seqlens`、`softmax_lse`、`S_dmask`、`rng_state` 在 Python 层各自扮演什么角色，以及哪些只是协议对象、不能按名字望文生义。
+- 哪些问题应停在 Python/API 层排查，哪些必须继续进入 compiled C++/CUDA/HIP 或 ROCm Triton backend。
 
 ## API 形态是场景分类
 
@@ -62,7 +62,7 @@ from flash_attn.flash_attn_interface import (
 | 输入归一化 | `maybe_contiguous`、head dim padding、默认 `softmax_scale` | 是否改变 tensor layout 或补齐 head_dim |
 | dispatcher 适配 | `_torch_custom_op_wrapper`、`torch.ops.flash_attn.*` | 是否服务 PyTorch 2.4+ custom op / compile |
 | autograd 状态 | `FlashAttnFunc.save_for_backward` | forward 保存哪些对象给 backward |
-| extension 调用 | `flash_attn_gpu.fwd/varlen_fwd/fwd_kvcache` | 下一跳是否进入 `flash_attn_2_cuda` |
+| backend 调用 | `flash_attn_gpu.fwd/varlen_fwd/fwd_kvcache` | 当前模块选中 CUDA/HIP compiled extension，还是 ROCm Triton |
 
 源码开头显示了 extension 和 contiguous 边界：
 
@@ -89,7 +89,7 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 ```
 
-读者抓手：import 问题属于 extension/ABI/ROCm fallback 边界；last-dim stride 问题属于 tensor layout 边界。两者都发生在真正 CUDA kernel 主循环之前。
+读者抓手：import 问题属于 backend/ABI 边界；last-dim stride 问题属于 tensor layout 边界。只有 HIP 分支会在 compiled extension 导入失败后把 `USE_TRITON_ROCM` 改为真；普通 CUDA 分支导入 `flash_attn_2_cuda` 失败不会自动转去 Triton。两者都发生在真正 kernel 主循环之前。
 
 ## Custom Op 和 Fake Tensor 是编译生态边界
 
@@ -153,7 +153,9 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 ```
 
-读者抓手：遇到 `torch.compile`、fake tensor、tracing 问题时，不要直接去 CUDA kernel。先检查 custom op 注册和 fake 输出形状。
+这里的 `p` 对应内部 `S_dmask` 槽位：默认是空 tensor；请求 `return_softmax` 时，CUDA fake shape 把两个序列维补到 128 的倍数，HIP fake shape 不做这层补齐。它只声明元数据，不证明 backend 真能运行，也不把该槽位变成数学意义上的完整 attention probability。
+
+读者抓手：遇到 `torch.compile`、fake tensor、tracing 问题时，不要直接去 kernel。先检查 PyTorch 版本、custom op 注册和 fake 输出形状。这个 custom-op/fake 主线覆盖 dense/varlen wrapper；KV-cache 入口在当前基线直接调用 `flash_attn_gpu.fwd_kvcache`，不能无条件套用同一 compile 行为。
 
 ## Autograd Function 是 forward/backward 协议边界
 
@@ -214,14 +216,14 @@ class FlashAttnFunc(torch.autograd.Function):
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 ```
 
-读者抓手：`softmax_lse`、`rng_state` 不是附带信息。它们是 backward 重算 probability 与 dropout 的协议字段。
+读者抓手：`softmax_lse`、`rng_state` 不是附带信息。它们是 backward 重建 softmax 权重与复现 dropout mask 的协议字段。`return_attn_probs=True` 只决定公开 API 返回三元组；内部只有 `dropout_p > 0` 才要求 backend 生成 `S_dmask`，所以 dropout 为 0 时第三项不能当成真实概率矩阵。
 
 ## Varlen 是连续 token 加边界数组
 
 `unpad_input` 把 padded batch 变成连续 token、原始位置 indices 和 `cu_seqlens`。这让 kernel 处理连续内存，同时仍知道每条样本的边界。
 
 ```python
-# 来源：flash_attn/bert_padding.py L111-L126
+# 定位：flash_attn/bert_padding.py L111-L128（摘要/骨架；去除 upstream 尾随空格）
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -238,9 +240,13 @@ class FlashAttnFunc(torch.autograd.Function):
         indices,
         cu_seqlens,
         max_seqlen_in_batch,
+        used_seqlens_in_batch,
+    )
 ```
 
-读者抓手：varlen 不改变每条序列内部 attention 语义，只改变 batch 存储形态。`cu_seqlens` 错，通常是 correctness bug，而不是性能小问题。
+这五项分别是 packed hidden states、回填原 batch 的 `indices`、样本边界 `cu_seqlens`、最大物理打包长度和 `used_seqlens_in_batch`。要特别留意当前实现中的两套长度：前四项的打包边界来自 `attention_mask + unused_mask`，第五项只统计 `attention_mask`。`bert_padding.py` 的 docstring 把 `seqused` 写成两种 mask 之和，与实际第五返回表达式不一致；调用者应以代码返回值为准。
+
+读者抓手：varlen 不改变每条序列内部 attention 语义，只改变 batch 存储形态。`cu_seqlens` 错，通常是 correctness bug，而不是性能小问题；把第五返回值误当物理 packed length，同样会混淆协议。
 
 ## KV cache API 是推理 decode 契约
 
@@ -280,8 +286,56 @@ def flash_attn_with_kvcache(
     cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
 ```
 
-读者抓手：decode 性能问题要从 cache load/update、paged KV、SplitKV 和 RoPE position 查起，不要把它当成普通 dense forward 的小 shape。
+公开参数可以同时出现在函数签名中，不代表任意组合都受支持。当前 C++ 入口明确拒绝 paged KV 与 `cache_batch_idx`、leftpad 同时使用：
+
+```cpp
+// 来源：csrc/flash_attn/flash_api.cpp L1247-L1253
+    at::Tensor block_table;
+    const bool paged_KV = block_table_.has_value();
+    if (paged_KV) {
+        TORCH_CHECK(!cache_batch_idx_.has_value(), "Paged KVcache does not support cache_batch_idx");
+        block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
+```
+
+```cpp
+// 来源：csrc/flash_attn/flash_api.cpp L1397-L1401
+    params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
+    if (leftpad_k_.has_value()) {
+        TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
+        auto leftpad_k = leftpad_k_.value();
+        TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
+```
+
+读者抓手：decode 性能与正确性问题要从 cache load/update、物理结束位置、paged KV、SplitKV 和 RoPE position 查起，不要把它当成普通 dense forward 的小 shape。这个 API 不支持 backward；重复 `cache_batch_idx` 配合 append 还会产生最终写入者不确定的风险。
+
+## 运行验证
+
+当前环境若不能加载 compiled extension 或 Aiter，也能先验证 Python 协议本身：
+
+```powershell
+@'
+import ast
+from pathlib import Path
+
+interface = Path("flash-attn/flash-attention/flash_attn/flash_attn_interface.py")
+padding = Path("flash-attn/flash-attention/flash_attn/bert_padding.py")
+for path in (interface, padding):
+    ast.parse(path.read_text(encoding="utf-8"))
+
+tree = ast.parse(padding.read_text(encoding="utf-8"))
+fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "unpad_input")
+ret = next(node for node in ast.walk(fn) if isinstance(node, ast.Return))
+assert isinstance(ret.value, ast.Tuple) and len(ret.value.elts) == 5
+print("AST + unpad five-return contract: PASS")
+'@ | python -
+
+rg -n 'USE_TRITON_ROCM|noop_custom_op_wrapper|register_fake|return_softmax=return_softmax and dropout_p|fwd_kvcache' flash-attn/flash-attention/flash_attn/flash_attn_interface.py
+```
+
+预期 AST 与五返回值断言通过，静态定位同时覆盖 backend 分叉、PyTorch 2.4 前后分叉、fake 注册、dropout 下的 `S_dmask` 门禁和 KV-cache 直调。它不证明 extension ABI、GPU 数值或 `torch.compile` 图实际可执行。
 
 ## 复盘
 
-Python API 层可以压成一句话：它把用户调用变成后端契约。这个契约包含输入形态、layout、autograd 保存项、compiler fake shape、C++ extension 名称和推理 cache 状态。下一篇 [[FlashAttention-Python-API-源码走读]] 会沿真实调用顺序走一遍。
+Python API 层可以压成一句话：它把用户调用变成后端契约。这个契约包含输入形态、layout、autograd 保存项、compiler fake shape、backend 路由和推理 cache 状态；其中 compiled extension 才继续进入 pybind/C++，ROCm Triton 不能套用同一调用链。下一篇 [[FlashAttention-Python-API-源码走读]] 会沿真实调用顺序走一遍。

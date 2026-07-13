@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Detokenizer · 源码走读
 
@@ -27,7 +27,7 @@ updated: 2026-07-10
 
 ## 长文读法
 
-这篇按“token id 回程”和“字符串回程”两条线读：Scheduler 只负责把本轮新增 token id、offset、finish reason、logprob 和 `http_worker_ipc` 打成 `BatchTokenIDOutput`；Detokenizer 子进程维护 per-rid `DecodeStatus`，把 token id 批量 decode 成增量字符串；TokenizerManager 再把字符串和元信息累加到 `ReqState`，唤醒对应 HTTP/SSE 协程。
+这篇按“detokenize 窗口”和“客户端输出”两条线读：Scheduler 把带 surrounding context 的 `decode_ids` 窗口片段、客户端 `output_ids` delta、offset、finish reason、logprob 和 `http_worker_ipc` 打成 `BatchTokenIDOutput`；Detokenizer 只消费前者生成文本 delta，并透传后者；TokenizerManager 再把文本、token 和元信息累加到 `ReqState`，决定 HTTP/SSE 暴露增量还是累积语义。
 
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
@@ -122,11 +122,11 @@ Detokenizer 不是库函数调用，而是 Engine 启动时拉起的子进程。
         return processes, names
 ```
 
-这段证明了两个边界：Detokenizer 可以水平扩展，但 router 持有公共 `detokenizer_ipc_name`；worker 拿到的是私有 IPC。
+这段证明了两个边界：Detokenizer 可以水平扩展，但 router 持有公共 `detokenizer_ipc_name`；worker 拿到的是私有 IPC。Router 的 worker 选择键是 `http_worker_ipc`，不是 rid，因此它提供 HTTP-worker 级亲和：状态连续有保证，但单个繁忙 HTTP worker 也会把其全部请求集中到一个 Detokenizer。
 
 ## 步骤 2：Scheduler 把输出 token 打包成 BatchTokenIDOutput
 
-Scheduler 不是把字符串发给 Detokenizer，而是通过 `SchedulerOutputStreamer` 收集每个请求本轮需要发送的 token ids、read offset、finish reason、logprob 和统计字段。
+Scheduler 不是把字符串发给 Detokenizer，而是通过 `SchedulerOutputStreamer` 同时收集两种 token 载荷：供 Detokenizer 续接上下文的 `decode_ids` 窗口片段，以及供客户端消费的 `output_ids` delta；另带 read offset、finish reason、logprob 和统计字段。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/scheduler_components/output_streamer.py L119-L164
@@ -208,7 +208,7 @@ Scheduler 不是把字符串发给 Detokenizer，而是通过 `SchedulerOutputSt
         self.no_stop_trim.append(req.sampling_params.no_stop_trim)
 ```
 
-`Req.init_incremental_detokenize` 的做法是保留一段 prompt 尾部 surrounding token，再拼上输出 token。这样 Detokenizer 不是只 decode 最新 token，而是有足够上下文处理 tokenizer 边界。
+`Req.init_incremental_detokenize` 的做法是保留一段 prompt 尾部 surrounding token，再拼上输出 token。这样 Detokenizer 不是只 decode 最新 token，而是有足够上下文处理 tokenizer 边界。这也解释了为什么首包 `decode_ids` 可能比 `output_ids` 长：前者是窗口协议，后者才是纯输出 token delta。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/schedule_batch.py L1233-L1252
@@ -402,7 +402,7 @@ DetokenizerManager 构造函数分四层初始化：IPC 通道、tokenizer、运
             ]
 ```
 
-差分发生在下一步：`new_text = read_texts[i][len(surr_texts[i]):]`。因此 `surr_texts[i]` 必须是 `read_texts[i]` 的前缀，否则增量文本会错。
+差分发生在下一步：`new_text = read_texts[i][len(surr_texts[i]):]`。因此 `surr_texts[i]` 必须是 `read_texts[i]` 的前缀，否则增量文本会错。所谓 batch decode 也不是把不同配置混在一次调用里：fast tokenizer 会按 `(skip_special_tokens, spaces_between_special_tokens)` 分组，空窗口先过滤再 scatter；slow tokenizer 则逐行走 `decode_without_hf_kwargs`。
 
 ## 步骤 6：streaming 分支处理 UTF-8 与重复发送
 
@@ -550,7 +550,7 @@ TokenizerManager 的后台 `handle_loop` 接收 Detokenizer 回包，然后 `_ha
             self.soft_watchdog.feed()
 ```
 
-对 `BatchStrOutput`，它把 `delta_text` 追加到 state，并根据 streaming/incremental 配置决定本轮是否唤醒前台 HTTP 协程。
+对 `BatchStrOutput`，它总会先把 `delta_text` 追加到 state，再根据 streaming/incremental 配置构造前台对象：incremental 模式直接交出本轮 delta；非 incremental streaming 的中间态把 `text` 设为 `None`，避免每轮物化累积全文，前台等待逻辑再按累积语义读取。Detokenizer 的 delta 契约与客户端 chunk 契约因此是两层状态机。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/tokenizer_manager.py L1970-L2021
@@ -641,3 +641,4 @@ TokenizerManager 的后台 `handle_loop` 接收 Detokenizer 回包，然后 `_ha
 | UTF-8 边界 | 流式请求包含中文、emoji、byte-level tokenizer 易拆分字符 | SSE chunk 不应永久输出 replacement char；可打印前缀不应重复 |
 | skip 模式 | 启动时开启 `--skip-tokenizer-init` | TokenizerManager 收到 `BatchTokenIDOutput`，输出里主要是 `output_ids` |
 | 状态容量 | 压高 streaming 并发并调小 `SGLANG_DETOKENIZER_MAX_STATES` | 可能触发 decode status 缺失错误；调大后缓解 |
+| 多 worker 亲和 | 固定多个请求来自同一 `http_worker_ipc`，记录 router `_pick` | 这些请求落到同一 Detokenizer；更换 HTTP worker key 才可能换 worker |

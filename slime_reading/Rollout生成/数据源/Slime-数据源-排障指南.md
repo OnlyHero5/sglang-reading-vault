@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 数据源 · 排障指南
 
@@ -22,7 +22,7 @@ updated: 2026-07-10
 判断：默认 `sglang_rollout.generate_rollout` 入口要求 `args.rollout_global_dataset`。关闭 global dataset 意味着 prompt 来源必须由自定义 rollout 或自定义 data source 管理。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L618-L633
+# 来源：slime/rollout/sglang_rollout.py L618-L632
 def generate_rollout(
     args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
@@ -46,6 +46,8 @@ def generate_rollout(
 - 如果 prompt 来自外部服务、睡眠 rollout 或自定义 buffer，同时替换 `--rollout-function-path` 和必要的 `--data-source-path`。
 
 验证：启动前检查参数；启动后若断在 `generate_rollout` 的 assert，说明不是 tokenizer 或文件格式问题，而是 rollout 函数与数据源模式不匹配。
+
+补充边界：`rollout_global_dataset=True` 但 `prompt_data=None` 时，默认 DataSource 会生成空 `Sample()`，并不是解析阶段 fail fast。普通训练仍应显式配置 prompt 数据；空 Sample 只适合确知后续 custom generate 会完整填充输入的扩展路径。
 
 ## 症状二：buffer 有样本，但好像仍然读了 dataset
 
@@ -75,12 +77,14 @@ def generate_rollout(
 
 验证：给 buffer 放 B 组，调用 `get_samples(N)` 后，预期返回 N 组，其中前 B 组来自 buffer，dataset 的 `sample_offset` 只增加 `N-B`。
 
+这个预期要求自定义 buffer filter 不超额返回。若它返回多于 N 组，剩余数会变成负值，源码没有断言，dataset offset 甚至可能倒退。
+
 ## 症状三：dynamic filter drop 后数据集消耗变快
 
 判断：默认主循环不会把 filtered-out group 自动塞回 buffer。源码里的注释明确说明 unused samples 没有存回 data buffer。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L429-L437
+# 来源：slime/rollout/sglang_rollout.py L429-L436
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
@@ -220,7 +224,7 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 判断：`Dataset` 用 `prompt_key` 从记录取 prompt。字段名不匹配时，`data.get(prompt_key)` 会得到 `None`，错误可能延迟到模板、processor 或 tokenizer 阶段。
 
 ```python
-# 来源：slime/utils/data.py L130-L138
+# 定位骨架（据 `slime/utils/data.py` L130-L138 删节）：
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
     prompt = data.get(prompt_key)
 
@@ -239,12 +243,40 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 
 验证：在 `Dataset.__init__` 后看第一条 `dataset.samples[0].prompt`，不要等到 SGLang 请求失败才查。
 
+## 症状十：请求 N 组却少返回，offset 还大于 dataset 长度
+
+判断：默认跨 epoch 代码只执行一次“尾部 + 新 epoch 头部”，不是 while 循环。若 dataset 只有 3 条而请求 10 组，当前实现会返回 6 组，并把 `sample_offset` 写成 7。这个状态已经不再是合法的 dataset 内 offset。
+
+处理与预期：保证单次请求不超过“当前尾部 + 一个完整 epoch”的容量，生产配置通常还应让 dataset 长度不小于 `over_sampling_batch_size`。自定义 source 若承诺精确 N，应用循环明确实现多 epoch wrap，并对最终返回长度和 offset 范围做断言。
+
+## 症状十一：空数据集时 rollout 不报 EOF，却一直不前进
+
+jsonl 坏行会被打印并跳过；若全部行无效，或长度过滤移除全部样本，dataset 可能为空。开启 max-length 时还可能先在 `origin_samples[0]` 触发 `IndexError`；未开启时 `get_samples` 持续返回空列表。默认 rollout 与 fully-async 都没有 EOF 终态：前者反复拉取，后者后台重试而前台持续等待。
+
+验证必须在启动生成前断言 `len(data_source) > 0`，并检查有效解析行数、过滤前后数量。不要把空 list 当作可以被默认控制循环正确处理的 EOF 信号。
+
+## 症状十二：配置了多模态字段，但纯文本行被拆成逐字符 content
+
+当 `multimodal_keys` 非空、某条记录却没有任何对应媒体数据时，`multimodals` 字典为空，源码仍构造 `pattern="()"`。`re.split` 会按空匹配切开字符串，例如 `abc` 变成三个 text item。应在数据预检中保证媒体字段与配置一致，或在自定义预处理里对空 `multimodals` 直接保留原文本结构。
+
+## 症状十三：切片语法解析成功，读取时却报 `islice` ValueError
+
+路径正则允许 `@[-2:]`、`@[:-1]` 这样的负数，但后续 `itertools.islice` 不接受负 start/stop。当前广义路径只应使用非负边界；需要尾部切片时先离线确定总行数或使用显式预处理，不能把 Python list 的负切片语义外推到流式 reader。
+
+## 症状十四：shuffle 后随机 RM 或自定义插件的随机序列变化
+
+`Dataset.shuffle` 会执行全局 `random.seed(seed + epoch_id)`。它能重建 dataset permutation，却同时覆盖进程级 RNG。若同一进程还有 `rm_type=random` 或插件使用 Python `random`，跨 epoch/load 会改变它们的后续序列。验证时在 shuffle 前后保存 `random.getstate()`；需要隔离时，自定义 Dataset 应使用局部 `random.Random` 实例。
+
+## 症状十五：fully-async 开了 dynamic filter，却没有 drop metrics
+
+fully-async worker 直接调用 `generate_and_rm_group`，不进入默认 `generate_rollout_async`，因此不会运行 dynamic sampling filter、`MetricGatherer` 或 all-samples hook。它的全局 worker 还复用首次 args/data source。若业务依赖这些控制面能力，应扩展 fully-async 实现或继续使用默认 rollout，不能只复用相同 CLI 参数就假定语义相同。
+
 ## 自定义扩展契约
 
 | 扩展点 | 签名/形状 | 核心不变量 |
 |--------|-----------|------------|
 | `--data-source-path` | 类构造 `__init__(args)` | 实现 `get_samples/add_samples/save/load/__len__` |
-| `get_samples` | `N -> list[list[Sample]]` | 外层 group 数不超过语义请求，内层长度为 `n_samples_per_prompt` |
+| `get_samples` | `N -> list[list[Sample]]` | 若调用方要求固定 batch，应精确返回 N；默认 source 对超大 N/空 dataset 不满足该承诺，内层长度仍须为 `n_samples_per_prompt` |
 | `add_samples` | `list[list[Sample]] -> None` | 不破坏 group 形状 |
 | `--buffer-filter-path` | `(args, rollout_id, buffer, num_samples)` | 返回后 buffer 状态要一致 |
 | `--rollout-all-samples-process-path` | `(args, all_groups, data_source)` | 可观察被 filter drop 的组 |
@@ -252,8 +284,8 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 契约测试入口：
 
 ```powershell
-$env:PYTHONPATH='F:\源码阅读\slime'
-python -m pytest slime/tests/plugin_contracts/test_plugin_path_loading_contracts.py -q
+Set-Location 'F:\源码阅读\slime'
+python -m pytest tests/plugin_contracts/test_plugin_path_loading_contracts.py -q
 ```
 
 预期现象：测试会校验默认 data source、buffer filter、自定义 data source 路径加载和最小返回形状。若缺少依赖导致 collection 失败，先记录缺失模块，不要把它误判为 DataSource 逻辑错误。

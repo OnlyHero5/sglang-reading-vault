@@ -15,14 +15,15 @@ updated: 2026-07-10
 
 ## 读者任务
 
-这一篇沿一个 KV slot 的生命周期读源码：ModelRunner 先建请求行和物理 KV 池；Scheduler/RadixCache 拿到 allocator；prefill 为新增 prompt token 分配 `out_cache_loc` 并写 `req_to_token`；attention backend 把 K/V 写入物理张量；decode 每步追加一个 token；空间不足时先 evict prefix cache，再由 Scheduler retract。
+这一篇沿一个“逻辑 token 最终落到物理 KV”的生命周期读源码：ModelRunner 先建请求映射和设备池；Scheduler/tree cache 共享 allocator；prefill 为 extend 区间分配通用 `out_cache_loc` 并写 `req_to_token`；attention metadata 把 virtual/full/SWA 等地址关系落实为 `KVWriteLoc`；pool 才真正写物理内容；普通 decode 每步追加一个 token，空间不足时先 evict，再由 Scheduler retract 或终止最后一个无法继续的请求。
 
 读完后，你应该能定位：
 
 - `req_pool_idx` 是哪里分配的。
 - `out_cache_loc` 是哪里生成的。
 - `req_to_token` 是哪里写入的。
-- K/V tensor 是哪里真正被写入的。
+- 通用、virtual 与 physical 写入位置在哪里分界。
+- K/V 或压缩状态是哪里真正被写入物理 pool 的。
 - page allocator 为什么需要 `alloc_extend/alloc_decode` 两条路径。
 - `alloc None` 为什么会变成 evict、RuntimeError 或 decode retract。
 
@@ -35,11 +36,11 @@ updated: 2026-07-10
 | 第一次建立 KV 生命周期 | 读者任务、主线图、第一步到第二步 | 请求行池和物理 KV slot 池是两级资源，不是同一个容量 |
 | 排查 pool 初始化 | 第一步、第二步 | allocator 类型由 page size、DCP、SWA/Mamba/平台特性决定 |
 | 排查 prefill 分配 | 第三步到第五步 | `alloc_for_extend` 同时分配 req slot、token slot，并写 `req_to_token` |
-| 排查 K/V 写入位置 | 第六步到第七步 | attention backend 用 `out_cache_loc` 调 `set_kv_buffer` 写物理 buffer |
+| 排查 K/V 写入位置 | 第六步到第七步 | metadata 先构造 `KVWriteLoc`，pool 再按 layout 写 physical buffer |
 | 排查 paged allocator | 第四步、第八步 | extend 需要处理 prefix/last_loc，decode 每步追加新 token，路径不同 |
-| 排查 OOM/retract | 第九步到第十一步 | decode 先 evict tree cache，再判断是否 retract，最后才 abort 最后一个请求 |
+| 排查 OOM/retract | 第八步 | decode 先 evict tree cache，再判断是否 retract，最后才 abort 无法容纳的唯一请求 |
 
-读的时候把三个下标分清：`req_pool_idx` 是请求行，`out_cache_loc` 是新写 token 的物理位置，`req_to_token` 是请求 token 位置到物理 slot 的映射。
+读的时候先把三个下标分清：`req_pool_idx` 是请求行，`out_cache_loc` 是新写 token 的通用位置，`req_to_token` 是请求 token 位置到 KV id 的映射。普通池里 id 常可直接视作 physical slot；Unified pool 里它可能仍是 virtual id，不能提前当作 tensor 下标。
 
 ## 主线图
 
@@ -50,8 +51,9 @@ flowchart LR
     Builder --> Tree["Radix / tree_cache"]
     Tree --> Extend["alloc_for_extend"]
     Extend --> ReqMap["req_to_token.write"]
-    Extend --> Loc["out_cache_loc"]
-    Loc --> Fwd["attention forward_extend"]
+    Extend --> Loc["out_cache_loc<br/>generic / maybe virtual"]
+    Loc --> Meta["attention metadata<br/>translate physical targets"]
+    Meta --> Fwd["attention forward_extend"]
     Fwd --> Store["KVCache.set_kv_buffer"]
     Store --> Tensor["K/V physical buffers"]
     Tensor --> Decode["alloc_for_decode"]
@@ -66,7 +68,7 @@ flowchart LR
 **设计选择：** `_init_pools` 先创建 `ReqToTokenPool`，再根据模型、平台、page size、SWA/Mamba/DSV4 等条件创建 `token_to_kv_pool` 和 `token_to_kv_pool_allocator`。
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py L531-L620
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py L531-L620
 if self.req_to_token_pool is None:
     ...
     self.req_to_token_pool = req_to_token_pool_cls(
@@ -79,7 +81,7 @@ if self.req_to_token_pool is None:
 ```
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py L1035-L1148
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py L1035-L1148
 need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
 if self.token_to_kv_pool_allocator is None:
     ...
@@ -116,12 +118,12 @@ if self.token_to_kv_pool_allocator is None:
 
 ## 第二步：Scheduler 构造 tree cache 时把 allocator 交给 Radix
 
-**系统压力：** RadixCache 知道 prefix 是否命中，但它不能自己凭空写 K/V；它必须和请求行、KV slot allocator 绑定，才能把命中的 prefix indices 和新分配的 slot 放到同一个表里。
+**系统压力：** RadixCache 知道 prefix 是否命中，但它不能自己凭空写 K/V；它必须和请求行、KV allocator 绑定，才能复用 canonical indices、插入新缓存并在 evict 时归还容量。
 
 **设计选择：** `build_kv_cache` 从 TP worker 取出 `req_to_token_pool` 和 `token_to_kv_pool_allocator`，放进 `CacheInitParams`，再交给 `create_tree_cache`。
 
 ```python
-# 来源：python/sglang/srt/mem_cache/kv_cache_builder.py L170-L263
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/mem_cache/kv_cache_builder.py L170-L263
 req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
 ...
 params = CacheInitParams(
@@ -144,7 +146,7 @@ return KVCacheBuildResult(
 ```
 
 ```python
-# 来源：python/sglang/srt/mem_cache/cache_init_params.py L17-L55
+# 来源：python/sglang/srt/mem_cache/cache_init_params.py L17-L22
 @dataclasses.dataclass
 class CacheInitParams:
     disable: bool
@@ -161,16 +163,18 @@ class CacheInitParams:
 
 ## 第三步：prefill 分配先拿请求行，再拿 KV slot
 
-**系统压力：** prefill 的请求长度不一样，且部分 prefix 已经命中。新 token 要写入新 slot，命中 token 要保留旧 `prefix_indices`。所以分配不只是“拿一段连续内存”。
+**系统压力：** prefill 的请求长度不一样，且本轮计算起点之前可能已有 KV 索引。extend token 要写入新位置，已有 `prefix_indices` 要保留，所以分配不只是“拿一段连续内存”。第一次 match 后这些索引是 device tree hit；chunk commit 后则可能同时含 tree canonical indices 与请求私有 tail。
 
 **设计选择：** `alloc_for_extend` 先调用 `alloc_req_slots` 分配请求行，再按 token/page 路径分配 `out_cache_loc`，最后调用 `write_cache_indices` 把 prefix 和新 slot 写进 `req_to_token`。
 
 ```python
-# 来源：python/sglang/srt/mem_cache/common.py L450-L524
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/mem_cache/common.py L450-L524
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocate KV cache for extend batch and write to req_to_token_pool."""
+    """
+    Allocate KV cache for extend batch and write to req_to_token_pool.
+    """
     batch.maybe_evict_swa()
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -200,10 +204,11 @@ def alloc_for_extend(
 
 **执行逻辑：**
 
-- `prefix_tensors` 来自 Radix prefix match，表示已可复用的 KV slot。
+- `prefix_tensors` 来自每个 `Req.prefix_indices`，表示本轮 extend 前需要接回请求行的已有 KV id；它不保证全部仍是“刚匹配出的 tree hit”。
 - `req_pool_indices` 是请求行号。
-- `out_cache_loc` 是本轮新增 token 要写的位置。
+- `out_cache_loc` 是本轮新增 token 的通用写入位置，Unified 下可能是 virtual。
 - `write_cache_indices` 把旧 prefix 和新 slot 拼进请求行，attention 后续按这张表读历史 KV。
+- `len(prefix_indices)` 决定下一轮从哪里继续算；`cache_protected_len` 才描述 tree ownership，不能用前者代替后者。
 
 ## 第四步：paged prefill 用 kernel 处理跨 page 边界
 
@@ -212,7 +217,7 @@ def alloc_for_extend(
 **设计选择：** `PagedTokenToKVPoolAllocator.alloc_extend` 把 `prefix_lens`、`seq_lens`、`last_loc` 和 `free_pages` 交给 Triton kernel，输出 token 级 `out_indices`。Python 侧只负责容量检查和推进 `free_pages`。
 
 ```python
-# 来源：python/sglang/srt/mem_cache/allocator/paged.py L172-L215
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/mem_cache/allocator/paged.py L172-L215
 def alloc_extend(
     self,
     prefix_lens: torch.Tensor,
@@ -256,7 +261,7 @@ def alloc_extend(
 **设计选择：** `prepare_for_extend` 先调用 `alloc_for_extend`，随后更新请求级 KV 长度，把 `out_cache_loc`、`req_pool_indices` 等字段挂到 batch 上。
 
 ```python
-# 来源：python/sglang/srt/managers/schedule_batch.py L2035-L2220
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/schedule_batch.py L2035-L2220
 # Set batch fields needed by alloc_for_extend
 self.prefix_lens = prefix_lens
 self.extend_lens = extend_lens
@@ -283,16 +288,17 @@ self.out_cache_loc = out_cache_loc
 
 - `kv_committed_len` 表示已经纳入请求 KV 状态的长度。
 - `kv_allocated_len` 表示 allocator 已经为该请求预留到哪个长度。
-- `out_cache_loc` 是本轮 forward 输出 K/V 的写入目标。
+- `out_cache_loc` 是本轮 forward 的通用写入目标；是否已是 physical 取决于 pool。
+- 普通 prefill 中 committed 与 allocated 往往一起推进；推测解码可以预留尚未 committed 的位置，因此两个字段必须长期分开维护。
 
 ## 第六步：attention backend 先写 KV，再做 attention
 
 **系统压力：** forward 计算出的 K/V 必须在 attention kernel 读取历史上下文前写入 KV pool。SWA、DCP、MLA、量化和统一内存都可能改变写入位置或 dtype。
 
-**设计选择：** Triton attention backend 在 `forward_extend` 中构造 `KVWriteLoc`，再调用 `_set_kv_buffer`；后者处理 DCP mask，最终委托 `token_to_kv_pool.set_kv_buffer`。
+**设计选择：** Triton attention backend 在 `forward_extend` 中构造 `KVWriteLoc`，再调用 `_set_kv_buffer`；后者处理 DCP 的 local shard 与 mask，最终委托 `token_to_kv_pool.set_kv_buffer`。Unified 的 virtual→physical、SWA 子池目标已在 attention metadata 阶段准备好，不由每层 pool 临时猜测。
 
 ```python
-# 来源：python/sglang/srt/layers/attention/triton_backend.py L1152-L1244
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/layers/attention/triton_backend.py L1152-L1244
 def _set_kv_buffer(
     self,
     forward_batch: ForwardBatch,
@@ -324,7 +330,7 @@ self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
 MHA KV pool 里真正写物理张量的位置在 `set_kv_buffer`：
 
 ```python
-# 来源：python/sglang/srt/mem_cache/memory_pool.py L1669-L1730
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/mem_cache/memory_pool.py L1669-L1730
 def set_kv_buffer(
     self,
     layer: RadixAttention,
@@ -348,18 +354,19 @@ def set_kv_buffer(
 
 **不变量：**
 
-- `out_cache_loc` 越界会在 async assert 开启时尽早暴露。
+- 真正交给该 pool 的 physical loc 越界，会在 async assert 开启时尽早暴露。
 - HND layout 不能当成一维 slot 行写，必须拆成 page 和 offset。
 - dtype 转换发生在 pool 写入前，避免物理 pool 存储 dtype 与计算 dtype 混淆。
+- 默认 NHD、HND、ROCm AITER `vectorized_5d`、PageMajor、MLA/DSA 与 NoOp pool 的 buffer 身份和写 kernel 不同；“每层一对普通 K/V tensor”只能用作 MHA 基线。
 
-## 第七步：decode 每轮只追加新 token，但 page 可能新增
+## 第七步：普通 decode 每请求追加一个 token，但 page 可能新增
 
-**系统压力：** decode 看起来每个请求只新增一个 token，但如果新 token 跨过 page 边界，就需要消耗新 page。因此 decode 的容量判断不能简单用 batch size 当实际 token slot 数。
+**系统压力：** 非推测普通 decode 每个请求新增一个 token，但如果新 token 跨过 page 边界，就需要消耗新 page。因此容量判断不能把“逻辑新增 token 数”和“实际新增 page 容量”混为一谈。
 
 **设计选择：** `alloc_for_decode` 取每个请求当前最后一个 KV slot 作为 `last_loc`，构造下一步 `seq_lens_next`，再调用 paged decode 分配；分配成功后把新位置写入 `req_to_token`。
 
 ```python
-# 来源：python/sglang/srt/mem_cache/common.py L579-L620
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/mem_cache/common.py L579-L620
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     ...
     if _alloc_page_size(batch) == 1:
@@ -382,7 +389,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 ```
 
 ```python
-# 来源：python/sglang/srt/mem_cache/allocator/paged.py L222-L259
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/mem_cache/allocator/paged.py L222-L259
 def alloc_decode(
     self,
     seq_lens: torch.Tensor,
@@ -411,9 +418,10 @@ def alloc_decode(
 
 **执行逻辑：**
 
-- `out_cache_loc` 长度是 batch size。
+- 在 `prepare_for_decode(... token_per_req=1)` 的普通路径，`out_cache_loc` 长度是 batch size。
 - 只有跨 page 边界的请求会消耗新 page。
 - `req_to_token.write((req_pool_indices, locs), out_cache_loc)` 把新 token 的 slot 写到对应请求行。
+- 推测解码由 `spec_prepare_for_decode` 接管，不能套用这个长度结论；DSV4 allocator 还可能先返回多子池 bundle，再以 `out_full_loc` 作为主通用位置。
 
 ## 第八步：decode 前先检查容量，不够就 retract
 
@@ -422,7 +430,7 @@ def alloc_decode(
 **设计选择：** `check_decode_mem` 先根据下一轮 decode 估算需要的 token/page 数，并尝试从 tree cache evict；仍不足时 `retract_decode` 选择部分请求释放，保证剩下 batch 可以继续跑。
 
 ```python
-# 来源：python/sglang/srt/managers/schedule_batch.py L2453-L2532
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/schedule_batch.py L2453-L2532
 def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
     num_tokens = self.new_tokens_required_next_decode(selected_indices)
     evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -449,6 +457,32 @@ def retract_decode(
 - retract 不是删除请求，而是释放其当前 KV 占用，后续重新入队调度。
 - 如果只剩最后一个请求仍放不下，代码会 abort 该请求，而不是让 scheduler 崩溃。
 
+最后一个请求的处理不是旧版本传闻，而是当前函数内的显式终止协议：
+
+```python
+# 来源：python/sglang/srt/managers/schedule_batch.py L2506-L2523
+reqs_to_abort: List[Req] = []
+if len(sorted_indices) <= 1 and not self.check_decode_mem(
+    selected_indices=sorted_indices
+):
+    # Even the last remaining request cannot fit in memory.
+    # Instead of crashing the scheduler, gracefully abort it.
+    last_idx = sorted_indices.pop()
+    last_req = self.reqs[last_idx]
+    last_req.to_finish = FINISH_ABORT(
+        "Out of memory even after retracting all other requests "
+        "in the decode batch. Aborting the last request.",
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
+    reqs_to_abort.append(last_req)
+    self.release_req(last_idx, 0, server_args)
+    logger.warning(
+        "retract_decode: aborted last request %s due to OOM", last_req.rid
+    )
+```
+
+这里同时完成四件事：设置 finish reason、把请求放入 `reqs_to_abort` 返回值、释放 KV/请求行资源、从保留索引中移除。它不是普通 retract；普通 retract 会 `reset_for_retract()` 并等待重新调度。
+
 ## 第九步：HiCache host pool 有自己的并发一致性
 
 **系统压力：** 开启 HiCache 后，设备 KV 可以下沉到 host pool。host pool 被 prefetch、backup、evict 多条路径访问，不能只靠普通 list 管理。
@@ -456,7 +490,7 @@ def retract_decode(
 **设计选择：** `HostKVCache` 用锁保护 `alloc/free`，并用 `slot_used` 检测 double alloc/free。
 
 ```python
-# 来源：python/sglang/srt/mem_cache/pool_host/base.py L241-L268
+# 来源：python/sglang/srt/mem_cache/pool_host/base.py L240-L257
 @synchronized
 def alloc(self, need_size: int) -> Optional[torch.Tensor]:
     assert (
@@ -482,6 +516,8 @@ def alloc(self, need_size: int) -> Optional[torch.Tensor]:
 - host 分配同样要求 page 对齐。
 - `slot_used` 是一致性检查，不是性能优化。
 - host pool 小于 device pool 时仍能启动，但源码会 warning L2 命中收益较低。
+- fixed-GB 容量会跨 PP ranks 同步到最小 token capacity，并按 page 向上对齐；主机预算还会预留 10 GiB。
+- `destroy()` 必须 unregister pinned host buffers；长期反复初始化/销毁时也要检查这条资源清理路径。
 
 ## 运行验证
 
@@ -499,14 +535,14 @@ rg -n "check_decode_mem|retract_decode|HostKVCache|slot_used" sglang/python/sgla
 
 - ModelRunner 和 builder 命中建池入口，说明 KV pool 的生命周期早于单个请求。
 - `prepare_for_extend` 与 `alloc_decode` 分别命中 prefill 和 decode 分配路径，说明两者不是同一种分配账。
-- attention backend 命中 `out_cache_loc` 和 cache 写入，说明真正写 K/V tensor 的位置不在 Scheduler。
+- attention backend 命中 `out_cache_loc`、`KVWriteLoc` 和 cache 写入，说明 Scheduler 只分配通用位置，真正的地址翻译与物理写入在 forward 侧。
 - `check_decode_mem`、`retract_decode` 和 `slot_used` 同时命中，说明容量保护和 HiCache 一致性检查是两层机制。
 
 ## 复盘
 
 - 建池在 ModelRunner，RadixCache 只是拿到池的引用。
-- prefill 分配同时处理请求行、prefix indices、新 KV slot。
-- decode 分配看似每请求一个 token，实际按 page 边界消耗空间。
-- attention backend 才是真正写 K/V tensor 的位置。
+- prefill 分配同时处理请求行、已有 KV indices 与新 KV id；tree ownership 另看 `cache_protected_len`。
+- 普通 decode 看似每请求一个 token，实际按 page 边界消耗空间；推测/DSV4 另有分配契约。
+- attention metadata/backend 才把通用位置变成物理写目标，具体 pool 再执行真实写入。
 - `available_size()` 是 allocator 视角的剩余 slot/page，不是完整显存监控。
 - retract 是 decode 侧容量保护，HiCache 是层级缓存扩展，两者解决的问题不同。

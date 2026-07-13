@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 引擎拓扑 · 核心概念
 
@@ -64,7 +64,7 @@ flowchart TB
 `ServerGroupConfig` 最小只需要 `worker_type` 和 `num_gpus`。`num_gpus_per_engine` 可以留空，之后由 model 级默认值或全局 `--rollout-num-gpus-per-engine` 补上。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_config.py L11-L41
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_config.py` L11-L41 选取字段）：
 @dataclasses.dataclass
 class ServerGroupConfig:
     worker_type: str
@@ -85,7 +85,7 @@ class ServerGroupConfig:
 `ModelConfig.resolve(args)` 是配置对象第一次被注入运行时默认值的位置。它会补 `num_gpus_per_engine`、把 `model_path` 写进每个 group 的 `overrides`，并推断 `update_weights`。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_config.py L68-L100
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_config.py` L68-L100 删节）：
 def resolve(self, args) -> None:
     default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine
     default_model_path = self.model_path or args.hf_checkpoint
@@ -108,12 +108,14 @@ def resolve(self, args) -> None:
 - 没显式写 `update_weights` 时，只有 `model_path == args.hf_checkpoint` 的模型默认接收训练权重。
 - ref、reward、judge 这类冻结模型应显式写 `update_weights: false`，让读者和程序都少猜一步。
 
+自动推断只比较路径字符串，不做 resolve、realpath 或 checkpoint 身份校验。`./model` 与绝对路径即使指向同一目录也会被判为不同；相同路径的冻结 teacher 又会被判为可更新。因此它是默认值便利，不是模型角色证明。
+
 ## 运行层：RolloutServer 是模型壳，ServerGroup 是 engine 池
 
 运行时对象的边界看 `RolloutServer`。它不负责启动 actor；它聚合多个 `ServerGroup`，并给训练侧暴露“哪些 engine 可见、每个 engine 占几张卡、offset 是多少”。
 
 ```python
-# 来源：slime/ray/rollout.py L282-L330
+# 定位骨架（据 `slime/ray/rollout.py` L282-L330 选取属性）：
 @dataclasses.dataclass
 class RolloutServer:
     server_groups: list[ServerGroup]
@@ -152,7 +154,7 @@ class RolloutServer:
 `_resolve_sglang_config` 把用户入口收敛成统一的 `SglangConfig`。优先级是：显式 YAML、零 GPU、legacy `--prefill-num-servers`、默认 regular。
 
 ```python
-# 来源：slime/ray/rollout.py L1231-L1255
+# 定位骨架（据 `slime/ray/rollout.py` L1231-L1255 删节）：
 def _resolve_sglang_config(args) -> SglangConfig:
     if getattr(args, "sglang_config", None) is not None:
         config = SglangConfig.from_yaml(args.sglang_config)
@@ -179,12 +181,14 @@ def _resolve_sglang_config(args) -> SglangConfig:
 
 这段让很多排障变简单：如果 YAML 的 GPU 总和和 `--rollout-num-gpus` 不一致，失败发生在配置解析阶段；如果 `rollout_num_gpus == 0`，Slime 仍会保留一个默认模型壳，但没有本地 ServerGroup；如果没有任何高级配置，就是一个 regular 单组。
 
+这里没有检查 model name 唯一，也没有要求 PD 同时存在 prefill 和 decode。重名会在后续字典写入时覆盖；只配一侧仍会让 Router 打开 PD，但不代表得到完整可服务拓扑。
+
 ## Router：单模型兼容，多模型分流
 
-每个 `ModelConfig` 都会得到一个 Router。第一个模型的 Router 会写回 `args.sglang_router_ip/port`，保证旧的默认 generate 路径还能工作；多模型信息会写到 `args.sglang_model_routers`，给自定义 rollout 选路。
+每个 `ModelConfig` 都会尝试得到一个 Router。第一个模型的 Router 会写回 `args.sglang_router_ip/port`，因此 YAML 顺序决定旧默认 generate 的目标；多模型信息会写到 `args.sglang_model_routers`，给自定义 rollout 选路。
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L65-L81
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L65-L81 删节）：
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     routers = getattr(args, "sglang_model_routers", None)
     if routers and model_name in routers:
@@ -193,7 +197,7 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
     return f"http://{args.sglang_router_ip}:{args.sglang_router_port}{endpoint}"
 ```
 
-默认 `generate` 函数仍然使用 `args.sglang_router_ip/port`，所以多模型部署要么由默认 actor 模型承接主请求，要么在 custom generate 中用 `get_model_url(args, "ref")` 这类入口明确选模型。
+默认 `generate` 函数仍然使用 `args.sglang_router_ip/port`，所以多模型部署应把 actor 放在第一项，或在 custom generate 中用 `get_model_url(args, "ref")` 明确选模型。未知 model name 会静默回退默认 Router，拼写错误不会 fail fast。
 
 ## 读者抓手
 

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 上下文并行与路由重放
 
@@ -27,6 +27,8 @@ updated: 2026-07-10
 - per-rollout mean 在 CP/DP 下为什么不随 rank 数改变。
 - `use_rollout_routing_replay` 缺 `rollout_routed_experts` 或 replay 游标错位。
 - ref/teacher forward 为什么必须走 `fallthrough`。
+- `allgather_cp` 与 rollout routing replay 为什么不能仅凭两个开关都能解析就认定兼容。
+- 训练异常后 replay stage、游标和 buffer 为什么必须作为一组状态检查。
 
 ## 两条主线
 
@@ -52,6 +54,8 @@ flowchart TB
 ```
 
 CP 是坐标和规约问题；RoutingReplay 是 MoE expert 路径一致性问题。两者都会影响 [[Slime-Advantage计算]] 和 [[Slime-Policy-Loss]]，但它们不是同一个机制。
+
+源码目前也没有替这两条主线完成所有组合证明：CP/reducer 多处使用 `zip(strict=False)`；rollout replay 预填固定复用 zigzag `slice_with_cp`，而 allgather-CP 的训练输入是全局 contiguous chunk。读者必须把“功能分别存在”和“组合已经验证”分开。
 
 ## 阅读顺序
 
@@ -90,4 +94,4 @@ CP 是坐标和规约问题；RoutingReplay 是 MoE expert 路径一致性问题
 - `tests/test_cp_utils.py`：CP reducer 与 per-rollout denom。
 - `tests/test_loss_cp_invariance.py`：不同 CP/DP 切分下 loss/grad 等价。
 - `tests/test_logprob_response_spans.py`：top-p mask 与 CP response row 对齐。
-- `tests/test_megatron_argument_validation.py`：allgather-CP 与 routing replay 参数校验。
+- `tests/test_megatron_argument_validation.py`：allgather-CP 的模型架构校验；当前没有 allgather-CP × rollout replay 组合门禁测试。

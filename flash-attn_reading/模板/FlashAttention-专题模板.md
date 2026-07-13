@@ -9,7 +9,7 @@ tags:
   - framework/flash-attn
   - content/template
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 
 # FlashAttention 专题模板
@@ -35,15 +35,17 @@ title: "FlashAttention {主题} 源码走读"
 type: walkthrough
 framework: flash-attn
 topic: "{主题}"
-learning_role: deep-dive
+learning_role: reference
 source_baseline: "002cce0"
 tags:
   - framework/flash-attn
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 ```
+
+`learning_role` 只使用 `core`、`reference`、`debug`、`practice`。源码走读通常是 `reference`；只有首次学习主线中的必读页才标为 `core`。
 
 ## 正文模板
 

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据准备工具
 
@@ -17,12 +17,13 @@ updated: 2026-07-10
 
 这组文档讲的不是 prompt 数据预处理，而是训练前后的**权重形态准备**：Hugging Face 目录如何变成 Megatron 能加载的 `torch_dist` checkpoint，训练保存的 Megatron checkpoint 又如何导回 HF safetensors。
 
-读完后，你应该能解释四件事：
+读完后，你应该能解释五件事：
 
 - 为什么 `--hf-checkpoint` 不能直接替代 `--ref-load`。
 - 为什么 conversion 命令必须带 `MODEL_ARGS`。
 - `convert_hf_to_torch_dist.py` 输出的 `release/` 和 tracker 文件如何被 Megatron 加载。
 - 导出 HF 时为什么要关心 vocab padding、`origin_hf_dir` 和 missing tensors。
+- 为什么 checkpoint 根目录与具体 `release/iter_xxx` 目录不能互换，以及 `--force` 为什么不等于“清空后重建”。
 
 ## 主线地图
 
@@ -80,14 +81,17 @@ flowchart LR
 | `MODEL_ARGS` 必须和 HF config 对齐 | Megatron 不能只靠 checkpoint 目录恢复模型结构 |
 | `--hf-checkpoint` 用于 HF 元数据、tokenizer、SGLang 初始化 | 它不是训练 actor 的 Megatron checkpoint |
 | `--ref-load` 和 `--load` 指向 Megatron checkpoint 根目录 | 不要直接指到 `iter_xxx` 子目录 |
+| 离线导出的 `--input-dir` 恰好相反：指向具体 `release/iter_xxx` | 脚本会直接读取该目录下的 `common.pt` 与 `.metadata` |
 | HF→torch_dist 输出会写 tracker 并把 step 目录改成 `release` | 这是 Megatron release checkpoint 约定 |
-| torch_dist→HF 要处理 embedding padding | 否则导出的 embedding/output layer 行数可能多于 HF vocab |
+| 转换输出目录应使用全新目录 | HF→torch_dist 的 move 与反向导出的 `--force` 都不会替你可靠清理旧产物 |
+| torch_dist→HF 要核对 embedding padding 的两级裁剪 | CLI `--vocab-size` 与 checkpoint 内 `args.vocab_size` 都可能参与裁剪 |
 
 ## 运行验证入口
 
 轻量环境很难完整跑权重转换，因为它依赖 Megatron、GPU、模型权重和分布式环境。可验证的最小门禁是：
 
 ```powershell
+Set-Location slime
 python -m py_compile tools/convert_hf_to_torch_dist.py tools/convert_torch_dist_to_hf.py
 python -m pytest tests/test_megatron_argument_validation.py -q
 ```
@@ -95,6 +99,7 @@ python -m pytest tests/test_megatron_argument_validation.py -q
 完整验证需要真实模型目录，例如 quick start 的转换命令：
 
 ```bash
+cd /root/slime
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
   ${MODEL_ARGS[@]} \
   --hf-checkpoint /root/Qwen3-4B \

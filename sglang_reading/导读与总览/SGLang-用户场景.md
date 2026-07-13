@@ -9,55 +9,57 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang 用户场景
 
-> 三个示意场景：RadixCache、EAGLE 投机、PD 分离。场景用于建立因果关系，性能结果必须在自己的环境中测量。
-
----
+> 三个决策故事：前缀复用、EAGLE 投机解码、PD 分离。它们不是三个“更快开关”，而是针对不同瓶颈、引入不同状态与失败面的系统改造。
 
 ## 你为什么要读
 
-只看架构图，很容易把 RadixCache、投机解码和 PD 分离都理解成“更快按钮”。本篇把它们放回真实用户故事：共享 system prompt、decode 加速、prefill/decode 拆池，分别解决什么瓶颈、付出什么代价、该观察哪些指标。场景是主角，源码对象是证人。
+只看功能列表，很容易得出错误结论：共享 prompt 就一定有高 cache hit，开启 speculative 就一定减少延迟，prefill/decode 拆池就一定优于混部。本篇从业务症状出发，沿“假设 → 源码对象 → 观测 → 对照实验 → 决策”走完三个场景。
 
-## 故事 A：长对话共享 System Prompt → RadixCache 前缀命中 → 跳过 Prefill
+读完后，你应当能够先问“瓶颈在哪里”，再决定是否启用特性；也能解释为什么命中率、接受率或 KV 传输带宽单独变好，并不足以证明端到端收益。
 
-### 场景角色
+---
 
-**小林**，某 SaaS 客服平台的推理工程师。平台的大量请求共享一段很长的 system prompt，每个终端用户只追加相对较短的消息。高峰期，P99 TTFT 是最先暴露问题的指标。
+## 先用一张表选场景
 
-### 时间线
+| 业务症状 | 首要假设 | 可能机制 | 新增代价 |
+|---|---|---|---|
+| 大量请求共享长前缀，未缓存 prompt 计算占 TTFT 大头 | 重复 prefill 可被复用 | RadixAttention / prefix cache | cache 地址、淘汰、隔离键与命中诊断 |
+| decode 占主要时长，target 每轮产出少 | draft 候选可被 target 一次接受多个 | EAGLE speculative decoding | draft、verify、树/链整理与额外显存 |
+| prefill 与 decode 互相干扰，资源画像和扩缩需求不同 | 两阶段值得独立调度和扩缩 | PD disaggregation + gateway | 双请求、会合、KV 传输、两池健康与重试 |
 
-| 时刻 | 事件 |
-|------|------|
-| T0 | 用户 A 发起首条消息；Scheduler 对完整 prompt 做 extend prefill，RadixCache `insert` 挂树 |
-| T0+30s | 用户 B、C… 陆续进入；`match_prefix` 命中相同 system 前缀 |
-| T1 | 并发会话增加；命中的请求由 `prefix_indices` 覆盖共享前缀，GPU 只计算未命中的 delta |
-| T2 | 对照 force miss 后，确认 matched tokens 增加，TTFT 分布随 prefill 工作量变化 |
+若 profile 显示瓶颈不符合首要假设，就不应仅因“框架支持”而启用该特性。
 
-### 涉及模块
+---
+
+## 故事 A：共享 system prompt，为什么命中率仍可能很低
+
+### 业务现场
+
+某客服平台的大多数请求共享一段较长 system prompt，用户消息相对较短。团队观察到 TTFT 随并发上升，但不能直接断言 prefix cache 无效：TTFT 还包含排队、未命中后缀计算、采样和回程。
+
+工程师先提出一个可证伪假设：**若请求的 token 前缀与隔离语义一致，第二批请求应得到更多 matched prefix tokens，并减少未缓存 prefill 工作。**
+
+### 对象生命线
 
 ```mermaid
 sequenceDiagram
- participant Client as 客服网关
- participant TM as TokenizerManager
- participant SCH as Scheduler
- participant RC as RadixCache
- participant MR as ModelRunner
-
- Client->>TM: POST /v1/chat/completions
- TM->>SCH: TokenizedGenerateReqInput
- SCH->>RC: match_prefix(RadixKey)
- RC-->>SCH: prefix_indices (2k hit)
- SCH->>MR: ForwardMode.EXTEND (仅 delta tokens)
- MR-->>SCH: logits
- Note over SCH,RC: 完成 insert 更新树
+    participant T as TokenizerManager
+    participant P as SchedulePolicy / Req
+    participant C as Prefix Cache
+    participant S as Scheduler
+    participant M as Model Execution
+    T->>P: token ids + extra_key
+    P->>C: match_prefix(RadixKey)
+    C-->>P: device/host match result
+    P->>P: 写入 prefix_indices 与命中长度
+    P->>S: waiting req 带着匹配状态进入准入
+    S->>M: 只为本轮需计算部分准备 extend
+    M-->>C: 完成后由相应路径提交可复用 KV
 ```
-
-**读法：** 前缀命中发生在 `ScheduleBatch` 初始化阶段：`match_prefix` 返回的 `device_indices` 写入 `prefix_indices`，后续 `prepare_for_extend` 只对 `origin_input_ids[len(prefix_indices):]` 分配 KV slot 并跑 attention。调度策略层 `match_prefix_for_req` 还会按命中长度排序 waiting 队列，提高 batch 内 prefix 复用率。
-
-**源码锚点：**
 
 ```python
 ## 来源：python/sglang/srt/managers/schedule_policy.py L91-L131
@@ -104,284 +106,273 @@ def match_prefix_for_req(
     )
 ```
 
-```python
-## 来源：python/sglang/srt/managers/schedule_batch.py L1168-L1206
-        if tree_cache is not None:
-            if cow_mamba is None:
-                cow_mamba = tree_cache.supports_mamba()
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids_to_match,
-                        extra_key=self.extra_key,
-                        limit=key_limit,
-                    ),
-                    req=self,
-                    cow_mamba=cow_mamba,
-                )
-            )
-            if envs.SGLANG_RADIX_FORCE_MISS.get():
-                match_result = zero_match_result(tree_cache, match_result)
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.best_match_node,
-                self.host_hit_length,
-                self.swa_host_hit_length,
-                self.mamba_host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.best_match_node,
-                match_result.host_hit_length,
-                match_result.swa_host_hit_length,
-                match_result.mamba_host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            if match_result.cache_protected_len is not None:
-                self.cache_protected_len = match_result.cache_protected_len
-            else:
-                self.cache_protected_len = len(self.prefix_indices)
-```
+这张证据卡只证明：匹配键同时包含 token ids 与 `extra_key`，匹配结果区分 device/host 状态，并写回请求对象。它不证明每次视觉上相同的 prompt 都会命中。
 
-**要点：**
+### 四步实验
 
-- `extra_key` 来自 OpenAI 层 `_compute_extra_key`；若各租户 LoRA adapter 不同，必须保证 extra_key 一致才能共享 system 前缀。
-- `positional_embed_overrides` 非空时强制禁用 prefix cache，避免同 token 不同 embedding 误共享。
+1. 固定模型、采样参数、并发和输入/输出长度分布，准备一组真正相同的 token 前缀。
+2. 先发送 warm-up 请求，再发送复用组；记录 matched/cached tokens、queue time、TTFT 和吞吐。
+3. 设置 `SGLANG_RADIX_FORCE_MISS=1` 做对照，再恢复环境变量。
+4. 比较的是分布与未缓存工作量，而不是只比较一两个请求的墙钟时间。
 
-### 如果…会怎样（调试）
+预期：复用组的 matched/cached tokens 应高于 force-miss 组；TTFT 是否显著改善取决于未命中后缀、排队和运行环境。
 
-| 现象 | 可能原因 | 排查 |
-|------|----------|------|
-| `cache_hit_rate` 始终为 0 | system prompt 含动态 timestamp / request id | 检查 template 是否每请求变化 |
-| 命中长度只有几百 token | `extra_key` 不一致（LoRA、routing_key） | 对比 `GenerateReqInput.extra_key` |
-| TTFT 降了但吞吐没升 | prefill batch 仍被长 delta 占满 | 看 `num_matched_prefix_tokens` 分布 |
-| 强制验证 miss 行为 | 设 `SGLANG_RADIX_FORCE_MISS=1` | 对比 A/B latency |
+### 命中失败时按顺序查
 
-**专题深读：** [[SGLang-RadixAttention]] · [[SGLang-SchedulePolicy]]
+| 证据 | 可能解释 | 下一步 |
+|---|---|---|
+| token ids 在很早位置就不同 | 模板含时间戳、随机 ID、消息顺序差异 | 比较 tokenizer 后的前缀，不只比较原始字符串 |
+| token ids 相同但 `extra_key` 不同 | LoRA、cache salt、routing/隔离语义不同 | 确认差异是必要隔离还是错误配置；不要为命中强行跨语义共享 |
+| 有 host hit、device hit 较低 | KV 已下沉或设备层被逐出 | 联查 HiCache/eviction 与设备容量 |
+| hit 高但 TTFT 仍高 | queue、长 delta、传输或首轮执行占主导 | 分解 TTFT，不把 cache hit 当端到端结论 |
+
+决策边界：只有“重复前缀足够长、复用频繁、隔离键允许共享、缓存压力可控”同时成立时，这项机制才最有价值。
+
+专题：[[SGLang-RadixAttention]]、[[SGLang-KV-Cache]]、[[SGLang-SchedulePolicy]]。
 
 ---
 
-## 故事 B：EAGLE 投机解码 — Accept Rate 下降时的 Reject Rollback
+## 故事 B：EAGLE 接受率下降，为什么不能先调一个开关
 
-### 场景角色
+### 业务现场
 
-**阿杰**，推理平台 SRE。集群开启 EAGLE，希望减少 target decode 轮次。一次业务域变化后，draft 与 target 的分布不再匹配，accept length 明显下降，端到端延迟反而上升。
+平台为某类稳定流量启用了 EAGLE。上线新领域数据后，decode 延迟上升。直觉上是 draft 与 target 更不一致，但正确诊断需要同时看：每轮接受长度、draft/verify 成本、batch 变化、输出长度以及端到端延迟。
 
-### 时间线
+EAGLE 的收益来源不是“draft 比 target 小”这一句话，而是：**draft 构造候选结构，target 一次 verify 后接受一条有效路径；被接受的 token 足够多时，才可能摊薄额外工作。**
 
-| 时刻 | 事件 |
-|------|------|
-| T0 | 基线流量：draft 连续提出候选，target `TARGET_VERIFY` 一次接受多个 token |
-| T1 | 新上线营销文案域，词汇分布偏移；draft top-1 与 target 分歧增大 |
-| T2 | `accept_lens` 分布下移；verify 成本仍在，额外 draft forward 开始侵蚀收益 |
-| T3 | 开启 `--speculative-use-rejection-sampling`；reject 时 rollback KV，避免错误 draft 污染 cache |
-| T4 | accept rate 仍低但 P99 恢复；决策：该域关闭投机或换 domain-specific draft |
-
-### 涉及模块
+### 对象生命线
 
 ```mermaid
 flowchart LR
- subgraph decode_step
- D[Draft 多步 forward] --> V[Target TARGET_VERIFY]
- V --> A{accept_lens}
- A -->|高| EXT[Draft extend 对齐 KV]
- A -->|低| REJ[Reject rollback]
- REJ --> D
- end
-```
-
-**读法：** EAGLE decode 循环中，target verify 产出 `accept_lens`（含 bonus token）。`_draft_extend_for_decode` 用 `num_correct_drafts = accept_lens - 1` 告诉 draft 从哪条分支继续 extend。开启 rejection sampling 时，draft forward 保存 `draft_probs`，verify 阶段按 target 分布 reject，未接受 token 的 KV 不 commit，防止错误猜测污染 Radix 树与 req_to_token 映射。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/speculative/eagle_worker_v2.py L659-L666
-            if self.server_args.speculative_use_rejection_sampling:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
-                )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
-                draft_probs_list.append(probs)
+    D[Draft 构造候选] --> V[Target verify]
+    V --> S[采样 accept_lens / accept_index]
+    S --> C[提交并整理 accepted path]
+    C --> N[生成下一轮 draft 输入]
+    N --> D
 ```
 
 ```python
-## 来源：python/sglang/srt/speculative/eagle_worker_v2.py L816-L839
-    def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
-    ):
-        # Batch 2: Draft extend
-        draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
-            # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
-            num_accept_tokens=batch_result.accept_lens,
-            # Draft-extend fills the whole tree width (num_draft_tokens) per req,
-            # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
-            num_tokens_per_req=self.speculative_num_draft_tokens,
-            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+## 来源：python/sglang/srt/speculative/eagle_worker_v2.py L1538-L1579
+        # Sample
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        new_seq_lens = batch.seq_lens + accept_lens
+        clear_unaccepted_c128 = getattr(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            "clear_unaccepted_c128_draft_states",
+            None,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
+        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+            clear_unaccepted_c128(
+                batch.req_pool_indices,
+                batch.seq_lens,
+                accept_lens,
                 self.speculative_num_draft_tokens,
-                device=self.device,
             )
-            + batch_result.accept_lens
-            - 1
+
+        # Update mamba state for hybrid GDN models after verification
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            self.speculative_num_draft_tokens,
         )
+
+        if not batch.forward_mode.is_idle():
+            accept_tokens = predict[accept_index]
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1]
+            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+            fill_bonus_tokens[(bs,)](
+                accept_tokens,
+                accept_lens,
+                bonus_tokens,
+                accept_index.shape[1],
+            )
 ```
 
-**要点：**
+这张证据卡只证明：target verify 之后由 `eagle_sample` 产生接受长度与路径索引，后续状态提交以这些结果为依据。它不支持“关闭 rejection sampling 会导致乱码”之类结论。
 
-- accept rate 可以由 `accept_lens` 与候选步数推导，但是否值得开启必须看端到端收益，不能套统一阈值。
-- draft/target 必须使用兼容 hidden size；rejection sampling 还要求 draft vocab 对齐。
+对于 tree drafting，接受路径还要被整理到后续链式布局所期望的位置：
 
-### 如果…会怎样（调试）
+```python
+## 来源：python/sglang/srt/speculative/eagle_worker_v2.py L1623-L1636
+        """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
+        hidden_states -- to the contiguous front of each per-req block, which the
+        downstream chain-layout code (draft-extend select_index, committed-KV reads)
+        assumes. Returns compacted predict; mutates logits_output.hidden_states
+        (moved only when present)."""
+        move_accept_tokens_to_target_kvcache(
+            batch, accept_index, accept_lens - 1, self.token_to_kv_pool_allocator
+        )
+        predict = self._compact_accept_to_front(predict, accept_index, bs)
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = self._compact_accept_to_front(
+                logits_output.hidden_states, accept_index, bs
+            )
+        return predict
+```
 
-| 现象 | 可能原因 | 排查 |
-|------|----------|------|
-| 吞吐反而下降 | accept length/rate 下移，draft/verify 成本超过节省 | Prometheus `spec_accept_rate` 或日志 `accept_lens` |
-| 偶发乱码 | reject 未开，错误 draft KV 已 commit | 对比 `--speculative-use-rejection-sampling` |
-| verify OOM | `speculative_num_steps` 过大 | 减 steps 或减 batch max running |
-| draft 与 target 不对齐 | 不同 tokenizer / 热词表 | 检查 `hot_token_id` 映射 |
+这张证据卡只证明 top-k tree 路径需要移动 accepted KV、token 与可选 hidden states；它解释了 speculative decoding 为什么新增状态整理成本。
 
-**专题深读：** [[SGLang-Speculative]]
+### 对照实验
+
+至少比较三组：普通 decode、当前 speculative 配置、降低 draft 深度/宽度后的配置。固定 workload 后记录：
+
+- `spec_accept_rate`、mean accepted length 或原始 `accept_lens` 分布；
+- target verify 与 draft 所占时间；
+- decode throughput、ITL/TPOT、端到端延迟；
+- batch size、输出长度和显存占用。
+
+预期：若接受长度下降而 draft/verify 成本不降，speculative 相对普通 decode 的收益会缩小，甚至负优化。但不存在跨模型通用的接受率阈值。
+
+### 不要这样排障
+
+- 不要把 rejection sampling 当作“防乱码开关”；它改变采样/接受契约，是否启用应按算法语义与质量、性能共同验证。
+- 不要只看 accept rate；候选宽度、步数、batch 和 verify kernel 都影响成本。
+- 不要把任何 draft 都假定为“小模型”；speculative method 还可能采用其他 draft 来源或插件路径。
+- 不要在未做输出一致性/质量检查时，只因吞吐提高就宣布成功。
+
+专题：[[SGLang-Speculative]]。
 
 ---
 
-## 故事 C：PD 分离 — 请求从 Prefill 节点穿越到 Decode 节点
+## 故事 C：PD 分离，真正新增的是一项分布式事务
 
-### 场景角色
+### 业务现场
 
-**老周**，云厂商 AI Infra 架构师。Prefill 与 Decode 的资源画像不同，混部时尾延迟波动明显。他把两者放进独立资源池，用 KV transfer backend 传状态，并由 Gateway 做 PD 路由。
+某集群的长 prompt 与长 decode 流量互相干扰，团队希望让 prefill 与 decode 独立扩缩。PD 分离不是把一个函数拆成两半：同一逻辑请求要被路由到一对 worker，双方通过 bootstrap metadata 会合，prefill 产生的 KV 要被 decode 正确接收，客户端响应还要由 Gateway 收口。
 
-### 时间线
-
-| 时刻 | 事件 |
-|------|------|
-| T0 | 客户端经 Gateway 发 chat；路由选中 Prefill worker |
-| T1 | Prefill Scheduler `DisaggregationMode.PREFILL` 完成 extend |
-| T2 | `MooncakeKVSender` 把 KV indices + metadata 推到 Decode bootstrap |
-| T3 | Decode 节点 `KVReceiver` 收齐 KV，`prepare_for_prebuilt` 设 `ForwardMode.PREBUILT` |
-| T4 | Decode Scheduler 进入常规 decode 循环；TTFT 由排队、prefill、传输和首个 decode 共同组成 |
-| T5 | Gateway health check 要求 prefill **与** decode 均 healthy 才对外 ready |
-
-### 涉及模块
+### 当前 HTTP Gateway 主线
 
 ```mermaid
 sequenceDiagram
- participant GW as model-gateway
- participant PF as Prefill Worker
- participant KV as Mooncake KV 通道
- participant DC as Decode Worker
- participant Client
-
- Client->>GW: /v1/chat/completions
- GW->>PF: route prefill
- PF->>PF: EXTEND + KVSender.send
- PF->>KV: KV tensors + bootstrap_room
- KV->>DC: KVReceiver.recv
- DC->>DC: PREBUILT batch
- DC->>Client: stream decode tokens
-```
-
-**读法：** PD 分离把一次生成的「重 prefill」与「长 decode」拆到不同进程甚至不同机器。Prefill 侧在 extend 结束后不再本地 decode，而是通过 disaggregation connector 发送 KV。Decode 侧不 rerun prefill forward，而是用 `prepare_for_prebuilt` 从 `req_to_token_pool` 已有 mapping 组装 `out_cache_loc`，`forward_mode = PREBUILT` 直接进入 target verify/decode 路径。Gateway 在 `PrefillDecode` 路由模式下同时检查两类 worker，避免「只有 prefill 没有 decode」的半开集群。
-
-**源码锚点：**
-
-```python
-## 来源：python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py L25-L56
-    def prepare_for_prebuilt(self: ScheduleBatch):
-        """
-        Prepare a prebuilt extend by populate metadata
-        Adapted from .prepare_for_extend().
-        """
-
-        self.forward_mode = ForwardMode.PREBUILT
-        reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = []
-        pre_lens = []
-        req_pool_indices = []
-
-        # Pre-calculate total size
-        total_size = sum(req.extend_range.length for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
-
-        # Fill the tensor in one pass
-        offset = 0
-        for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
-            pre_len = len(req.prefix_indices)
-
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                pre_len : pre_len + req.extend_range.length
-            ]
-            assert (
-                offset + req.extend_range.length <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_range.length] = chunk
-            offset += req.extend_range.length
+    participant C as Client
+    participant G as Gateway PD Router
+    participant P as Prefill Worker
+    participant D as Decode Worker
+    participant K as KV Transfer / Rendezvous
+    C->>G: 一个生成请求
+    G->>G: 选择 prefill/decode pair，注入 bootstrap metadata
+    par 双发请求
+        G->>P: prefill request
+        G->>D: decode request
+    end
+    P->>K: 计算并发送 KV
+    D->>K: 建立会合并接收 KV
+    D-->>G: decode 响应流
+    P-->>G: prefill 状态/可选 input logprobs
+    G-->>C: 收口后的响应
 ```
 
 ```rust
-// 来源：sgl-model-gateway/src/server.rs L110-L118
- RoutingMode::PrefillDecode { .. } => {
- let has_prefill = healthy_workers.iter().any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
- let has_decode = healthy_workers.iter().any(|w| matches!(w.worker_type(), WorkerType::Decode));
- has_prefill && has_decode
- }
+// 来源：sgl-model-gateway/src/routers/http/pd_router.rs L681-L710
+        // Build both requests
+        let prefill_request = self.build_post_with_headers(
+            &self.client,
+            &prepared_prefill.endpoint_url,
+            &prepared_prefill.body,
+            headers,
+            false,
+        );
+        let decode_request = self.build_post_with_headers(
+            &self.client,
+            &prepared_decode.endpoint_url,
+            &prepared_decode.body,
+            headers,
+            false,
+        );
+
+        // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        let (prefill_result, decode_result) =
+            tokio::join!(prefill_request.send(), decode_request.send());
+
+        events::RequestReceivedEvent {}.emit();
+
+        // Process decode response
 ```
 
-**要点：**
+这张证据卡只证明：当前 HTTP PD router 构造 prefill/decode 两个请求并并发发送，然后以 decode response 为主要响应处理入口。它反驳“Gateway 先等 prefill 请求完成，再串行请求 decode”的过时模型。
 
-- OpenAI 请求里的 `bootstrap_host` / `bootstrap_port` / `bootstrap_room` 由 `_convert_to_internal_request` 注入，用于 decode 侧 rendezvous。
-- 传输后端可选 Mooncake / Nixl / Ascend / Mori；选型影响带宽与 tail latency。
+### 为什么说它像分布式事务
 
-### 如果…会怎样（调试）
+一次逻辑请求至少跨越四类状态：
 
-| 现象 | 可能原因 | 排查 |
-|------|----------|------|
-| Gateway 503 ready=false | 仅 prefill 或仅 decode healthy | Gateway worker 探活与 `WorkerType` |
-| Decode 首 token 极慢 | KV 传输未完成就组 batch | `req_time_stats` disagg 分段 |
-| 乱码 / 重复 | bootstrap_room 冲突 | 保证 room id 全局唯一 |
-| PREBUILT OOM | decode 池 KV pool 小于 prefill 产出 | 对齐 `--mem-fraction` 与 max-seq |
+| 状态 | 必须对齐的内容 | 典型失败 |
+|---|---|---|
+| 路由对 | prefill worker、decode worker 与 DP/rank 语义 | 半边无健康实例、rank 不匹配 |
+| 会合身份 | rid、bootstrap room/host/port 等 | 冲突、过期、双方找不到彼此 |
+| KV 所有权 | 哪些位置已分配、发送、接收和可用于 decode | transfer 卡住、容量不足、metadata 不一致 |
+| 响应所有权 | prefill 状态、decode stream、取消与重试 | 半边继续执行、重复请求、错误未收口 |
 
-**专题深读：** [[SGLang-PD分离]] · [[SGLang-model-gateway]]
+因此 PD 的收益不能只看 KV 带宽。端到端 TTFT 还包含两边排队、bootstrap、prefill、传输、decode 准备与响应回程；可用性还取决于一对 worker 和传输后端共同健康。
+
+### 验证顺序
+
+1. 先在相同模型与 workload 下建立混部基线。
+2. 记录 prefill queue/compute、bootstrap、KV alloc/transfer、decode queue/first token 的分段时间。
+3. 分别注入 prefill 不健康、decode 不健康、会合超时和 decode KV 容量不足，确认错误能收口且资源被释放。
+4. 再比较不同 prefill/decode 池比例；不要只测一组静态配比。
+
+预期：PD 可能降低阶段互扰并改善独立扩缩，却会新增传输与协调成本。只有收益超过这些成本，且故障收口可接受，才适合生产启用。
+
+专题：[[SGLang-PD分离]]、[[SGLang-model-gateway]]。
 
 ---
 
-## 三故事对照
+## 三个故事的共同决策框架
 
-| 维度 | 故事 A RadixCache | 故事 B EAGLE | 故事 C PD |
-|------|-------------------|--------------|-----------|
-| 优化目标 | TTFT / prefill 算力 | decode 吞吐 | 混部解耦 / 弹性扩缩 |
-| 关键 metrics | `cache_hit_rate` | `accept_lens` / accept rate | KV 传输延迟、PD ready |
-| 误开代价 | 低（最多 miss） | 中（可能负优化） | 高（半开集群不可用） |
-| 入口专题 | [[SGLang-RadixAttention]] · [[SGLang-KV-Cache]] | [[SGLang-Speculative]] | [[SGLang-PD分离]] · [[SGLang-model-gateway]] |
+```mermaid
+flowchart LR
+    S[业务症状] --> P[profile 找主导瓶颈]
+    P --> H[提出可证伪假设]
+    H --> E[固定 workload 做对照实验]
+    E --> O[观察机制指标 + 端到端指标]
+    O --> F[注入失败并检查收口]
+    F --> D{收益是否覆盖复杂度}
+    D -->|是| R[逐步发布]
+    D -->|否| B[回到基线或换方案]
+```
+
+| 场景 | 机制指标 | 必看的端到端结果 | 新增失败面 |
+|---|---|---|---|
+| Prefix cache | matched/cached tokens、device/host hit | TTFT、queue、throughput | 隔离键、eviction、层级命中 |
+| EAGLE | accept length/rate、draft/verify 成本 | ITL/TPOT、decode throughput、质量 | 候选状态、verify、accepted path 整理 |
+| PD | bootstrap、KV alloc/transfer 分段 | TTFT、吞吐、池利用率、可用性 | 双发、会合、两池健康、取消/重试 |
 
 ---
 
-## 运行验证
+## 静态验证
 
-维护本文时，先用下面的命令确认三个用户故事仍能映射到源码入口：
+在知识库根目录执行：
 
 ```powershell
-rg -n "match_prefix|prepare_for_extend|prepare_for_prebuilt|Eagle|accept_lens|PrefillDecode|WorkerType::Prefill|WorkerType::Decode" sglang/python/sglang/srt/managers/schedule_policy.py sglang/python/sglang/srt/managers/schedule_batch.py sglang/python/sglang/srt/speculative/eagle_worker_v2.py sglang/python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py sglang/sgl-model-gateway/src/server.rs
+# A：匹配键、命中结果与 force miss 对照入口
+rg -n "RadixKey\(|device_indices|host_hit_length|SGLANG_RADIX_FORCE_MISS" `
+  sglang/python/sglang/srt/managers/schedule_policy.py
+
+# B：target verify、接受路径与 accepted KV 整理
+rg -n "eagle_sample|accept_lens|accept_index|move_accept_tokens_to_target_kvcache" `
+  sglang/python/sglang/srt/speculative/eagle_worker_v2.py
+
+# C：HTTP PD router 确实构造并并发发送两个请求
+rg -n "prefill_request|decode_request|tokio::join!|Process decode response" `
+  sglang/sgl-model-gateway/src/routers/http/pd_router.rs
 ```
 
-预期信号：
+预期：A 命中 token ids + `extra_key` 的匹配键和 device/host 结果；B 命中 target verify 后的接受长度、路径索引和 KV 整理；C 命中 prefill/decode 双请求与 `tokio::join!`。这些静态检查证明对象与分支存在，不证明目标环境一定获得性能收益。
 
-- 故事 A 应命中 prefix match 与 extend 准备路径。
-- 故事 B 应命中 EAGLE worker、`accept_lens` 和 accepted token 处理。
-- 故事 C 应命中 `prepare_for_prebuilt` 与 gateway 的 prefill / decode worker 就绪判断。
-
-如果某条故事线没有命中，先确认能力是被重命名、迁移，还是已不再属于主线场景，再更新本页和对应专题入口。
+最后自问：我能否为准备启用的特性写出“瓶颈假设、对照组、机制指标、端到端指标、失败注入、回滚条件”六项？若不能，先不要把它当作生产优化结论。

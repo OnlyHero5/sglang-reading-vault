@@ -9,13 +9,13 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ModelRunner · 源码走读
 
 ## 读者任务
 
-这篇沿一条真实主线走：Scheduler 已经选出一个 generation batch，接下来谁把它变成一次 GPU forward，谁决定 graph 或 eager，谁采样 token，谁把结果交回 Scheduler。
+这篇沿一条真实主线走：Scheduler 已经选出一个 generation batch，接下来谁把它收窄成执行工作对象，谁进行 DP/MLP padding，谁把它投影成 eager/Graph view，谁拥有 attention metadata，谁采样 token，谁保证结果跨流存活并交回 Scheduler。
 
 读完后应能定位这些问题：
 
@@ -27,11 +27,11 @@ updated: 2026-07-10
 
 ## 长文读法
 
-这篇按“调度态如何变成一次 GPU forward”读：Scheduler 只交出 `ScheduleBatch`，Worker 把它快照成 `ForwardBatch`，ModelRunner 判断 graph/eager 路径，runner 真正调用模型，Worker 再决定是否立即采样，Scheduler 最后消费结果并衔接下一轮。
+这篇按“调度态如何变成一次 GPU forward”读：Scheduler 只交出 `ScheduleBatch`，Worker 构造会继续变形的 `ForwardBatch`，ModelRunner 判断 Graph eligibility 并准备 live shape，runner 建立专用 view、协调 metadata 后调用模型，Worker 再决定是否立即采样，Scheduler 最后处理 D2H、relay 与提交。
 
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
-| 第一次建立执行主线 | 读者任务、主线地图、1 到 3 | `ScheduleBatch` 是调度态，`ForwardBatch` 是一次 forward 的执行快照 |
+| 第一次建立执行主线 | 读者任务、主线地图、1 到 3 | `ScheduleBatch` 是调度工作台，`ForwardBatch` 是借用字段且可受控变形的执行对象 |
 | 排查 graph/eager | 4 到 7 | CUDA Graph 能不能跑由 forward mode、runner 可用性和 batch 条件共同决定 |
 | 排查 PP 非末 rank | 2、8 | 非末 rank 返回的是 PP proxy tensors，不负责 logits 和采样 |
 | 排查 structured output 延迟采样 | 8 到 9 | overlap + grammar 场景会把采样封装成 `delay_sample_func`，由 Scheduler 之后触发 |
@@ -87,16 +87,16 @@ if batch.spec_algorithm.is_none():
 - `forward_batch_generation` 是 Scheduler 看到的执行入口。
 - overlap 模式下，Scheduler 还会把下一迭代的输入通过 `future_map` 接起来，所以结果包不仅是 logits，还会带跨流、跨迭代的生命周期约束。
 
-## 2. Worker 先换成 ForwardBatch
+## 2. Worker 先构造 ForwardBatch 工作对象
 
-系统压力：`ScheduleBatch` 里有请求对象、调度字段、CPU mirror、grammar、HiCache consumer 等混合状态；模型 forward 需要的是稳定 tensor 视图。
+系统压力：`ScheduleBatch` 里有请求对象、调度字段、CPU mirror、grammar、HiCache consumer 等混合状态；模型执行需要收窄职责，但后续 padding、Graph view 与 spec pre-plan 又不能靠一次深拷贝解决。
 
 设计选择：`TpModelWorker.forward_batch_generation` 在进入 ModelRunner 前先设置 HiCache consumer，再调用 `ForwardBatch.init_new`。
 
 源码入口：来源：python/sglang/srt/managers/tp_worker.py L482-L572
 
 ```python
-# 来源：python/sglang/srt/managers/tp_worker.py L490-L511
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/tp_worker.py L490-L511
 if batch is not None:
     # update the consumer index of hicache to the running batch
     self.set_hicache_consumer(batch.hicache_consumer_index)
@@ -125,16 +125,16 @@ if self.pp_group.is_last_rank:
 - dLLM 有独立分支。
 - PP 末 rank 与非末 rank 从这里分叉，末 rank 才会进入采样。
 
-## 3. ForwardBatch 是一次 forward 的快照
+## 3. ForwardBatch 是可变工作对象，不是深拷贝快照
 
-系统压力：同一个 `ScheduleBatch` 会被 Scheduler 继续修改，例如过滤完成请求、合并 running batch、处理 overlap。forward 需要的是本次调用能稳定读取的字段集合。
+系统压力：同一个 `ScheduleBatch` 会被 Scheduler 继续修改，而执行侧又要在不同 runner、DP padding、spec inner view 与 Graph bucket 间转换形状。`init_new` 需要给出明确字段边界，但不能保证所有 tensor/reference 与原 batch 隔离。
 
-设计选择：`ForwardBatch.init_new` 消费一次性 override，处理 extend-only 字段，填充 grammar，校验 CPU cache，最后把核心字段组织成 dataclass。
+设计选择：`ForwardBatch.init_new` 消费一次性 override，处理 extend-only 字段，填充 grammar，校验 CPU cache，最后把核心字段组织成 dataclass。许多字段直接借用；后续 `_prepare_eager_forward_batch`、runner registry 或 replay view 会继续塑形。
 
 源码入口：来源：python/sglang/srt/model_executor/forward_batch_info.py L613-L722
 
 ```python
-# 来源：python/sglang/srt/model_executor/forward_batch_info.py L640-L670
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/forward_batch_info.py L640-L670
 if batch.forward_mode.is_decode_or_idle():
     extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
 else:
@@ -159,7 +159,7 @@ else:
 ```
 
 ```python
-# 来源：python/sglang/srt/model_executor/forward_batch_info.py L675-L683
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/forward_batch_info.py L675-L683
 ret = cls(
     forward_mode=batch.forward_mode,
     batch_size=len(batch.seq_lens),
@@ -175,8 +175,10 @@ ret = cls(
 - `input_ids` 是这次要算的 token。
 - `req_pool_indices` 指向请求行。
 - `seq_lens` 和 `seq_lens_cpu` 决定位置、padding、graph eligibility。
-- `out_cache_loc` 指向本次写 KV 的 slot。
+- `out_cache_loc` 是本轮 generic KV write location；Unified/SWA 的物理落点由 attention metadata/pool 翻译。
 - `sampling_info.grammars` 决定 structured output 是否需要延迟采样和 vocab mask。
+
+还要检查 metadata 所有权字段：专用 planner 可先调用 `mark_forward_metadata_ready()` 记录计划 shape。runner 随后必须通过 `needs_forward_metadata_init()` 决定是否计划；对不声明 replan 等价的 multi-step wrapper，重复 plan 会直接破坏其专用 metadata。
 
 ## 4. 启动期先搭好执行现场
 
@@ -189,7 +191,7 @@ ret = cls(
 源码入口：来源：python/sglang/srt/model_executor/model_runner.py L820-L945
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L900-L940
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner.py L900-L940
 def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
     self.eager_runner = EagerRunner(self)
 
@@ -228,7 +230,7 @@ def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
 源码入口：来源：python/sglang/srt/model_executor/model_runner.py L2954-L3046
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L2965-L3002
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner.py L2965-L3002
 self.forward_pass_id += 1
 
 step_span_ctx = profile_range(_build_step_span_name(forward_batch))
@@ -255,12 +257,12 @@ with (
 
 系统压力：decode 要尽量 replay graph 降低 launch 开销；prefill token 数不稳定，需要 graph runner 支持或退回 eager；split prefill 又不能直接交给 eager。
 
-设计选择：先判断 decode/verify/idle 是否能走 graph，能走就立即返回；否则准备 live batch，再依次尝试 split prefill、prefill graph、eager。
+设计选择：先在原始 live batch 上判断 decode/verify/idle 是否能走 Graph，能走就由 Graph runner 自己做 bucket padding 并立即返回；否则先执行 DP/MLP-sync padding，再依次尝试 split prefill、prefill Graph、eager。
 
 源码入口：来源：python/sglang/srt/model_executor/model_runner.py L3048-L3141
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L3060-L3085
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner.py L3060-L3085
 mode_check = (
     forward_batch.forward_mode.is_cpu_graph
     if self.device == "cpu"
@@ -281,7 +283,7 @@ if can_run_graph:
 ```
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L3093-L3133
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner.py L3093-L3133
 self._prepare_eager_forward_batch(forward_batch)
 
 if forward_batch.forward_mode.is_split_prefill():
@@ -308,18 +310,19 @@ else:
     )
 ```
 
-排障时按这四个门槛看：
+排障时至少按这些门槛看：
 
 1. `forward_mode` 是否允许 graph。
 2. 对应 graph runner 是否存在。
 3. 当前 batch 是否能被 runner 接受。
 4. prefill 是否被 CP、capture size、模型结构或 EAGLE target 条件挡住。
+5. dynamic embedding override、encoder lens、TBO、hidden-state capture mode、ngram shape 与 DP Graph 标志是否兼容。
 
-## 7. Runner 才真正调用模型
+## 7. Runner 先建立 view 与 metadata，再调用模型
 
 系统压力：同样是 eager，decode、idle、extend 的准备动作不同；graph replay 还需要把 live batch 装入静态 buffer。
 
-设计选择：eager runner 负责按 mode 分派；decode graph runner 负责 pad 到 capture bucket、填共享 buffer、初始化 out-of-graph metadata，然后 replay。
+设计选择：eager runner 默认把 live batch 复制到固定 registry（可用环境开关禁用复制），再按 mode 分派；decode Graph runner pad 到 capture bucket、填共享 buffer、构造同时含 capture mode 与 actual mode 的 replay view、刷新 graph 外 metadata，然后 replay。
 
 源码入口：来源：python/sglang/srt/model_executor/runner/eager_runner.py L167-L253
 
@@ -352,7 +355,7 @@ with ctx, pdmux_ctx:
 源码入口：来源：python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py L930-L1045
 
 ```python
-# 来源：python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py L1012-L1037
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py L1012-L1037
 def execute(
     self,
     forward_batch: ForwardBatch,
@@ -372,16 +375,18 @@ def execute(
 
 这里能看出 overlap 的一个底层抓手：graph replay 前会记录 read-done event，Scheduler 的 WAR barrier 可以知道共享 buffer 的读阶段何时完成。
 
+还有一个比“是否 Graph”更隐蔽的分支：若 `forward_batch.needs_forward_metadata_init()` 为假，说明 plan-stream 或 multi-step 已经拥有 metadata。Graph `load_batch()` 此时只复制仍需刷新的输入字段并选择 graph key，不会重新执行普通 metadata plan。排查 stale metadata 时必须记录 ready 标记、计划 shape 与最终 padded shape。
+
 ## 8. Worker 决定采样时机
 
 系统压力：模型 forward 只产 logits，是否立刻采样要看 PP rank、verify 分支、prefill-only 请求、structured output 与 overlap。
 
-设计选择：末 PP rank 才构造含 logits 的 `GenerationBatchResult`；verify 可跳过采样；overlap + grammar 会把采样延迟成闭包；prefill-only 用 dummy token。
+设计选择：末 PP rank 才构造含 logits 的 `GenerationBatchResult`；verify 可跳过采样；overlap + grammar 会把采样延迟成闭包；prefill-only 生成与 batch size 对齐的 dummy token tensor。源码注释写“CPU”，但实际 `device=forward_batch.input_ids.device`，判断设备应以代码参数为准。
 
 源码入口：来源：python/sglang/srt/managers/tp_worker.py L506-L572
 
 ```python
-# 来源：python/sglang/srt/managers/tp_worker.py L512-L543
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/tp_worker.py L512-L543
 batch_result = GenerationBatchResult(
     logits_output=logits_output,
     can_run_cuda_graph=can_run_cuda_graph,
@@ -419,7 +424,7 @@ if not forward_batch.is_prefill_only:
 源码入口：来源：python/sglang/srt/model_executor/model_runner.py L3143-L3191
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L3160-L3191
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/model_executor/model_runner.py L3160-L3191
 def sample(
     self,
     logits_output: LogitsProcessorOutput,
@@ -454,7 +459,7 @@ def sample(
 源码入口：来源：python/sglang/srt/managers/scheduler.py L3389-L3455
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L3404-L3432
+# 定位骨架（非逐行摘录）：来源 python/sglang/srt/managers/scheduler.py L3404-L3432
 def launch_batch_sample_if_needed(
     self, batch_result: GenerationBatchResult
 ) -> Union[GenerationBatchResult]:
@@ -482,7 +487,7 @@ def launch_batch_sample_if_needed(
 
 最小验证不需要改源码：
 
-- 启动时对比打开和关闭 graph，观察日志中是否出现 `Capture target decode CUDA graph begin` 与 `end`，并对比 decode throughput。
+- 固定模型、backend、batch/context、输入与硬件，对比 Graph on/off；观察 capture/replay、错误形态与输出一致性，吞吐方向只记录实测。
 - 对 structured output 请求打开 overlap，检查 delayed sampling 是否最终被 `launch_batch_sample_if_needed` 消费；预期是 result 进入处理器前已有 `next_token_ids`。
 - 在 PP 环境下分别断点 `tp_worker.py` 的末 rank 和非末 rank 分支；预期非末 rank 返回 `pp_hidden_states_proxy_tensors`，末 rank 才进入 `sample`。
 - 如果在线更新权重，检查请求是否带 `recapture_cuda_graph`；预期只在该标志打开且设备支持 graph 时重建 decode graph。
@@ -490,7 +495,7 @@ def launch_batch_sample_if_needed(
 ## 复盘迁移
 
 - 调度态和执行态分开，是读懂本模块的第一不变量。
-- `ForwardMode` 是最短排障路径；先看 mode，再看 runner。
+- `ForwardMode` 是第一把钥匙，但还要看 actual/capture mode、runner view 和 metadata owner。
 - graph 不是“decode 必然走”，而是 mode、runner、shape、backend、capture 配置共同满足后的结果。
 - `GenerationBatchResult` 是跨流结果包，不只是 logits 容器。
 - Worker 边界让 Scheduler 免于理解 TP/PP/draft/embedding/weight update 的执行细节。

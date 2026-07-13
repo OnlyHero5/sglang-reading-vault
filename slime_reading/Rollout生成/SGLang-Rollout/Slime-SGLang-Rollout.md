@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang-Rollout
 
@@ -41,7 +41,7 @@ flowchart LR
 | 部件 | 源码对象 | 作用 |
 |------|----------|------|
 | 进水口 | `data_source(args.over_sampling_batch_size)` | 一次补入一批 prompt group |
-| 水位计 | `GenerateState.remaining_batch_size` | 记录已提交、仍可能贡献有效 group 的数量 |
+| 容量账 | `GenerateState.remaining_batch_size` | 记录“已提交且尚未被 filter 否决”的 group 数；它包含已 keep 的 group，并不等于 pending task 数 |
 | 过滤网 | `call_dynamic_filter` | 完成后判断 group 是否进入训练 |
 | 排水口 | `RolloutFnTrainOutput.samples` | 只排出 `rollout_batch_size` 个有效 group |
 | 泄压阀 | `abort` | 有效 batch 满后停止剩余请求，partial 模式下回收半成品 |
@@ -117,11 +117,18 @@ def generate_rollout(
 ## 本专题的不变量
 
 - `rollout_batch_size` 是有效 prompt group 数，不是所有已提交 group 数。
-- `GenerateState.remaining_batch_size` 按 group 计数，filter drop 后必须下降。
+- `GenerateState.remaining_batch_size` 按 group 计数，只在 filter drop 时下降；keep 后不下降，因为已保留 group 仍占目标容量。
 - `generate_and_rm_group` 的任务粒度是 group，单个 sample 的生成在组内并发。
 - 默认 `generate` 必须请求 `return_logprob=True`，训练 token 才有 rollout logprob。
 - custom generate 可以返回 `Sample` 或 `list[Sample]`，但必须维护 Sample 字段不变量。
 - `abort` 不只是停服务，还要 drain pending task；partial 模式下才会回收半成品。
+
+## 四个容易被“接口支持”掩盖的边界
+
+- fan-out 的单层接口确实允许 custom generate 返回 `list[Sample]`，但 `group_rm` 的组级赋 reward、partial abort 的 `for sample in group` 和部分 filter/hook 仍按叶子是 `Sample` 编写；组合启用前必须做端到端嵌套形状测试。
+- `dp_rank_context()` 会维护 `GenerateState.dp_rank` 的最小负载计数，但默认 HTTP `generate()` 仍请求统一 router URL，payload/header 没有携带这个 rank；它不是默认路径的强制 DP 定向路由。
+- `rollout_sample_filter_path` 在有效 batch 已凑满、state 已 reset 后执行；其正式契约是原地设置 `Sample.remove_sample`，让样本不参与 loss，而不是从 group 中删除。它也不改变更早发生的 advantage normalization。
+- 一次 `asyncio.wait(FIRST_COMPLETED)` 可能同时收割多个 done task。若 `data` 在处理这批 done 的中途已满，后续 keep group 只进入 `all_data`，不会进入训练，也不会自动回灌 DataSource；`rollout_all_samples_process_path` 是观察/处理它们的最后 hook。
 
 ## 验证抓手
 
@@ -131,4 +138,4 @@ python -m pytest slime/tests/test_rollout_metrics.py -q
 python -m pytest slime/tests/plugin_contracts/test_plugin_generate_contracts.py -q
 ```
 
-预期现象：第一组测试验证 `append_response_tokens` 与 top-p/routing replay 指标契约；第二组测试验证 custom generate 的优先级、签名和返回形状。
+预期覆盖如上，但当前环境不能把 collection 失败写成通过：`test_rollout_metrics.py` 缺 `ray`；三份 plugin contract 直接运行均先缺 `httpx`，最小 stub `httpx` 后又暴露缺 `pylatexenc` 与 PyArrow/Torch 对 NumPy 2.x 的 ABI 问题。本轮因此补做当前源码 AST 行为检查，5 项通过：默认 HTTP 不消费 `state.dp_rank`、最终 hook 位于 abort/reset 之后、eval 以 `results.update` 合并、partial abort 假定 leaf 是 Sample、fan-out + group RM 真实触发 list 无 `.reward`。AST 证据不替代完整依赖环境。

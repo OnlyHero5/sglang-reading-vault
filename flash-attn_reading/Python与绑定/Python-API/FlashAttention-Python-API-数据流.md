@@ -9,15 +9,15 @@ tags:
   - framework/flash-attn
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Python-API · 数据流
 
 ## 读者任务
 
-这篇只看对象生命周期：同一个 attention 调用在 Python、C++、CUDA 边界上分别长什么样。读完后你应该能说明：
+这篇只看对象生命周期：同一个 attention 调用在 Python、backend 路由与 compiled C++/kernel 边界上分别长什么样。读完后你应该能说明：
 
-- dense forward 如何从 PyTorch tensor 变成 C++ `Flash_fwd_params`。
+- dense forward 如何先选择 backend，以及 compiled 分支如何从 PyTorch tensor 变成 C++ `Flash_fwd_params`。
 - varlen 如何从 padded batch 变成连续 token，再 scatter 回 padded batch。
 - 返回值里 `out/softmax_lse/S_dmask/rng_state` 分别服务谁。
 - KV cache decode 为什么多了 cache 长度、batch index、block table 和 RoPE 这些状态。
@@ -27,17 +27,70 @@ updated: 2026-07-10
 ```mermaid
 flowchart LR
     T["q/k/v tensor<br/>B,S,H,D"]
-    M["maybe_contiguous<br/>last dim stride=1"]
+    API["flash_attn_func<br/>public API"]
     A["FlashAttnFunc.forward<br/>scale + head_dim pad"]
-    E["flash_attn_gpu.fwd<br/>extension call"]
-    C["mha_fwd<br/>dtype/device/stride checks"]
+    W["_wrapped_flash_attn_forward<br/>custom op wrapper"]
+    M["maybe_contiguous<br/>last dim stride=1"]
+    E["flash_attn_gpu.fwd<br/>selected backend"]
+    B{"backend"}
+    R["ROCm Triton"]
+    C["compiled extension / mha_fwd<br/>dtype/device/stride checks"]
     P["Flash_fwd_params<br/>ptr/stride/shape/flags"]
-    K["CUDA kernel"]
+    K["CUDA/HIP kernel"]
     O["out + softmax_lse"]
-    T --> M --> A --> E --> C --> P --> K --> O
+    T --> API --> A --> W --> M --> E --> B
+    B --> R --> O
+    B --> C --> P --> K --> O
 ```
 
-C++ fixed-length forward 首先把 Python tensor 约束成 kernel 能接受的形态。
+这里的顺序不能颠倒：public API 先进入 autograd `FlashAttnFunc.apply`；`FlashAttnFunc.forward` 先确定 scale，并在 head dim 不是 8 的倍数时 padding；随后才调用 wrapped custom op。`maybe_contiguous` 位于 custom op 实现内部，负责把最后一维 stride 不为 1 的输入整理后再交给扩展。它不是进入 autograd forward 之前的前置步骤。
+
+```python
+# 定位：flash_attn/flash_attn_interface.py L828-L855（摘要/骨架）
+class FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        is_grad_enabled,
+    ):
+        ...
+        head_size_og = q.size(3)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+```
+
+```python
+# 定位：flash_attn/flash_attn_interface.py L89-L106（摘要/骨架）
+def _flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    ...
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
+        q,
+        k,
+        v,
+        ...
+    )
+```
+
+下面的 C++ fixed-length forward 只描述 compiled CUDA extension 分支：它首先把 Python tensor 约束成 kernel 能接受的形态。ROCm Triton 分支不经过这段 `mha_fwd`，HIP compiled extension 的平台门禁也不能由这张 CUDA 卡外推。
 
 ```cpp
 // 来源：csrc/flash_attn/flash_api.cpp L351-L395
@@ -137,7 +190,7 @@ flowchart LR
 `unpad_input` 的输出同时服务 kernel 和回填：
 
 ```python
-# 来源：flash_attn/bert_padding.py L111-L126
+# 定位：flash_attn/bert_padding.py L111-L128（摘要/骨架；去除 upstream 尾随空格）
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -154,7 +207,11 @@ flowchart LR
         indices,
         cu_seqlens,
         max_seqlen_in_batch,
+        used_seqlens_in_batch,
+    )
 ```
+
+前四项的打包边界来自 `attention_mask + unused_mask`，第五项却只统计 `attention_mask`。当前 docstring 对 `seqused` 的描述与第五返回表达式不一致，数据流判断应以实现为准。
 
 回填则只需要 packed output 和原始 indices：
 
@@ -181,10 +238,10 @@ def pad_input(hidden_states, indices, batch, seqlen):
 
 | 返回值 | 生产者 | 消费者 | 语义 |
 |--------|--------|--------|------|
-| `out` | CUDA forward | 上层模型 | attention 输出 |
-| `softmax_lse` | CUDA forward | backward、测试、可选用户返回 | 每行 logsumexp 摘要 |
-| `S_dmask` | CUDA forward 可选 | 测试 | 概率/dropout mask 调试输出，不是主路径 |
-| `rng_state` | CUDA forward dropout 路径 | backward | 对齐 dropout 随机状态 |
+| `out` | backend forward | 上层模型 | attention 输出 |
+| `softmax_lse` | backend forward | backward、测试、可选用户返回 | 每行 logsumexp 摘要 |
+| `S_dmask` | backend forward 可选 | 测试 | dropout 调试槽位；不是稳定的完整概率矩阵 |
+| `rng_state` | backend forward | backward | dropout 开启时对齐随机状态；作为协议字段随 forward 返回 |
 
 `FlashAttnFunc.forward` 只在需要梯度时保存 backward 所需对象：
 
@@ -216,9 +273,11 @@ def pad_input(hidden_states, indices, batch, seqlen):
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 ```
 
+公开 `return_attn_probs=True` 决定是否返回三元组，但传给 backend 的 `return_softmax` 还要同时满足 `dropout_p > 0`。因此 dropout 为 0 时第三项不能按函数参数名推断为真实 attention probability。
+
 ## KV cache：cache 状态参与输入契约
 
-模型层 decode fast path 会把 q、新 kv、历史 cache、cache length、RoPE 和 ALiBi 都传给 `flash_attn_with_kvcache`。
+下面这个模型层 decode fast path 会把 q、新 kv、历史 dense cache、cache length、RoPE 和 ALiBi 传给 `flash_attn_with_kvcache`。它没有传 `cache_batch_idx` 或 `block_table`，所以只能证明 dense cache 的一种上层接线，不能代表 paged/remap 的完整能力面。
 
 ```python
 # 来源：flash_attn/modules/mha.py L526-L569
@@ -268,7 +327,7 @@ def pad_input(hidden_states, indices, batch, seqlen):
                 causal=self.inner_cross_attn.causal,
 ```
 
-读者抓手：KV cache 数据流不是“多一个参数”，而是多了一组状态账：cache memory、当前长度、batch index、page table、RoPE position。
+读者抓手：KV cache 数据流不是“多一个参数”，而是多了一组状态账：cache memory、物理结束位置、可选 batch remap、可选 page table、leftpad 与 RoPE position。签名同时暴露这些对象不代表任意组合都合法；paged KV 当前拒绝与 `cache_batch_idx`、leftpad 同时使用。
 
 ## 运行验证
 
@@ -278,6 +337,24 @@ def pad_input(hidden_states, indices, batch, seqlen):
 | varlen 边界 | 检查 `cu_seqlens[0] == 0` 和 `cu_seqlens[-1] == packed.shape[0]` | packed token 数和边界一致 |
 | 回填 | `pad_input(unpadded, indices, batch, seqlen)` | shape 回到 `(batch, seqlen, ...)` |
 | KV cache | 传 int `cache_seqlens` | Python 层会转为 batch 维 int32 tensor |
+
+无法加载 extension/Aiter 时，先执行静态替代：
+
+```powershell
+@'
+import ast
+from pathlib import Path
+for path in [
+    "flash-attn/flash-attention/flash_attn/flash_attn_interface.py",
+    "flash-attn/flash-attention/flash_attn/bert_padding.py",
+    "flash-attn/flash-attention/flash_attn/modules/mha.py",
+]:
+    ast.parse(Path(path).read_text(encoding="utf-8"))
+print("AST parse: PASS")
+'@ | python -
+```
+
+预期三份文件均可解析。这个结果只验证 Python 对象流的静态完整性，不证明 compiled ABI、GPU 数值、paged KV 组合或 `torch.compile` 可执行。
 
 ## 复盘
 

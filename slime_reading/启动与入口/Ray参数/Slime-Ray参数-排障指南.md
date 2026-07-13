@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Ray参数 · 排障指南
 
@@ -74,7 +74,7 @@ del args.offload
 参数 help 明确把 0 定义成“只启动 router，不启动本地 SGLang engine”的选择。
 
 ```python
-# 来源：slime/utils/arguments.py L44-L53
+# 来源：slime/utils/arguments.py L44-L54
 parser.add_argument(
     "--rollout-num-gpus",
     type=int,
@@ -170,7 +170,7 @@ def get_server_info(url: str, timeout: float = 30.0) -> dict:
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/external.py L117-L120
+# 来源：slime/backends/sglang_utils/external.py L117-L119
 args.rollout_external_engine_infos = [info.to_dict() for info in infos]
 args.rollout_num_engines = len(infos)
 args.rollout_num_gpus = sum(info.num_gpus for info in infos)
@@ -234,7 +234,7 @@ parser.add_argument(
 )
 ```
 
-这是因为 PG bundle 切分和 rollout engine 组织都需要知道物理节点上的 GPU 粒度。小卡数实验里，`actor_num_gpus_per_node` 和 `num_gpus_per_node` 不一致时，最容易出现资源切片和引擎预期不一致。
+这张证据只证明参数帮助明确要求“小于 8 卡/节点的 colocate 要显式设置”；它没有单独证明某一种故障必然发生。排障时同时记录 `actor_num_gpus_per_node`、`num_gpus_per_node`、PG bundle 的实际 node/GPU 映射和每个 ServerGroup 的 engine 布局，再判断是节点粒度、资源切片还是引擎拓扑不一致。
 
 ## 该在哪里打断点
 

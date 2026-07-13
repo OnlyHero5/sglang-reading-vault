@@ -7,7 +7,7 @@ learning_role: reference
 tags:
   - maintenance
   - obsidian
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # Obsidian 知识库规范
@@ -31,7 +31,7 @@ updated: 2026-07-10
 | 排障 | `SGLang-Scheduler-排障指南.md` |
 | 学习检查 | `SGLang-Scheduler-学习检查.md` |
 
-禁止使用排序数字前缀、泛化的 `README.md`、重复的 `核心概念.md`，也不要用历史编号作为 alias。
+读者专题禁止使用排序数字前缀、泛化的 `README.md`、重复的 `核心概念.md`，也不要用历史编号作为 alias。仓库根目录用于说明项目打开方式和目录边界的 `README.md` 是唯一例外。
 
 ## Properties
 
@@ -53,7 +53,7 @@ updated: 2026-07-10
 ---
 ```
 
-`type` 使用：`map`、`guide`、`concept`、`walkthrough`、`dataflow`、`troubleshooting`、`exercise`、`reference`、`template`、`index`、`dashboard`、`readme`。
+`type` 使用：`guide`、`map`、`concept`、`walkthrough`、`dataflow`、`troubleshooting`、`exercise`、`reference`、`dashboard`、`template`。
 
 `learning_role` 使用：`core`、`reference`、`debug`、`practice`。`framework` 使用 `sglang`、`slime`、`flash-attn` 或 `cross-framework`。
 
@@ -102,7 +102,7 @@ Bases 用于动态汇总，不手工维护重复清单。现有视图位于 `kno
 node maintenance/audit_wikilinks.mjs
 node maintenance/audit_source_evidence.mjs
 node maintenance/audit_markdown_quality.mjs
-git diff --check
+git -c core.autocrlf=false diff --check
 ```
 
-同时确认：读者入口没有维护编号或派工话术，upstream 和 `.obsidian/` 未被意外修改。
+同时确认：读者入口没有维护编号或派工话术，upstream 和 `.obsidian/` 未被意外修改，本轮修改文档已完成脱离编辑过程的全文语义复读。

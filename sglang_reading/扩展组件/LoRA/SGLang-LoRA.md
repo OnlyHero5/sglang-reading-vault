@@ -15,22 +15,24 @@ updated: 2026-07-10
 
 ## 读者任务
 
-这一组笔记解决一个很具体的问题：同一个 base model 如何在一个 serving 进程里同时服务多个 LoRA adapter，并且不让请求路由、prefix cache、GPU 权重槽位和 kernel metadata 互相串线。
+这一组笔记解决一个很具体的问题：同一个 base model 如何在一套 serving 实例里同时服务多个 LoRA adapter，并且不让请求路由、prefix cache、GPU 权重槽位和 kernel metadata 互相串线。
 
-读完要能做四件事：
+读完要能做五件事：
 
 - 看到请求里的 `lora_path`，能追到 `LoRARegistry.acquire` 生成的内部 `lora_id`。
 - 看到 `max_loras_per_batch` 拦住请求，能判断是 batch 内 adapter 容量、pinned adapter 还是 drainer 在起作用。
 - 看到输出疑似串 adapter，能先检查 `Req.extra_key` 是否把 `lora_id` 纳入 RadixCache namespace。
 - 准备改 LoRA backend 或 MoE LoRA 时，能分清 `LoRAManager`、`LoRAMemoryPool`、`LoRABackend` 和 LoRA 包装层各自负责什么。
+- 处理动态 load/unload 失败时，能判断 registry、`lora_ref_cache`、CPU adapter 字典和 GPU slot 哪些已经改变、哪些没有回滚。
 
 ## 先建立模型
 
-LoRA 在 SGLang 里不是“把某个 adapter 临时套到模型上”这么简单。更准确的模型是：每个请求带着一张 adapter 登机牌，控制面先把人名换成稳定座位号，调度器确认本轮航班能坐下这些 adapter，执行面再把对应权重搬进 GPU 槽位，kernel 只看槽位编号。
+LoRA 在 SGLang 里不是“把某个 adapter 临时套到模型上”这么简单。更准确的模型是：每个请求带着一张 adapter 登机牌，控制面先把名称换成本次加载生命周期内有效的内部 ID，调度器确认本轮航班能坐下这些 uid，执行面再把对应权重搬进 GPU 槽位，kernel 只看槽位编号。
 
 ```mermaid
 flowchart LR
   API["请求<br/>lora_path / lora_name"] --> REG["LoRARegistry<br/>name -> lora_id<br/>引用计数"]
+  REG --> HIST["lora_ref_cache<br/>历史可重载引用"]
   REG --> REQ["Req<br/>lora_id + extra_key"]
   REQ --> SCH["Scheduler<br/>batch 准入"]
   SCH --> FB["ForwardBatch<br/>lora_ids"]
@@ -40,7 +42,7 @@ flowchart LR
   BE --> LAYER["LoRA 包装层<br/>base + delta"]
 ```
 
-这张图是本专题的主线。控制面只回答“哪个 adapter 可用、谁正在用”；执行面只回答“本 batch 要用哪些槽位、每个 token 该读哪组 A/B 权重”。
+这张图是本专题的主线。控制面 registry 回答“哪个名称当前可 acquire、谁正在用”；`lora_ref_cache` 还会保留已经 unregister 的历史引用，以便请求触发隐式 reload。执行面回答“本 batch 要用哪些槽位、每个 token 该读哪组 A/B 权重”。这些状态通过 fan-out 最终一致，而不是一个原子事务。
 
 ## 阅读顺序
 
@@ -63,7 +65,7 @@ flowchart LR
 | 动态加载与卸载 API | `python/sglang/srt/managers/tokenizer_control_mixin.py`、`python/sglang/srt/entrypoints/http_server.py` |
 | 调度准入 | `python/sglang/srt/managers/scheduler.py` |
 | 请求对象与 prefix cache namespace | `python/sglang/srt/managers/schedule_batch.py` |
-| 执行快照 | `python/sglang/srt/model_executor/forward_batch_info.py` |
+| 执行对象与 LoRA 身份载体 | `python/sglang/srt/model_executor/forward_batch_info.py` |
 | 执行面管理器 | `python/sglang/srt/model_executor/model_runner.py`、`python/sglang/srt/lora/lora_manager.py` |
 | GPU 槽位与 eviction | `python/sglang/srt/lora/mem_pool.py`、`python/sglang/srt/lora/eviction_policy.py` |
 | kernel metadata 与层内计算 | `python/sglang/srt/lora/backend/triton_backend.py`、`python/sglang/srt/lora/layers.py`、`python/sglang/srt/lora/utils.py` |
@@ -91,13 +93,13 @@ flowchart LR
         )
 ```
 
-这段代码给出本专题边界：请求侧 `LoRARegistry` 不负责 GPU 权重，模型侧 `LoRAManager` 不负责用户传入的 adapter 名称解析。
+这段代码给出本专题边界：请求侧 `LoRARegistry` 不负责 GPU 权重，模型侧 `LoRAManager` 不负责用户传入的 adapter 名称解析。还要保留两个失败边界：`LoRAManager` 的加载异常没有清理已经写入的 `configs` 条目；控制面 backend 成功后若 register 或 LRU 收口失败，也没有跨进程回滚。
 
 ## 关联专题
 
 - Prefix cache namespace 见 [[SGLang-RadixAttention]]。
 - batch 准入与 waiting queue 主线见 [[SGLang-Scheduler]]。
-- 模型执行快照与 CUDA Graph 选路见 [[SGLang-ModelRunner]]。
+- 模型执行对象、runner view 与 CUDA Graph 选路见 [[SGLang-ModelRunner]]。
 - MoE base 层与 expert 并行见 [[SGLang-MoE]]。
 
 ## 下一步

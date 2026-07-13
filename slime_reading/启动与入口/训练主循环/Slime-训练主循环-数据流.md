@@ -69,8 +69,8 @@ sequenceDiagram
         end
         alt use_critic
             Main->>CR: async_train(rollout_data_ref)
-            CR-->>ACT: value_refs
-            Main->>ACT: async_train(rollout_data_ref, external_data)
+            CR-->>Main: value_refs
+            Main->>ACT: async_train(rollout_data_ref, external_data=value_refs)
         else no critic
             Main->>ACT: async_train(rollout_data_ref)
         end
@@ -78,7 +78,7 @@ sequenceDiagram
             Main->>ACT: save_model
             Main->>RM: save data source
         end
-        Main->>ACT: clear_memory or auto offload
+        Main->>ACT: clear_memory or model auto-offload
         opt offload_rollout
             Main->>RM: onload_weights
         end
@@ -98,7 +98,7 @@ sequenceDiagram
 `create_placement_groups` 输出的不是三套独立 placement group，而是同一个 `pg` 加不同 bundle index 视图。
 
 ```python
-# 来源：slime/ray/placement_group.py L126-L137
+# 来源：slime/ray/placement_group.py L126-L135
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
@@ -145,6 +145,7 @@ sequenceDiagram
 - RolloutManager 负责把 samples 转成训练侧可消费的数据引用。
 - Actor/Critic 只通过 `rollout_data_ref` 和可选 `value_refs` 交互。
 - `train.py` 不解释 batch 内 token layout；那是训练数据和 loss 专题的职责。
+- critic-only 阶段不会发起 actor train，但 step 尾部仍调用 actor 的发布门面；训练消费与版本发布必须分开记账。
 
 ## 权重同步数据流
 
@@ -203,7 +204,7 @@ sequenceDiagram
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 ```
 
-这条数据流的核心是“一步 ahead 的 future”。它不是后台无限生成，也不是 fully-async worker。
+这条数据流的核心是“一步 ahead 的 future”。它不是后台无限生成，也不是 fully-async worker。N+1 的 future 在 train N 之前发起，所以流水线即使每轮发布一次，也存在至少一拍生成侧 staleness。
 
 ## 周期动作数据流
 
@@ -230,14 +231,14 @@ save 和 eval 都调用同一个 helper，但传参不同。
 
 - save 知道 `num_rollout`，最后一步也会触发。
 - eval 不知道 `num_rollout`，只按 interval 或 epoch 边界触发。
-- eval 在 update weights 后，看到的是当前训练后的 policy。
+- 循环尾部 eval 位于发布调用之后；但在 async 入口中，若本轮未命中 `update_weights_interval`，周期 eval 看到的仍可能是上次发布的 policy。
 
 ## 参数校验对主循环的影响
 
 很多主循环分支在进入 `train()` 前已经被参数校验改写。
 
 ```python
-# 来源：slime/utils/arguments.py L1885-L1906
+# 来源：slime/utils/arguments.py L1885-L1902
     # always true on offload for colocate at the moment.
     if args.colocate:
         if args.offload_train is None:

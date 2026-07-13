@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 通用模型 · 数据流
 
@@ -77,9 +77,9 @@ class _ModelRegistry:
 
 因此，类账的核心不变量是：HF architecture 字符串必须能命中 `self.models` 中的 key，或者能被改写到 fallback architecture。
 
-## 2. 执行账：`ForwardBatch` 只随张量下传
+## 2. 执行账：`ForwardBatch` 是借来的可变执行视图
 
-模型层不解析 `Req`，也不决定调度策略。Scheduler 和 ModelRunner 已经把请求压成 `input_ids`、`positions` 和 `ForwardBatch`；模型层把它们原样传给 decoder layer 和 attention。
+模型层不解析 `Req`，也不决定调度策略。Scheduler 和 ModelRunner 已把请求压成 `input_ids`、`positions` 和 `ForwardBatch`；decoder layer 与 attention 会共享这一个工作对象，读取 mode、cache location、backend metadata 等字段。普通 forward 主要把它向下传，但 split-prefill 会把 `hidden_states/residual` 写回其中，所以它不是不可变快照，也不能概括成“原样透传”。
 
 ```python
 # 来源：python/sglang/srt/models/llama.py L228-L252
@@ -110,7 +110,7 @@ class _ModelRegistry:
         return output
 ```
 
-这里的边界很清楚：模型 attention 准备 Q/K/V，`RadixAttention` 消费 `ForwardBatch` 里的 mode、cache 位置和 backend metadata。
+这里的边界很清楚：模型 attention 准备 Q/K/V，`RadixAttention` 消费 `ForwardBatch` 里的 mode、cache 位置和 backend metadata。对象所有权仍在本次执行链，模型子层不应把它长期缓存成跨 batch 状态。
 
 ## 3. PP 边界：首 rank 消费 token，中间 rank 消费 proxy
 
@@ -119,7 +119,7 @@ PP 下的对象形态会变：
 | PP 位置 | 输入对象 | 输出对象 |
 |---------|----------|----------|
 | first rank | `input_ids` 或 `input_embeds` | hidden states + residual |
-| middle rank | `PPProxyTensors` | 新的 `PPProxyTensors` |
+| middle rank | `PPProxyTensors` | 更新后的 `PPProxyTensors` |
 | last rank | `PPProxyTensors` 或 first rank hidden | final hidden states，再进入 logits/pooler |
 
 `Qwen2Model.forward` 展示了这个边界：
@@ -207,11 +207,11 @@ class PPProxyTensors:
         return len(self.tensors)
 ```
 
-所以 PP 数据流里，关键不是序列化协议，而是 hidden/residual 两个状态是否在 stage 间保持一致。
+所以 `PPProxyTensors` 只是逻辑容器，不是这里展示的网络序列化协议；PP 数据流的关键是 hidden/residual 两个具名状态是否被 stage 传输层完整交付。切片操作还会对容器内所有 tensor 同步切片。
 
 ## 4. CausalLM 边界：最后一跳才有 logits
 
-`LlamaForCausalLM.forward` 展示了输出分叉。`get_embedding=True` 时走 pooler；普通 generate 在 last rank 走 logits processor；非 last rank 返回 hidden states。
+`LlamaForCausalLM.forward` 展示了输出分叉。`get_embedding=True` 时走 pooler；普通 generate 在 last rank 走 logits processor；非 last rank 返回底层 model 的输出。对标准 PP 路径而言，这个对象实际是 `PPProxyTensors`，只是局部变量仍命名为 `hidden_states`。
 
 ```python
 # 来源：python/sglang/srt/models/llama.py L550-L562
@@ -230,7 +230,7 @@ class PPProxyTensors:
             return hidden_states
 ```
 
-排查“为什么这里没有 logits”时，先确认当前 rank 是否是 PP last rank，再确认 `get_embedding` 是否为真。
+排查“为什么这里没有 logits”时，先确认当前 rank 是否是 PP last rank，再确认 `get_embedding` 是否为真；不要因 wrapper 的变量名把 proxy 容器误判成裸 tensor。
 
 ## 5. Qwen3 层内边界：通信由 LayerCommunicator 接管
 
@@ -277,7 +277,7 @@ Qwen3 layer 的对象变化不是简单的 `norm → attention → norm → mlp`
         return hidden_states, residual
 ```
 
-这个边界解释了为什么 Qwen3 问题不能只按 Llama 的 Pre-Norm 公式排查。通信和 layout 已经被抽象进 communicator。
+这个边界解释了为什么 Qwen3 问题不能只按 Llama 的 Pre-Norm 公式排查。QKV/O projection 使用 attention TP，其中 O projection 不在层内立即 reduce；MLP 复用 Qwen2 路线。通信和 layout 的重新接合被抽象进 communicator。
 
 ## 6. 权重账：ModelLoader 的输出进入 `load_weights`
 
@@ -289,7 +289,7 @@ Qwen3 layer 的对象变化不是简单的 `norm → attention → norm → mlp`
 | stage/filter | 跳过 PP stage 外层和冗余 tensor | `rotary_emb.cos_cached` |
 | stacked mapping | 把 HF 分开参数写入 fused 参数 | `q_proj` → `qkv_proj` |
 
-Qwen3 的前缀兼容和 tied embedding 写入发生在权重账入口：
+Qwen3 的前缀兼容和 tied embedding 补写发生在权重账入口。尤其在 PP>1 时，last rank 的 `lm_head` 是独立模块；“tied”由同一 embedding tensor 的加载语义维持，而不是 Python 对象 alias：
 
 ```python
 # 来源：python/sglang/srt/models/qwen3.py L607-L624
@@ -337,11 +337,11 @@ Llama 的 stacked mapping 则展示了 QKV 和 gate/up 的 fused 写入：
 
 | 现象 | 观察入口 | 预期 |
 |------|----------|------|
-| native 没命中 | `model_config._resolved_model_arch` | 值是 native 类名或 `TransformersForCausalLM` |
+| native 没命中 | `model_config._resolved_model_arch/_impl` | 值应明确指向 native 类或具体 `Transformers*` wrapper；wrapper 类型还受 generation/pooling、多模态与 MoE 影响 |
 | PP 中间 rank 无 logits | `pp_group.is_last_rank` | 非 last rank 返回 hidden 或 `PPProxyTensors` |
-| Qwen3 layer 输出 shape 异常 | `LayerCommunicator.prepare_attn/prepare_mlp` | attention/MLP 前后的 layout 应匹配当前 parallel 配置 |
+| Qwen3 layer 输出 shape 异常 | `attn_tp_size`、O projection 的 `reduce_results=False`、`LayerCommunicator` | attention 输出与 MLP 输入应在 communicator 边界恢复为当前 parallel 配置要求的 layout |
 | 权重名前缀不匹配 | `Qwen3ForCausalLM.load_weights` | 缺 `model.` 的 `layers/embed_tokens/norm` 会被补前缀 |
-| QKV 权重 shape mismatch | `stacked_params_mapping` 和参数 `weight_loader` | `q/k/v` 应写入 `qkv_proj` 的对应 shard |
+| QKV 权重 shape mismatch | `stacked_params_mapping`、QKV 层的 `tp_rank/tp_size` 和参数 `weight_loader` | `q/k/v` 应按该线性层实际采用的并行组写入 `qkv_proj` 对应 shard |
 
 ## 复盘
 

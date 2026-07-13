@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # SchedulePolicy · 核心概念
 
@@ -21,9 +21,9 @@ updated: 2026-07-10
 
 - 一个等待请求在进入 prefill 前，哪些字段会被写入。
 - prefix cache 命中如何影响排队顺序，却不等于已经执行了模型。
-- 为什么本轮 prefill 可能因为硬预算、软限制或延迟器而停下。
+- 为什么本轮 prefill 会以 `NO_TOKEN` 或 `OTHER` 停下，以及为什么枚举名不能替代具体返回点。
 
-## 心理模型：prefill 准入裁判
+## 心理模型：排序、准入、提交三层裁决
 
 把一轮 prefill 看成四个连续动作：
 
@@ -33,8 +33,8 @@ flowchart TD
  B --> C["预算账本<br/>PrefillAdder"]
  C --> D{"结果"}
  D -->|"CONTINUE"| C
- D -->|"NO_TOKEN"| E["硬预算不足<br/>KV/SWA/Mamba"]
- D -->|"OTHER"| F["软限制<br/>chunk/input/bs/delayer"]
+ D -->|"NO_TOKEN"| E["容量类停止<br/>总/即时 KV、SWA、Mamba"]
+ D -->|"OTHER"| F["本轮边界停止<br/>input/chunk/DLLM/bs/delayer"]
  C --> G["can_run_list"]
  G --> H["ScheduleBatch.init_new"]
 ```
@@ -42,7 +42,7 @@ flowchart TD
 这套模型有两个分离点：
 
 - `SchedulePolicy` 只回答“先看谁”，它会原地调整 `waiting_queue`。
-- `PrefillAdder` 才回答“本轮能放谁”，它维护一轮 prefill 的预算快照。
+- `PrefillAdder` 才回答“本轮能放谁”。它保存本轮 offset 与配额，但容量属性仍会读取 allocator/cache 的最新状态。
 
 ## 策略分两类
 
@@ -155,7 +155,7 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 ```
 
-`CONTINUE` 表示本轮还可以继续尝试下一个请求。`NO_TOKEN` 表示硬预算不足，通常来自总 KV、当前轮即时 token、SWA 或 Mamba slot。`OTHER` 表示不是硬 token 空间不够，而是本轮已经碰到输入 token、chunk、最大 prefill 请求数、delayer 或上下文并行限制。
+`CONTINUE` 表示当前请求已处理完，并且账本仍允许继续看下一个请求。`NO_TOKEN` 是“容量口径已经不能安全继续”的停止信号，可能来自总生命周期 KV、当前 extend 峰值、SWA 子池、Mamba 可恢复 slot，也可能来自 `ignore_eos` 的保守生存期检查。`OTHER` 是“本轮到边界了”的停止信号，包括输入/chunk/DLLM 配额耗尽、delayer 拒绝、请求数上限、context-parallel 单请求限制或 chunk 对齐后无可提交 token。
 
 源码收口在 `budget_state`：
 
@@ -185,7 +185,7 @@ class AddReqResult(Enum):
         return AddReqResult.CONTINUE
 ```
 
-这个三态非常重要，因为 Scheduler 对 `NO_TOKEN` 会标记 `batch_is_full`，而 `OTHER` 更像本轮准入的策略性停止。
+这个三态首先是 Scheduler 的控制协议，不是完美的根因分类器：两者都会终止本轮 waiting-queue 扫描；只有 `NO_TOKEN` 会触发 `batch_is_full` 更新，而且 hierarchical cache 分支还要看本轮或 running batch 是否已有可服务请求。排障时必须回到具体返回点，不能只凭枚举名下结论。
 
 ## 两个延迟器解决不同问题
 
@@ -214,7 +214,9 @@ class MinFreeSlotsDelayer:
         return running_bs > 0 and num_allocatable_reqs < self._min_free_slots
 ```
 
-`PrefillDelayer` 则更像一次 forward pass 级别的同步闸门：每个 rank 汇报自己是否有可 prefill 请求、KV 使用水位、running batch 大小和等待队列长度，再决定这轮放行还是延迟。
+`PrefillDelayer` 则更像一次 prefill pass 级别的同步闸门。每个参与 rank 先用本地 token usage 计算一个 `token_watermark_force_allow` 布尔量，再 all-gather 五个整数：是否可 prefill、是否低水位强制放行、running batch 大小、历史最大 prefill batch 和等待队列长度。原始 token usage 浮点值不会跨 rank 传输。
+
+它还有四个不能省略的安全边界：第一次满足 delay 条件时由 `skip_first_delayer` 放行；任一 rank 命中低水位就强制放行；`mixed` 状态最多等待配置的 pass 数；queue trigger 受墙钟超时约束。`disable_overlap_schedule=True` 时构造器直接断言，因此它不是非 overlap 模式的通用节流器。
 
 ## 核心不变量
 
@@ -222,8 +224,8 @@ class MinFreeSlotsDelayer:
 |--------|------------|--------------|
 | 排序阶段不创建 `ScheduleBatch` | 防止把 policy 和执行混在一起 | 难以定位谁改变了请求字段 |
 | `prefix_indices` 必须与 `extend_range` 配套 | 命中部分不应重复 prefill | 重算前缀、KV 对齐错误或吞吐下降 |
-| `PrefillAdder` 只代表一轮 prefill 的预算快照 | 每轮都要重新看 allocator 与 running batch | 旧预算会导致过度准入或过度保守 |
-| chunked prefill 中间块只扣输入预算，不重复扣 decode 预算 | 同一个请求不能每块都预留一次输出空间 | 长 prompt 被过早判定资源不足 |
+| `PrefillAdder` 只活一轮，但容量属性仍动态读取 allocator/cache | offset 属于本轮，真实可用与可驱逐容量可能在锁前后变化 | 把它误当静态快照会漏掉二次容量检查 |
+| chunked prefill 未完成块的 `max_new_tokens` 记为 0，最后一块才计入输出估算 | 同一个请求不能每块都重复预留 decode 空间 | 长 prompt 被过早判定资源不足 |
 | delayer 只决定“这轮是否先等等” | 它不改变请求停止条件 | 把 TTFT 变差误判成采样或模型问题 |
 
 ## 运行验证

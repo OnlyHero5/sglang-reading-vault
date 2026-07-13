@@ -8,7 +8,7 @@ tags:
   - maintenance
   - agent
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # AI Infra 知识库维护指南
@@ -106,6 +106,7 @@ tags:
 node maintenance/audit_wikilinks.mjs
 node maintenance/audit_source_evidence.mjs
 node maintenance/audit_markdown_quality.mjs
+git -c core.autocrlf=false diff --check
 ```
 
-检查项：全局唯一文件名、零断链、源码引用有效、单一 H1、Mermaid 合规、无维护编号、核心文档有读者任务、验证包含操作和预期。
+检查项：全局唯一文件名、零断链、源码引用有效、正式源码卡与标注行段逐行一致、单一 H1、Mermaid 合规、无维护编号、核心文档有读者任务、验证包含操作和预期、改动无空白错误或冲突标记。自动检查只是发布下限；本轮修改的文档还必须完成全文语义复读。

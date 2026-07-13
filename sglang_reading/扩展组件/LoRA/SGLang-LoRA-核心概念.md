@@ -68,7 +68,7 @@ class LoRARegistry:
     """
 ```
 
-这里的关键词是 single source of truth。它回答“这个名字现在是否可用、对应哪个 `lora_id`、是否还有请求在用”，但不回答“GPU 上哪个 buffer slot 装着它”。
+这里的关键词是 single source of truth，但作用域只限“当前可用名称”。它回答“这个名字现在是否可 acquire、对应哪个 `lora_id`、是否还有请求在用”，但不回答“GPU 上哪个 buffer slot 装着它”。TokenizerManager 另有 `lora_ref_cache` 保存曾加载过的历史引用：显式 unload 后名称会从 registry 消失，但后续同名请求可以触发隐式 reload，并获得新的动态 `lora_id`。
 
 ### 3. `Req.extra_key`：prefix cache 隔离线
 
@@ -111,7 +111,7 @@ LoRA 改变同一段 token 后续的 hidden states。如果不同 adapter 共用
         )
 ```
 
-`LoRAManager` 是执行面，不是 registry。动态加载时，TokenizerManager 先让后端加载，后端成功后才把 adapter 注册到 registry。
+`LoRAManager` 是执行面，不是 registry。动态加载的正常顺序是“后端成功，再注册控制面”，这只避免 backend 失败时出现可请求的半加载 adapter；它不是事务保证。backend 已成功后，registry register、`max_loaded_loras` LRU 卸载或控制面返回仍可能失败，源码没有向已经成功的 backend 发补偿回滚。
 
 ### 5. `LoRAMemoryPool`：GPU 槽位分配器
 
@@ -152,7 +152,7 @@ Memory pool 预分配 LoRA A/B buffer，并维护 `uid_to_buffer_id` 与 `buffer
 
 ### registry LRU 与 memory pool eviction 不是一回事
 
-`LoRARegistry` 的 LRU 用于 `max_loaded_loras` 这类控制面注册上限；`LoRAMemoryPool` 的 eviction 用于 GPU buffer slot 不够时换出冷 adapter。前者发生在 TokenizerManager，后者发生在 model runner 执行面。
+`LoRARegistry` 的 LRU 用于 `max_loaded_loras` 控制面注册上限；`LoRAMemoryPool` 的 eviction 用于 GPU buffer slot 不够时换出冷 uid。前者发生在 TokenizerManager，后者发生在 model runner 执行面。开启 overlap loading 时，`max_loaded_loras` 还约束需要 pin 在 CPU 的 adapter 集合，启动期要求它不超过 `2 * max_loras_per_batch`，所以它也不是纯粹的“名称数量”参数。
 
 ### `lora_id` 与 `weight_indices` 不是一回事
 
@@ -184,6 +184,19 @@ Memory pool 预分配 LoRA A/B buffer，并维护 `uid_to_buffer_id` 与 `buffer
 
 如果你在 kernel 侧看到错 adapter，先不要回到 HTTP 参数找原因，而是先确认本 batch 的 `weight_indices` 是否对应正确的 `uid_to_buffer_id`。
 
+这里还有一个防御性缺口：当某个 `forward_batch.lora_ids` 不在 `uid_to_buffer_id` 时，循环直接 `continue`，该请求的 `weight_indices` 保持默认值 `0`，不会立即报错。slot 0 并不由类型保证永远是 base model；因此控制面身份与 pool 映射一旦失配，可能表现为错误 adapter，而不是清晰的 “uid missing” 异常。
+
+## 更新不是事务：四份状态可能短暂或永久分叉
+
+动态 LoRA 至少涉及四份状态：registry/counter、`lora_ref_cache`、每个 worker 的 `configs/loras/lora_refs` CPU 字典、GPU pool 的 `uid_to_buffer_id` 与权重槽。当前基线没有统一 commit/rollback：
+
+- `LoRAManager.load_lora_adapter` 在权重加载前写入 `configs`；后续异常只返回失败，不删除已经写入的局部条目。
+- unload 在控制面先 unregister 并删除 counter，再通知 backend；backend unload 失败时，名称仍不可 acquire，但 worker 可能仍保留 adapter。
+- backend unload 只删除 manager CPU 字典，不主动清除 GPU pool 映射；旧 slot 等后续 eviction 覆盖。
+- `lora_ref_cache` 不随显式 unload 删除，所以未来请求会尝试重新加载该名称。
+
+这不意味着正常请求必然串线，而是说明排障不能只看 `/load_lora_adapter` 的最终布尔值。必须同时核对名称、ID、worker loaded-adapter 列表和 pool 映射。
+
 ## 本篇结论
 
 - `LoRARegistry` 是控制面事实源，负责 name、id、ref count。
@@ -192,6 +205,7 @@ Memory pool 预分配 LoRA A/B buffer，并维护 `uid_to_buffer_id` 与 `buffer
 - `LoRAManager` 把 batch 的 adapter 身份转成执行 metadata。
 - `LoRAMemoryPool` 是 GPU slot allocator，不是 adapter registry。
 - `LoRABackend` 和 LoRA 包装层只消费 slot、rank、scaling 与 segment，不关心用户传入的名字。
+- 动态更新是多状态最终一致流程，不具备跨 registry/backend/pool 的事务回滚。
 
 下一篇 [[SGLang-LoRA-源码走读]] 会沿一条请求把这些对象串起来。
 

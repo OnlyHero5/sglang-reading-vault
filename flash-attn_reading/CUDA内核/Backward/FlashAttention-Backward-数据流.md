@@ -9,7 +9,7 @@ tags:
   - framework/flash-attn
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Backward · 数据流
 
@@ -26,7 +26,7 @@ flowchart LR
     C["Python buffer<br/>dq dk dv"]
     D["C++ buffer<br/>softmax_d dq_accum"]
     E["Flash_bwd_params<br/>指针 stride mask scale"]
-    F["preprocess<br/>softmax_d = D"]
+    F["preprocess<br/>softmax_d = D<br/>dropout 时乘 p_keep"]
     G["main kernel<br/>P dS dQaccum dK dV"]
     H["convert<br/>dQ"]
     I["C++ return<br/>dq dk dv softmax_d"]
@@ -40,9 +40,9 @@ flowchart LR
 | Python backward | `dout_padded`、预分配 `dq/dk/dv` | head dim padding 与 forward 对齐 |
 | C++ `mha_bwd` | Tensor 检查、`softmax_d`、`dq_accum` | fp16/bf16、last dim contiguous、head dim <= 256 |
 | `Flash_bwd_params` | 指针和 stride | LSE、mask、scale 语义沿用 forward |
-| preprocess | `dsoftmax_sum` | 每个 query 行一个 `D=sum(dO*O)` |
+| preprocess | `dsoftmax_sum` | 每个 query 行一个点积；dropout 时乘 `p_keep` 与内部 `dP` 标尺对齐 |
 | main kernel | tile 内 `P/dP/dS` 与梯度累积 | 不跨 tile 保存完整 `P` |
-| convert/GQA sum | 最终 `dQ/dK/dV` | split 和 head group 被归并 |
+| convert/GQA sum | 最终 `dQ/dK/dV` | dQ split 与 KV head group 被归并；dQ/dK 接管 `scale/p_keep`，dV 接管 `1/p_keep` |
 
 ## Dense 与 varlen 的差异
 
@@ -55,30 +55,86 @@ flowchart LR
 
 ```cpp
 // 来源：csrc/flash_attn/flash_api.cpp L976-L1000
-mha_varlen_bwd(const at::Tensor &dout,
-               const at::Tensor &q,
-               const at::Tensor &k,
-               const at::Tensor &v,
-               const at::Tensor &out,
-               const at::Tensor &softmax_lse,
-               std::optional<at::Tensor> &dq_,
-               std::optional<at::Tensor> &dk_,
-               std::optional<at::Tensor> &dv_,
-               const at::Tensor &cu_seqlens_q,
-               const at::Tensor &cu_seqlens_k,
-               ...)
+std::vector<at::Tensor>
+mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
+               const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               const at::Tensor &k,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &out,   // total_q x num_heads x head_size
+               const at::Tensor &softmax_lse,    // h x total_q, softmax logsumexp
+               std::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &cu_seqlens_q,  // b+1
+               const at::Tensor &cu_seqlens_k,  // b+1
+               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               const int max_seqlen_q,
+               const int max_seqlen_k,          // max sequence length to choose the kernel
+               const float p_dropout,         // probability to drop
+               const float softmax_scale,
+               const bool zero_tensors,
+               const bool is_causal,
+               int window_size_left,
+               int window_size_right,
+               const float softcap,
+               const bool deterministic,
+               std::optional<at::Generator> gen_,
+               std::optional<at::Tensor> &rng_state) {
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/flash_api.cpp L1102-L1165
+// 来源：csrc/flash_attn/flash_api.cpp L1102-L1121
+auto opts = q.options();
 auto softmax_d = torch::empty({num_heads, total_q + 128 * batch_size}, opts.dtype(at::kFloat));
-if (!deterministic) {
-    dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
-} else {
-    dq_accum = torch::zeros({nsplits, total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+at::Tensor dq_accum;
+if (loop) {
+    // We don't want to allocate dq_accum of size (batch, seqlen_q_rounded, num_heads, head_size_rounded)
+    // because that would be too large if there is a very long sequence and the rest of the sequences are short.
+    // Instead, we allocate dq_accum of size (total_q + 128 * batch, num_heads, head_size_rounded).
+    // Note that 128 is the max block size on the seqlen_q dimension.
+    // For dQ, the i-th sequence is stored in indices from cu_seqlens[i] + 128 * i to
+    // cu_seqlens[i + 1] * 128 * i - 1. This ensures that the i-th sequence and (i + 1)-th sequence will
+    // be at least 128 apart. It's ok for us to do atomicAdds up to 128 rows beyond what we're normally
+    // allowed to do. So we won't have to do any bound checking, and performance should stay the same.
+    // Same holds for softmax_d, since LSE is stored in unpadded format.
+    if (!deterministic) {
+        dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+    } else {
+        const int nsplits = (get_num_sm(get_current_device()) + batch_size * num_heads - 1) / (batch_size * num_heads);
+        dq_accum = torch::zeros({nsplits, total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+    }
 }
-set_params_dgrad(params, ..., cu_seqlens_q.data_ptr(), cu_seqlens_k.data_ptr(), ...,
-                 softmax_lse.data_ptr(), softmax_d.data_ptr(), ..., /*unpadded_lse*/true);
+```
+
+参数装配把 packed 边界、unpadded LSE 和 `total_q` 一起交给 kernel：
+
+```cpp
+// 来源：csrc/flash_attn/flash_api.cpp L1139-L1165
+Flash_bwd_params params;
+
+set_params_dgrad(params,
+                 batch_size,
+                 max_seqlen_q, max_seqlen_k,
+                 seqlen_q_rounded, seqlen_k_rounded,
+                 num_heads, num_heads_k,
+                 head_size, head_size_rounded,
+                 q, k, v, out,
+                 dout, dq, dk_expanded, dv_expanded,
+                 cu_seqlens_q.data_ptr(),
+                 cu_seqlens_k.data_ptr(),
+                 loop ? dq_accum.data_ptr() : nullptr,
+                 nullptr,
+                 nullptr,
+                 softmax_lse.data_ptr(),
+                 softmax_d.data_ptr(),
+                 p_dropout,
+                 softmax_scale,
+                 window_size_left,
+                 window_size_right,
+                 softcap,
+                 deterministic,
+                 /*unpadded_lse*/true);
+params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 params.total_q = total_q;
 ```
 
@@ -90,29 +146,66 @@ Dropout backward 不是重新随机一次，而是用 forward 返回的 `rng_sta
 
 ```python
 # 来源：flash_attn/flash_attn_interface.py L855-L878
-out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(...)
+out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+    q,
+    k,
+    v,
+    dropout_p,
+    softmax_scale,
+    causal=causal,
+    window_size_left=window_size[0],
+    window_size_right=window_size[1],
+    softcap=softcap,
+    alibi_slopes=alibi_slopes,
+    return_softmax=return_softmax and dropout_p > 0,
+)
 if is_grad:
     ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+    ctx.dropout_p = dropout_p
+    ctx.softmax_scale = softmax_scale
+    ctx.causal = causal
+    ctx.window_size = window_size
+    ctx.softcap = softcap
+    ctx.alibi_slopes = alibi_slopes
+    ctx.deterministic = deterministic
+out = out_padded[..., :head_size_og]
+return out if not return_softmax else (out, softmax_lse, S_dmask)
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_bwd_kernel.h L448-L550
-FLASH_NAMESPACE::Dropout dropout(params.rng_state[0], params.rng_state[1],
-                       params.p_dropout_in_uint8_t, bidb, bidh, tidx, params.h);
-...
-dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-    acc_s, block_row_idx, block_col_idx, AtomLayoutMS
-);
+// 来源：csrc/flash_attn/src/flash_bwd_kernel.h L448-L449
+FLASH_NAMESPACE::Dropout dropout(params.rng_state[0], params.rng_state[1], params.p_dropout_in_uint8_t,
+                       bidb, bidh, tidx, params.h);
 ```
 
-如果 dropout 训练中出现梯度不稳定，先确认 forward/backward 使用的是同一个 `rng_state`，而不是只看 `dropout_p` 数值。
+重算概率后，dropout 用与 forward 相同的 batch/head/lane/block 坐标复现 mask，并把它编码进符号位：
+
+```cpp
+// 来源：csrc/flash_attn/src/flash_bwd_kernel.h L537-L550
+if constexpr (Is_dropout) {
+    int warp_id = tidx / 32;
+    int block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
+    // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
+    static_assert(MMA_N_SdP % 2 == 0);
+    int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
+    dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+        acc_s, block_row_idx, block_col_idx, AtomLayoutMS
+    );
+}
+// Convert scores from fp32 to fp16/bf16
+Tensor rP = !Is_dropout
+    ? FLASH_NAMESPACE::convert_type<Element>(acc_s)
+    : FLASH_NAMESPACE::convert_type_relu<Element>(acc_s);
+```
+
+如果 dropout 训练中出现梯度不稳定，先确认 forward/backward 使用的是同一个 `rng_state` 和同一套 block 坐标，而不是只看 `dropout_p`。还要查标尺所有权：preprocess 的 `dsoftmax_sum` 乘 `p_keep`，最终 dQ/dK 再乘 `softmax_scale / p_keep`，dV 乘 `1 / p_keep`。
 
 ## Deterministic 的归约边界
 
 非 deterministic 路径可以让不同 K split 更自由地累积 `dQaccum`。deterministic 路径显式引入 `nsplits` 维，并在 convert 阶段按固定 split 数归并。
 
 ```cpp
-// 来源：csrc/flash_attn/flash_api.cpp L889-L895
+// 来源：csrc/flash_attn/flash_api.cpp L890-L895
 if (!deterministic) {
     dq_accum = torch::empty({batch_size, seqlen_q_rounded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
 } else {
@@ -122,18 +215,30 @@ if (!deterministic) {
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/src/flash_bwd_launch_template.h L72-L125
+// 来源：csrc/flash_attn/src/flash_bwd_launch_template.h L74-L82
+const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+dim3 grid_m(num_m_block, params.b, params.h);
+const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
 int gridDimx = num_n_block;
 if (params.deterministic) {
     int num_sm = get_num_sm(get_current_device());
     gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
 }
-...
-flash_bwd_convert_dq_kernel<Kernel_traits><<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(
-    params, !params.deterministic ? 1 : gridDimx);
+dim3 grid_n(gridDimx, params.b, params.h);
 ```
 
-因此 deterministic 是可复现性开关，不是数值公式开关。它改变归约布局和性能成本。
+```cpp
+// 来源：csrc/flash_attn/src/flash_bwd_launch_template.h L119-L125
+auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
+if (Kernel_traits::kSmemdQSize >= 48 * 1024)  {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
+}
+kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params, !params.deterministic ? 1 : gridDimx);
+C10_CUDA_KERNEL_LAUNCH_CHECK();
+```
+
+因此 deterministic 是归约所有权开关，不是数值公式开关：默认路径的多个 sequence-K 工作块向共享 `dQaccum` atomic add；确定性路径按 `blockIdx.x` 选择隔离 split，convert 再按固定 `0..nsplits-1` 顺序求和。它改变临时显存、归约顺序和性能成本。
 
 ## GQA/MQA 的 `dK/dV` 回收边界
 
@@ -141,7 +246,8 @@ Forward 中多个 Q head group 共享同一个 KV head。Backward 先按 Q head 
 
 ```cpp
 // 来源：csrc/flash_attn/flash_api.cpp L900-L907
-if (num_heads_k != num_heads) {
+at::Tensor dk_expanded, dv_expanded;
+if (num_heads_k != num_heads) {  // MQA / GQA
     dk_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
     dv_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
 } else {
@@ -151,7 +257,8 @@ if (num_heads_k != num_heads) {
 ```
 
 ```cpp
-// 来源：csrc/flash_attn/flash_api.cpp L967-L970
+// 来源：csrc/flash_attn/flash_api.cpp L967-L971
+// For MQA/GQA we need to sum dK and dV across the groups
 if (num_heads_k != num_heads) {
     at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
@@ -165,11 +272,12 @@ if (num_heads_k != num_heads) {
 `flash_attn_with_kvcache` 服务 decode 推理，会原地更新 KV cache，并支持 paged KV、cache remap、RoPE 和 SplitKV。它不是训练 autograd 路径，接口文档明确不支持 backward。
 
 ```python
-# 来源：flash_attn/flash_attn_interface.py L1312-L1451
-def flash_attn_with_kvcache(...):
-    """If k and v are not None, k_cache and v_cache will be updated *inplace* ...
-    Note: Does not support backward pass.
-    """
+# 来源：flash_attn/flash_attn_interface.py L1542-L1546
+If window_size != (-1, -1), implements sliding window local attention. Query at position i
+will only attend to keys between
+[i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+Note: Does not support backward pass.
 ```
 
 这条边界很实用：训练长上下文看 dense/varlen backward；decode serving 延迟问题看 [[FlashAttention-KV-Cache]]。

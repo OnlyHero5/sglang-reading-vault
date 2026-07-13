@@ -9,201 +9,165 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
-# 多模态生成 · 排障指南
 
----
+# 多模态生成 · 排障指南
 
 ## 你为什么要读
 
-多模态生成与文本 `srt` 共享仓库，却有独立的 server args、worker、Scheduler 和 pipeline。本文先确认你启动的是哪套 runtime，再沿 stage、rank 与 latent 生命周期排查，避免把扩散 pipeline 的错误送去文本 Scheduler 寻医。
+扩散服务一次请求跨过父进程、HTTP、ZMQ、Scheduler queue、distributed group、pipeline stage 与输出 transport。最快的排障方法不是从 traceback 里猜模型，而是先回答：请求最后一次被谁确认接收、是否已 dispatch、是否已形成 OutputBatch、是否只在返回阶段失败。
 
-## 1. multimodal_gen 与 srt 能否共进程？
+## 快速分层
 
-**读法：** **不能默认共进程**。二者各有独立 `launch_server`、Scheduler、GPU worker 模型。同一机器可不同 port 各起一套服务，但共享 GPU 需手动分配 `CUDA_VISIBLE_DEVICES`。
+| 现象 | 第一责任层 | 先查 |
+|---|---|---|
+| HTTP 端口未监听 | 启动 barrier | 各 rank ready/EOF、模型加载、distributed init |
+| `/health` 200，生成接口等待 | server warmup gate | `warmup_done`、synthetic scheduler request |
+| rank0 收到请求，其他 rank不动 | distributed broadcast | TP/SP/CFG group、source rank、CPU group |
+| 延迟出现固定小台阶 | Scheduler queue | batching delay、admission、兼容拒绝原因 |
+| 合批后每个请求都报相同错误 | merge/forward/split | merged error、第一维、output paths 数量 |
+| GPU forward 已完成但 client timeout | reply transport | pickle、local spill、send、client materialize |
+| 文件生成了但 HTTP 返回 error | HTTP 后处理 | 文件读取/base64、路径可见性、编码 |
+| disagg role 无 HTTP | 角色设计 | role 类型与 head server 地址，而非 HTTP port |
 
-**源码锚点：**
+## 1. 服务没有监听 HTTP
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/launch_server.py L86-L90
-def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
-    """
-    Args:
-        launch_http_server: False for offline local mode
-    """
-```
+**症状：** 父进程日志停在启动阶段，或某个 rank 报 EOF/exit code。
 
-**要点：**
+**可能原因：** 任一 Scheduler 构造失败。由于 Scheduler 构造会加载 GPUWorker/pipeline，模型路径、OOM、distributed init、port 或配置校验都可能在 ready 前失败。
 
-- srt 用 `python -m sglang.launch_server`；扩散用 multimodal 入口。
-- 仅共享 utilities（logging、orjson_response 等）。
+**源码入口：** `launch_server.py::launch_server`、`gpu_worker.py::run_scheduler_process`。
 
----
+**操作：** 按 rank 找最后一条日志；区分 `pipe_writer.send(status=ready)` 之前还是之后退出。检查最小空闲 GPU，而非只看所有卡总显存。
 
-## 2. 为什么 HTTP 与 Scheduler 分进程？
+**预期：** 所有 rank 都返回 ready 后才出现 “All workers are ready” 并进入 HTTP 启动。只看到进程 PID 不算 ready。
 
-**读法：** FastAPI asyncio 进程与 CUDA worker 分离，避免 GIL 与 blocking forward 卡住 event loop。ZMQ 跨进程 REQ/REP 序列化 `Req`/`OutputBatch`。
+## 2. `/health` 正常，但用户路由一直等待
 
-**源码锚点：**
+**症状：** `/health`、`/model_info` 可访问，image/video generation 卡住。
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/entrypoints/http_server.py L110-L112
-    # 1. Initialize the singleton client that connects to the backend Scheduler
-    server_args = app.state.server_args
-    async_scheduler_client.initialize(server_args)
-```
+**可能原因：** server warmup middleware 正在等待 `server_warmup_done`。控制面路径刻意 bypass，所以 health 200 不代表 warmup完成。
 
-**要点：**
+**源码入口：** `http_server.py::_run_server_warmup_after_http_ready` 与 `create_app` middleware。
 
-- 与 srt TokenizerManager ↔ Scheduler ZMQ 模式 analogous。
-- 长生成（视频）需要大 ZMQ timeout（6000s RCVTIMEO）。
+**操作：** 查 warmup task 是否已经调用 `async_scheduler_client.forward`，再看 Scheduler 是否收到 `is_warmup` 请求。不要重复测试 `/health_generate`：当前实现尚未执行真实生成，只固定返回 ok。
 
----
+**预期：** synthetic request成功后 event set，普通路由立即放行；失败则当前 HTTP 进程收到 SIGTERM，而不是永久留在半 warm 状态。
 
-## 3. Rank0 master 挂了会怎样？
+## 3. 多 GPU 时 slave 没执行请求
 
-**读法：** Rank0 持有 ZMQ socket 与 HTTP client 连接。Master OOM/崩溃后 HTTP 全部失败；slave 无独立服务端口。K8s 应 liveness 整个 worker group。
+**症状：** rank0 ROUTER 收到请求，其他 rank无对应 forward，随后 collective hang。
 
-**源码锚点：**
+**可能原因：** TP/SP/CFG group 分解或 `broadcast_pyobj` source/CPU group异常。普通生成不是经 task Pipe 分发。
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/launch_server.py L179-L185
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            processes[i].join()
-            logger.error(f"Exit code: {processes[i].exitcode}")
-            raise
-```
+**源码入口：** `scheduler.py::recv_reqs`。
 
-**要点：**
+**操作：** 打印最终 `tp_size/sp_degree/ulysses_degree/ring_degree/cfg_parallel_degree`；确认每个条件分支在所有相关 rank 上一致进入。检查 `sp_degree == ring_degree * ulysses_degree` 与 GPU 整除约束。
 
-- 启动阶段 EOF 即 abort；运行期需外部 supervisor 重启。
-- `kill_process_tree` 用于优雅关闭全部 worker。
+**预期：** rank0 从 ROUTER获得非空对象，其他 rank通过对应 broadcast得到同一逻辑请求。task Pipe 正常不能证明这条主线正常。
 
----
+## 4. 两个请求为什么没有合批
 
-## 4. CPU Offload 如何影响数据流？
+**症状：** queue 同时存在多个请求，但 dispatch size 始终为 1。
 
-**读法：** `PipelineExecutor.before_stage` 根据 `dit_cpu_offload` 等在 stage 前将 component 权重迁到 GPU，stage 后迁回 CPU，拉长单次请求 wall time 但降低峰值显存。
+**可能原因：** warmup、realtime、image condition、prompt 非字符串、path-only 不同、SamplingParams 签名不同、`diffusers_kwargs` 不同，或 admission 提前判满。
 
-**源码锚点：**
+**源码入口：** `_can_dynamic_batch`、`_get_dynamic_batch_reject_reason`、`BatchAdmissionController`。
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/pipelines_core/executors/pipeline_executor.py L171-L176
-            if server_args.dit_cpu_offload and component_name in (
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "audio_dit",
-            ):
-```
+**操作：** 开启 batching metrics；比较首个 reject reason，而不是只比较 width/height。确认 `batching_max_size > 1` 且 pipeline config 宣称支持 dynamic batching。
 
-**要点：**
+**预期：** compatible 请求在 delay 到期、达到 max size 或 admission 满时合并；不兼容队列项可以被跳过并留待后续，不要求物理相邻。
 
-- FSDP inference 路径需特殊 `inference_mode(False)` context。
-- `OFFLOAD_DISABLE_RECOMMENDATION_ORDER` 建议 OOM 时关闭 offload 顺序。
+## 5. batching delay 为什么放大尾延迟
 
----
+**症状：** 低 QPS 时每个请求都多出接近 `batching_delay_ms` 的等待。
 
-## 5. broker 与 HTTP 能否同时用？
+**可能原因：** 队首兼容且尚未到 user/admission 上限，Scheduler 有意等待更多候选。
 
-**读法：** **可以**。lifespan 始终启动 broker task；HTTP 与 offline client 并发连同一 Scheduler，Scheduler 需串行或内部 queue 化请求（实现于 `managers/scheduler.py`）。
+**源码入口：** `get_next_batch_to_run` 中 `should_wait_for_more` 与 event loop poll/sleep。
 
-**源码锚点：**
+**操作：** 对照 queue wait metrics、dispatch size 和 stop_reason；用 `batching_delay_ms=0` 做控制组。
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/entrypoints/http_server.py L116-L117
-    # 2. Start the ZMQ Broker in the background to handle offline requests
-    broker_task = asyncio.create_task(run_zeromq_broker(server_args))
-```
+**预期：** 零 delay 基本立即派发；增加 delay 后吞吐可能提高，但低流量 queue wait 会可见增加。没有 workload 和硬件时不要给固定推荐阈值。
 
-**要点：**
+## 6. 合批失败后为什么没有顺序重试
 
-- broker 用 pickle，注意版本兼容与安全（应仅 bind localhost）。
-- 高 QPS 场景以 HTTP 为主，broker 适合 batch benchmark。
+**症状：** 一次 merged forward error 后，所有原请求立即收到同类错误。
 
----
+**可能原因：** 当前策略只在 merge 前不兼容时顺序执行；merged forward 已运行后，error 或 split 失败直接构造逐请求错误。
 
-## 6. warmup 失败为什么要 SIGTERM？
+**源码入口：** `_handle_generation`、`_build_dynamic_batch_error_outputs`、`_split_batched_output`。
 
-**读法：** 未 warmup 的首请求可能极慢或 OOM，不如快速失败让 orchestrator 重启。
+**操作：** 区分日志 “merge returned None” 与 “Dynamic batch execution returned error / could not split”。检查 output/output_file_paths 第一维是否等于 `sum(num_outputs_per_prompt)`。
 
-**源码锚点：**
+**预期：** 前者可顺序执行；后者不二次生成。不要把没有重试误判成 Scheduler crash。
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/entrypoints/http_server.py L98-L100
-    except Exception as e:
-        logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
-        os.kill(os.getpid(), signal.SIGTERM)
-```
+## 7. CPU/layerwise offload 后延迟异常
 
-**要点：**
+**症状：** 显存下降但每个 stage 前后出现明显搬运或同步开销。
 
-- `fail_open=True` 时分辨率列表未配置可跳过 fatal。
-- 生产建议显式配置 `warmup_resolutions`。
+**可能原因：** component residency、layerwise prefetch、FSDP version counter context 或相互覆盖的 offload配置。
 
----
+**源码入口：** `PipelineExecutor.before_stage/_stage_execution_context`、ServerArgs `_adjust/_validate_offload`。
 
-## 7. disagg 与 multi-GPU TP 如何组合？
+**操作：** 记录具体 active component、residency manager动作和 H2D/D2H 时间；检查 layerwise selection 是否自动关闭同 component 的普通 CPU offload，DiT layerwise 是否禁用了 FSDP。
 
-**读法：** 每个 role pool 内仍可 `num_gpus>1` TP；orchestrator 在 role 边界传递 intermediate tensor（embeddings/latents），而非完整像素。
+**预期：** 每个选项的实际 owner清楚可见。`before_stage` 命中只证明委托发生，不证明某个 component 必然迁移。
 
-**源码锚点：**
+## 8. forward 完成但 client 仍超时
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/launch_server.py L220-L223
-    """Launch a pool-based disaggregated server with N:M:K independent role instances.
+**症状：** GPU metrics 显示 pipeline结束，client 在 REQ receive超时。
 
-    DiffusionServer orchestrates the full pipeline, dispatching at every
-    role transition (Encoder → Denoiser → Decoder).
-```
+**可能原因：** raw/frame物化、文件保存、local array spill、pickle、ZMQ send或client端 `materialize_file_refs` 失败。100 分钟 RCVTIMEO 不会取消后端任务。
 
-**要点：**
+**源码入口：** GPUWorker `_materialize_output_transport`、Scheduler `return_result`、scheduler_client `_materialize_output_batch_file_refs`。
 
-- encoder 与 decoder 可共享物理 GPU（列表可重叠），靠 queue 分时。
-- 类比 srt PD：compute 阶段拆分，非简单 replica。
+**操作：** 分别观察 `Scheduler.return_result.spill_arrays/pickle/send` metrics；检查临时目录容量和权限；确认 reply identity仍对应活着的 REQ socket。
 
----
+**预期：** 模型完成时间与响应完成时间可被拆开。若文件已产生而 client断开，系统不会自动删除资产或回滚计算。
 
-## 8. 与 FastVideo 上游关系
+## 9. broker 与 HTTP 互相影响
 
-**读法：** 多文件 header 标注 Copied from FastVideo；SGLang 在此基础上集成 OpenAI API、disagg、与 srt 生态工具。
+**症状：** 离线 job 加入后，HTTP queue wait或吞吐变化。
 
-**源码锚点：**
+**可能原因：** broker 与 HTTP 都通过同一个 async client/context接到同一 Scheduler queue；它们不是独立 backend。broker自身是单 REP loop，一次 recv→forward→reply 后才处理下一离线 job。
 
-```python
-## 来源：python/sglang/multimodal_gen/runtime/pipelines_core/executors/pipeline_executor.py L1-L4
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+**源码入口：** `http_server.py::lifespan`、`scheduler_client.py::run_zeromq_broker`。
 
-# SPDX-License-Identifier: Apache-2.0
-"""
-```
+**操作：** 以 request id区分入口，观察统一 waiting queue；不要把 localhost bind理解成资源隔离。
 
-**要点：**
+**预期：** 两类流量共享调度容量。关闭 HTTP lifespan 后 broker也随之不存在；仅 `launch_http_server=False` 不会提供 broker服务。
 
-- 读 FastVideo 文档可辅助理解原始 pipeline 设计。
-- SGLang 特有扩展：realtime、rollout_api、layerwise offload 等。
+## 10. Disagg role 启动后没有 HTTP
 
----
+**症状：** encoder/denoiser/decoder role worker ready，但指定 HTTP port不可访问。
+
+**可能原因：** standalone role 本来就不服务 HTTP；只有 monolithic 或 server role需要 HTTP。role 使用 work/result endpoint 与 head DiffusionServer通信。
+
+**源码入口：** `launch_server.py::dispatch_launch/launch_disagg_role`、ServerArgs `_adjust_network_ports/_adjust_warmup`。
+
+**操作：** 核对 `disagg_role`、`disagg_server_addr`、derived work/result endpoint、内部 scheduler port与物理 GPU映射。确认 head server已启动并绑定 frontend/result sockets。
+
+**预期：** role进程进入 `_disagg_event_loop`；server warmup被关闭；客户端只访问 head server，而不是直接访问 role HTTP。
+
+## 11. 配置里有 `dp_size`，为什么启动仍失败
+
+**症状：** 设置 `dp_size=2` 后参数校验抛出 “DP is not yet supported”。
+
+**原因：** 当前基线保留 DP字段和部分派生公式，但明确拒绝大于 1。接口表面与可运行能力不同步。
+
+**操作：** 先保持 `dp_size=1`，用当前支持的 TP/SP/CFG 或多个外部 replica扩展；不要绕过校验后宣称 DP可用。
+
+**预期：** 配置回到合法组合后通过 `_validate_parallelism`；真实水平扩容由外部路由与多个服务实例承担。
 
 ## 验证抓手
 
-`multimodal_gen` 同时包含 HTTP 入口、scheduler 进程、broker、warmup、offload 和 disagg pool。排障时先用静态检索把问题归到正确层。
-
 ```powershell
-rg -n "server_warmup_done|run_zeromq_broker|SIGTERM|broker_task|dit_cpu_offload|pool-based disaggregated|kill_process_tree|launch_scheduler_process" `
-  sglang/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py `
-  sglang/python/sglang/multimodal_gen/runtime/launch_server.py `
-  sglang/python/sglang/multimodal_gen/runtime/pipelines_core/executors/pipeline_executor.py
+rg -n 'status.*ready|reader.recv|launch_http_server_only' sglang/python/sglang/multimodal_gen/runtime/launch_server.py sglang/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+rg -n 'receiver = None|broadcast_pyobj|waiting_queue|reject_reason|should_wait_for_more|Dynamic batch|return_result|spill_arrays' sglang/python/sglang/multimodal_gen/runtime/managers/scheduler.py
+rg -n 'server_warmup_done|SIGTERM|health_generate|run_zeromq_broker' sglang/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py
+rg -n 'DP is not yet supported|server_warmup = False|sp_degree.*ring_degree.*ulysses_degree' sglang/python/sglang/multimodal_gen/runtime/server_args.py
 ```
 
-预期现象：
-
-- `http_server.py` 命中 `server_warmup_done`、`SIGTERM`、`run_zeromq_broker` 和 `broker_task`，证明 warmup fatal、HTTP lifespan 与 offline broker 都在入口层。
-- `launch_server.py` 命中 `kill_process_tree` 和 `pool-based disaggregated`，证明多进程生命周期和 pool disagg 是 launch 层职责。
-- `pipeline_executor.py` 命中 `dit_cpu_offload`，证明 CPU offload 的权重迁移发生在 pipeline stage 执行前后。
-
-运行期看到启动失败时，先看是 warmup 触发 `SIGTERM`，还是 scheduler 子进程 EOF；看到单次请求变慢时，先查 offload；看到 HTTP 与离线请求互相影响时，再回到 broker 与 scheduler queue 边界。
+静态预期是能把每个症状定位到唯一所有者。真实数值、NCCL collective、模型兼容、文件编码和 disagg transfer 仍需目标 Linux/GPU 环境故障注入。

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Advantage计算 · 数据流
 
@@ -38,7 +38,7 @@ updated: 2026-07-10
 字段读取与写回集中在 `compute_advantages_and_returns`：
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L686-L695
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L686-L695；省略类型注解）
 rollout_log_probs = rollout_data.get("rollout_log_probs")
 log_probs = rollout_log_probs if args.use_rollout_logprobs else rollout_data.get("log_probs")
 ref_log_probs = rollout_data.get("ref_log_probs")
@@ -84,13 +84,14 @@ sequenceDiagram
 
 - 开启 `use_rollout_logprobs` 后，可以跳过训练侧 old actor logprob，但 ref/teacher 或 mismatch metrics 仍可能触发额外 forward。
 - 开启 PPO 时，actor 需要外部 critic values；否则 `get_advantages_and_returns_batch` 没有 baseline。
+- 命中 `can_reuse_log_probs_in_loss` 只表示 policy loss 可以用当前 forward 的 detached logprob；advantage 在它之前执行，仍需现成的 `rollout_log_probs` 或 `values` 来构造零 KL 的 shape。自定义 rollout 不提供二者时，这项复用不可达。
 
 ## critic 路径
 
 critic actor 也会调用同一个函数，因为 value loss 需要 `returns`，而 PPO actor 下一步还需要 old values。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L402-L427
+# 定位骨架（基于 `slime/backends/megatron_utils/actor.py` L402-L427；省略函数签名与参数）
 rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
 compute_advantages_and_returns(self.args, rollout_data)
 self.args.loss_type = "value_loss"
@@ -135,7 +136,7 @@ flowchart LR
 allgather-CP 有一个额外转换：先按 contiguous global sequence chunk 得到局部 response，再重分布到 downstream 期待的 zigzag CP 布局。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L151-L227
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L151-L227；省略重建与 padding 细节）
 def _allgather_cp_redistribute(...):
     cp_group = mpu.get_context_parallel_group()
     cp_rank = mpu.get_context_parallel_rank()
@@ -155,7 +156,7 @@ def _allgather_cp_redistribute(...):
 `policy_loss_function` 不重新计算 advantage，它只读取本专题写入的字段。OPD 的 reverse KL 也只是作为 metric 上报。
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L1105-L1108
+# 定位骨架（基于 `slime/backends/megatron_utils/loss.py` L1105-L1108；省略外层条件上下文）
 if "opd_reverse_kl" in batch:
     opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
     reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
@@ -167,12 +168,30 @@ if "opd_reverse_kl" in batch:
 - ratio、clip、entropy bonus、GSPO/CISPO policy 差异属于 [[Slime-Policy-Loss]]。
 - top-p replay 字段的采样来源属于 rollout，训练侧只校验和使用。
 
+## estimator 后的对象别名
+
+多数分支的 `advantages` 与 `returns` 是不同 list；REINFORCE++ baseline 例外，源码执行 `returns = advantages`。随后数据流为：
+
+```text
+baseline helper list
+  ├─ advantages ─┐
+  └─ returns ────┘  同一对象
+        ↓ OPD: advantages[i] = new_tensor
+advantages 与 returns 同时看到新 tensor
+        ↓ whitening: advantages = new_list
+advantages 变 whitened；returns 保留 OPD 后、whitening 前值
+```
+
+这会影响日志、自定义 hook 和任何未来消费 returns 的路径。验证时应比较 `advantages is returns`，不能只比较 tensor 数值。
+
 ## 数据不变量
 
 - 所有 list 字段必须按 sample 顺序对齐。
 - 每个 `advantages[i]` 的长度必须等于本 rank 对该 sample 持有的 response token 数。
 - `loss_masks[i]` 是完整 response mask；CP normalization 前要切成本地 mask chunk。
 - `returns` 与 `advantages` 都写回 `rollout_data`，函数没有返回值。
+- baseline helper 当前不读取传入的 `loss_masks`；mask 在 whitening 和下游 loss reducer 才生效。
+- 多个 helper 使用 `zip(strict=False)`；所有 sample list 等长、每项 shape 相等不是函数自动保证的不变量。
 
 ## 运行验证
 

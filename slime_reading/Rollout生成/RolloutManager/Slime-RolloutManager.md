@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RolloutManager
 
@@ -23,8 +23,8 @@ updated: 2026-07-10
 
 1. 一个 `rollout_id` 如何触发数据源、rollout 函数、SGLang 引擎和奖励后处理。
 2. `list[Sample]` 如何变成列式 `train_data`。
-3. 为什么 DP schedule 按 rollout id 而不是按 sample 数切 step。
-4. 权重更新为什么从 RolloutManager 取 engines 和 lock，而不是让训练 actor 自己找 SGLang。
+3. 为什么 DP schedule 按 rollout id 而不是按 sample 数切 step，以及尾部不足一整 step 时哪些样本会被丢弃。
+4. 权重更新为什么从 RolloutManager 取 engines 和 lock，以及多模型时为何只选择第一个 `update_weights=True` 的 server。
 
 ## 主线图
 
@@ -70,6 +70,8 @@ flowchart LR
 ## 运行抓手
 
 - 如果只想验证 rollout 函数和奖励，开 `debug_rollout_only`：预期会生成并保存 Sample，但不会返回训练 ObjectRef。
-- 如果想复现训练数据构造，使用 `load_debug_rollout_data`：预期跳过 SGLang 调用，直接从磁盘 Sample 进入 convert/split。
-- 如果 DP 切分失败，先看 `rollout_ids`、`global_batch_size`、`dp_size`、`micro_batch_size` 和 `use_dynamic_batch_size`。
-- 如果权重更新卡住，先看 `get_updatable_engines_and_lock` 返回的 engines 是否为空，以及 `update_weights=True` 是否只配置在 policy server 上。
+- 如果想复现训练数据构造，使用 `load_debug_rollout_data`：参数归一化会强制 `debug_train_only=True`，跳过 SGLang，直接从磁盘 Sample 进入 convert/split；这条复放路径不会重新执行 compact rollout-id 校验。
+- 如果 DP 切分失败，先看 `rollout_ids`、`global_batch_size`、`dp_size`、`micro_batch_size` 和 `use_dynamic_batch_size`；若开启 `balance_by_flops`，不要再把 `max_tokens_per_gpu` 当硬上限。
+- 如果权重更新卡住，先看 `get_updatable_engines_and_lock` 返回的 engines 是否为空，以及是否只有目标 policy server 配 `update_weights=True`；多个可更新 server 当前也只取第一个。
+
+当前基线轻量验证：`tests/test_dp_schedule.py` 为 `9 passed`；从当前 `_post_process_rewards` AST 抽取函数体实跑，固定 fanout 得到逐组中心化 `[-1, 1, -2, 2]`，可变 fanout 得到整批中心化 `[-3.67, -1.67, 5.33]`。

@@ -34,6 +34,9 @@ const ROOTS = [
 const SOURCE_RE =
   /来源：\s*([^`#*<>\r\n]+?)(?:\s+L(\d+)(?:\s*[-–]\s*L?(\d+))?)?(?=\s*(?:\r?\n|$|[（(]|`|\*))/gu;
 
+const SOURCE_CARD_RE =
+  /来源：\s*`?([^`\s>]+)`?\s+L(\d+)(?:\s*[-–]\s*L?(\d+))?/u;
+
 function walkMarkdown(dir, out = []) {
   if (!fs.existsSync(dir)) return out;
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -65,6 +68,77 @@ function lineOfOffset(text, offset) {
     if (text.charCodeAt(i) === 10) line++;
   }
   return line;
+}
+
+function normalizeExcerpt(lines) {
+  const copy = [...lines];
+  while (copy.length > 0 && copy[0].trim() === "") copy.shift();
+  while (copy.length > 0 && copy.at(-1).trim() === "") copy.pop();
+  const indents = copy
+    .filter((line) => line.trim() !== "")
+    .map((line) => line.match(/^\s*/u)[0].length);
+  const commonIndent = indents.length > 0 ? Math.min(...indents) : 0;
+  return copy
+    .map((line) => line.slice(commonIndent).replace(/[ \t]+$/u, ""))
+    .join("\n");
+}
+
+function scanSourceCards(text, root, relNote) {
+  const lines = text.split(/\r?\n/u);
+  const cards = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const opening = lines[i].match(/^\s*(`{3,}|~{3,})/u);
+    if (!opening) continue;
+
+    const marker = opening[1][0];
+    const markerLength = opening[1].length;
+    const body = [];
+    let end = i + 1;
+    for (; end < lines.length; end++) {
+      const closing = lines[end].match(/^\s*(`{3,}|~{3,})\s*$/u);
+      if (
+        closing &&
+        closing[1][0] === marker &&
+        closing[1].length >= markerLength
+      ) {
+        break;
+      }
+      body.push(lines[end]);
+    }
+
+    const firstLine = body[0]?.trim() ?? "";
+    const sourceMatch = firstLine.match(SOURCE_CARD_RE);
+    if (sourceMatch) {
+      const sourceRel = normalizeSourcePath(sourceMatch[1]);
+      const start = Number(sourceMatch[2]);
+      const finish = sourceMatch[3] ? Number(sourceMatch[3]) : start;
+      const resolved = resolveSource(root, sourceRel);
+      const exists = fs.existsSync(resolved.abs);
+      let exact = false;
+      if (exists) {
+        const sourceLines = fs
+          .readFileSync(resolved.abs, "utf8")
+          .split(/\r?\n/u)
+          .slice(start - 1, finish);
+        exact = normalizeExcerpt(body.slice(1)) === normalizeExcerpt(sourceLines);
+      }
+      cards.push({
+        note: relNote,
+        noteLine: i + 2,
+        source: resolved.rel,
+        sourceRoot: root.source.replace(/\\/g, "/"),
+        start,
+        end: finish,
+        exists,
+        exact,
+      });
+    }
+
+    i = end;
+  }
+
+  return cards;
 }
 
 function getDocType(text) {
@@ -129,6 +203,7 @@ function scanNote(notePath, root) {
     note: relNote,
     docType: getDocType(text),
     refs,
+    sourceCards: scanSourceCards(text, root, relNote),
     sourceFiles: [...new Set(refs.map((r) => r.source))].sort(),
   };
 }
@@ -170,6 +245,8 @@ if (noteArgIndex !== -1) {
 const allRefs = allNotes.flatMap((n) => n.refs);
 const missing = allRefs.filter((r) => !r.exists);
 const badRanges = allRefs.filter((r) => r.exists && !r.rangeOk);
+const allSourceCards = allNotes.flatMap((n) => n.sourceCards);
+const badSourceCards = allSourceCards.filter((card) => !card.exists || !card.exact);
 const notesWithRefs = allNotes.filter((n) => n.refs.length > 0);
 const walkthroughs = allNotes.filter((n) => n.docType === "walkthrough");
 const walkthroughsWithoutRefs = walkthroughs.filter((n) => n.refs.length === 0);
@@ -180,6 +257,8 @@ console.log(`Notes with source refs: ${notesWithRefs.length}`);
 console.log(`Source refs: ${allRefs.length}`);
 console.log(`Missing source files: ${missing.length}`);
 console.log(`Bad line ranges: ${badRanges.length}`);
+console.log(`Formal source cards: ${allSourceCards.length}`);
+console.log(`Formal source card mismatches: ${badSourceCards.length}`);
 console.log(`Walkthrough notes: ${walkthroughs.length}`);
 console.log(`Walkthrough notes without refs: ${walkthroughsWithoutRefs.length}`);
 
@@ -207,8 +286,18 @@ function printHits(title, hits) {
 
 printHits("MISSING SOURCE FILES", missing);
 printHits("BAD LINE RANGES", badRanges);
+printHits("FORMAL SOURCE CARD MISMATCHES", badSourceCards);
 
 console.log("\n=== WRITING GATE ===");
 console.log(
   "Before rewriting any note, read every unique upstream file listed by that note's source refs, then verify the cited ranges still support the explanation.",
 );
+
+if (
+  missing.length > 0 ||
+  badRanges.length > 0 ||
+  badSourceCards.length > 0 ||
+  walkthroughsWithoutRefs.length > 0
+) {
+  process.exitCode = 1;
+}

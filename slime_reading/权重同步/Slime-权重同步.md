@@ -9,12 +9,11 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 权重同步
 
-> **你只需阅读本目录，不必打开 `slime/` 源码。**
-> 内嵌代码对应 slime Git commit `22cdc6e1`。
+> 本目录先提供连续的权重同步主线；准备修改实现、核对版本漂移或遇到证据争议时，仍应按 Git `22cdc6e1` 打开 `slime/` 源码验证。
 > SGLang 交叉对照：[[SGLang-ModelLoader]]、[[SGLang-CheckpointEngine]]、[[Slime-SGLang-Engine]]。
 
 ---
@@ -25,7 +24,7 @@ updated: 2026-07-10
 
 三个专题覆盖权重同步与 checkpoint 全链路：
 
-| 模块 | 角色 | 一句话 |
+| 专题 | 角色 | 一句话 |
 |------|------|--------|
 | [[Slime-分布式权重同步]] | NCCL 广播 | `UpdateWeightFromDistributed`、PP source → engine GPU |
 | [[Slime-磁盘权重同步]] | 磁盘 / tensor | full disk、delta disk、colocate IPC tensor |
@@ -60,11 +59,23 @@ sequenceDiagram
  UW->>TSR: IPC / 可选 NCCL
  TSR->>ENG: update_weights_from_tensor
  end
- Note over CK: 周期性 save_hf<br/>Megatron → safetensors
- ACT->>CK: save() / load_checkpoint
+ opt 周期性 checkpoint
+ ACT->>CK: 先 Megatron save，再可选 save_hf
+ end
 ```
 
-这张图的读法是：`update_weights` 在 **每个 train step 末尾**（或 `update_weights_interval` 间隔）执行；transport 由 `--update-weight-transport` 与 colocate 状态共同决定，再与 [[Slime-磁盘权重同步]] 的 delta/tensor 模式组合出具体同步路径。
+这张图的读法是：训练主循环按 `update_weights_interval` 的门禁触发 `update_weights`；transport 由 `--update-weight-transport`、colocate 拓扑和 update mode 共同决定。checkpoint save 是另一条周期性路径，不是每次 rollout 权重同步都会发生的一步。
+
+## 先选介质，再谈快慢
+
+| 路径 | 核心介质 | 必要前提 | 关键失败状态 |
+|------|----------|----------|----------------|
+| distributed NCCL | HF named tensor 经 trainer↔engine process group 广播 | 分离拓扑、group 与 rank 映射正确 | engine 可能被 pause/lock，版本号已前移，无统一 rollback |
+| full disk | 完整 HF 目录写共享文件系统后 reload | 所有节点可见同一路径 | 最终版本目录中可留半成品，无整目录原子发布 |
+| delta disk | trainer snapshot → XOR delta → host-local mmap base | Linux/POSIX `flock`、初始 HF base 一致 | snapshot/base 可前移或半写，失败后应重建 host-local base |
+| tensor colocate | 同机 CUDA IPC tensor bucket | colocated actor/engine 与可用 IPC handle | pause/flush/continue 只覆盖 colocated 子集，混合 remote 需单独审计 |
+
+这四条路径没有一个共同的“原子提交 + 统一回滚”层。正确的工程问法不是只问“哪个快”，而是同时问：谁持有新权重、谁已 pause、版本号是否前移、磁盘/base/snapshot 哪个已改变，以及失败后从哪个已知好状态重建。
 
 ---
 
@@ -90,7 +101,7 @@ sequenceDiagram
 
 ## 阶段衔接
 
-| 方向 | 模块 | 衔接点 |
+| 方向 | 专题 | 衔接点 |
 |------|------|--------|
 | ← 训练后端 | [[Slime-训练步骤]] | train 完成 → `update_weights` |
 | → 高级特性 | [[Slime-Agent轨迹]] · [[Slime-自定义扩展]] | Agent/customization 不改变同步主路径 |
@@ -105,15 +116,16 @@ sequenceDiagram
 1. **transport 矩阵：** 对照 [[Slime-磁盘权重同步-核心概念]]，列出 colocate + nccl vs 分离 + disk 的组合。
 2. **delta 约束：** 确认 `--update-weight-mode=delta` 必须 `--update-weight-transport=disk` 的原因（见 [[Slime-磁盘权重同步-排障指南]]）。
 3. **save 路径：** 追踪 [[Slime-Megatron到HF转换-数据流]] 中 `--save-hf` 产出目录结构与 SGLang `--model-path` 的对应关系。
+4. **失败状态账：** 为四条路径分别列出 trainer、engine、version、disk/base 和 pause/lock 状态，标出哪些修改没有 `finally` 或 rollback。
 
 ---
 
-## 模块导航
+## 专题导航
 
 | 目录 | 状态 |
 | ------ | ------ |
-| [[Slime-分布式权重同步|WeightSync-Dist]] | ✅ |
-| [[Slime-磁盘权重同步|WeightSync-Disk]] | ✅ |
-| [[Slime-Megatron到HF转换|Checkpoint-M2HF]] | ✅ |
+| [[Slime-分布式权重同步|分布式 NCCL 同步]] | ✅ |
+| [[Slime-磁盘权重同步|磁盘与 Tensor 同步]] | ✅ |
+| [[Slime-Megatron到HF转换|Megatron 与 HF 转换]] | ✅ |
 
 ← [[Slime-训练后端]] · → [[Slime-高级特性]]

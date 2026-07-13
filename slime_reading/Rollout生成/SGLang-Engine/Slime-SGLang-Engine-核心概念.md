@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # SGLang-Engine · 核心概念
 
@@ -47,7 +47,7 @@ flowchart TB
 | 对象 | 读者应该记住的职责 | 易错点 |
 |------|--------------------|--------|
 | `ServerGroup` | 一组同质 engine，负责 Ray actor 创建、Placement Group 绑定和端口分配 | `num_gpus=0.2` 是 Ray 调度占位，不等于 SGLang 实际 TP GPU 数 |
-| `RolloutServer` | 一个模型对应的 router 加多个 `ServerGroup` | `engines` 只返回 node 0 actor，`all_engines` 才包含所有节点 actor |
+| `RolloutServer` | 一个模型对应的 router 加多个 `ServerGroup` | 上述 node-0/all-node 语义只对 managed 多节点拓扑成立；external 是一地址一 adapter |
 | `SGLangEngine` | Ray actor 控制台，维护 server host/port，转发控制面 HTTP | 它不直接做模型 forward |
 | `ExternalRolloutServer` | 包装预启动外部 SGLang server | external 不支持 fault tolerance recover/offload |
 | `UpdateWeight*` | 训练侧权重同步策略 | 真正发起 pause/flush/update 的是训练侧 updater |
@@ -69,22 +69,24 @@ stateDiagram-v2
     Paused --> Empty: flush_cache 或 abort_until_idle
     Empty --> WeightUpdating: tensor/disk/distributed update
     WeightUpdating --> Registered: continue_generation
-    Registered --> Shutdown: remove router worker + kill process
-    Shutdown --> [*]
+    Registered --> LocalShutdown: remove router worker + kill process
+    Registered --> ExternalDetached: shutdown 直接返回
+    LocalShutdown --> [*]
+    ExternalDetached --> [*]
 ```
 
 状态机里有两个容易漏掉的分支。
 
-第一，external 模式不会进入 `launch_server_process`，但仍会进入 `SGLangEngine.init` 和 `_register_to_router`。第二，权重更新不是 engine init 的一部分，而是在训练侧需要同步新权重时才由 updater 触发。
+第一，external 模式不会进入 `launch_server_process`，但仍会进入 `SGLangEngine.init` 和 `_register_to_router`；其 `shutdown()` 直接返回，不执行 router 注销。第二，权重更新不是 engine init 的一部分，而是在训练侧需要同步新权重时才由 updater 触发。
 
 ---
 
 ## 源码证明：node 0 actor 是控制面代表
 
-多节点 engine 会有多个 Ray actor，但对外发 HTTP 的只有 node 0。`ServerGroup.engines` 的切片和 `SGLangEngine._make_request` 的早退共同证明了这个约束。
+managed 多节点 engine 会有多个 Ray actor，但对外发通用 `_make_request` HTTP 的只有 node 0。`ServerGroup.engines` 的切片和 `_make_request` 早退共同证明了这个约束；external server 只为每个公开地址创建 adapter，不能据此枚举其内部节点。
 
 ```python
-# 来源：slime/ray/rollout.py L129-L135
+# 定位骨架（据 `slime/ray/rollout.py` L129-L135 补属性装饰器）：
 @property
 def nodes_per_engine(self):
     return max(1, self.num_gpus_per_engine // self.args.num_gpus_per_node)
@@ -96,7 +98,7 @@ def engines(self):
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L234-L254
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L234-L254 删节）：
 def _make_request(self, endpoint: str, payload: dict | None = None):
     if self.node_rank != 0:
         return
@@ -133,7 +135,7 @@ def _make_request(self, endpoint: str, payload: dict | None = None):
 `_compute_server_args` 把 Slime 的训练参数翻译成 SGLang 可理解的 `ServerArgs`。这个翻译不是简单透传，它会决定 GPU 起点、多节点 rank、并行尺寸、PD worker 类型、routing replay、dtype 和 per-group override。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L578-L609
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L578-L609 选取核心字段）：
 _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
 nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
 node_rank = rank % nnodes
@@ -164,7 +166,7 @@ kwargs = {
 - `base_gpu_id` 传给 SGLang 时必须是当前进程可见的本地 GPU id。
 - `tp_size` 与 `pp_size` 的乘积要覆盖 engine 的 GPU 数。
 - prefill worker 必须拿到 `disaggregation_bootstrap_port`。
-- external engine 只校验一部分字段，host、port、rank、并行尺寸等由 Slime 期望值和外部 server 实际值共同约束。
+- external engine 只校验一小部分字段，而且 check-list 在通用 `sglang_*` 参数和 per-group overrides 合入前就已生成；host、port、rank、TP/DP/PP/EP 等还被显式跳过，必须另行核对。
 
 ---
 
@@ -207,7 +209,9 @@ def _init_external(self, expect_server_args, external_engine_need_check_fields):
     self._register_to_router(expect_server_args)
 ```
 
-读者排障时要把 external 看成“进程由别人启动，控制面仍由 Slime 接管”。这解释了为什么 external 模式下 `shutdown` 不 kill 进程，但 router 注册、权重端点和版本检查仍然重要。
+读者排障时要把 external 看成“进程由别人启动，Slime 只接入部分控制面”。Slime 会发现地址、创建 adapter、做有限 sanity check 并注册 router；但 `shutdown` 既不 kill 进程也不注销 router worker，offload/recover 和多主机本地 checkpoint 也不能套用 managed 假设。
+
+还有一个坐标风险：`start_external_rollout_servers` 按地址 `enumerate` 生成 adapter rank，而 `_compute_server_args` 用 `rank % nnodes` 计算 node rank。每个地址本来就是公开 HTTP 控制端点；若 `info.num_gpus > num_gpus_per_node` 且有多个地址，后续 adapter 可能被标成非 node 0，随后跳过 router 注册和通用 `_make_request`。当前轻量 external 测试只覆盖单节点 GPU 数，不能证明该组合安全。
 
 ---
 

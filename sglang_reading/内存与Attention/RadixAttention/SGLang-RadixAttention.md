@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # RadixAttention
 
@@ -22,7 +22,7 @@ updated: 2026-07-10
 
 读完之后，你应该能做三件事：
 
-- 解释 `req.prefix_indices` 如何让 prefill 从“全量重算”变成“只算未命中 tail”。
+- 解释 `req.prefix_indices` 如何让 prefill 跳过已经可复用的 KV，并区分 tree-owned prefix 与请求私有 tail。
 - 区分 `RadixCache` 和 `RadixAttention`：前者是 CPU 侧前缀索引，后者是模型层 attention 入口。
 - 按源码入口排查 cache miss、显存泄漏、SWA tail 驱逐和 piecewise CUDA Graph 相关问题。
 
@@ -44,7 +44,7 @@ flowchart LR
   POLICY -->|"RadixKey(token_ids, extra_key)"| TREE
   TREE -->|"device_indices / last_node"| POLICY
   POLICY -->|"req.prefix_indices"| BATCH
-  BATCH -->|"只取未命中 token"| POOL
+  BATCH -->|"只取本轮尚未计算 token"| POOL
   BATCH --> ATTN
   ATTN --> BACKEND
   BACKEND -->|"读写 paged KV"| POOL
@@ -52,7 +52,7 @@ flowchart LR
 
 ## 一条请求穿过它
 
-场景：客服系统有 2k token 的固定 system prompt。用户 A 第一次请求时，tree 里还没有这段前缀，prefill 会计算整段 prompt 并把 page-aligned KV indices 插入树。用户 B 随后进入，同样的 system prompt 命中 tree，调度侧把命中的 KV indices 写入 `req.prefix_indices`，本轮 extend 只对用户问题那段 tail 分配新 KV slot。请求结束或 chunked prefill 中途暂停时，cache 再把已提交的 KV 挂回树，并释放重复 slot。
+场景：客服系统有 2k token 的固定 system prompt。用户 A 第一次请求时，tree 里还没有这段前缀，prefill 先计算输入；在 unfinished/finished cache commit 时，page-aligned 部分才可能进入 tree。用户 B 随后进入，同样 namespace 下的 system prompt 命中 tree，调度侧把 device indices 写入 `req.prefix_indices`，本轮 extend 只为其余 tail 分配新 KV slot。若 A 是 chunked prefill，commit 后的 `prefix_indices` 还可能在 `cache_protected_len` 之后携带未进 tree 的请求私有 tail。
 
 这个场景有四条边界：
 
@@ -86,15 +86,15 @@ flowchart LR
 ## 不变量
 
 - `RadixCache` 存的是 token 前缀到 KV pool indices 的映射，不存 QKV tensor 本体。
-- `req.prefix_indices` 的长度决定本轮 prefill 跳过多少 token。
+- `len(req.prefix_indices)` 决定下一轮 extend 跳过多少已计算 token；只有前 `cache_protected_len` 能断言已由 tree 接管。
 - `page_size > 1` 时，未对齐 tail 可以留在请求侧，但不能作为完整 page 进入 tree。
-- 活跃请求持有 `last_node` 的 lock；`lock_ref > 0` 的路径不能被 tree evict。
+- classic cache 中活跃请求持有 `last_node` 到 root 的 lock；Unified 还可能按 component/host 分层持锁，SWA 可在满足窗口条件后提前释放其部分锁。
 - `RadixAttention.forward` 不调用 `match_prefix`，它只做 shape 适配和 backend 转发。
 
 ## 验证入口
 
 - 强制 miss：设置 `SGLANG_RADIX_FORCE_MISS=1`，相同 prompt 的第二次请求应不再享受 prefix hit。
-- 对照配置：启动时打开或关闭 `--disable-radix-cache`，比较相同 system prompt 的 TTFT 和 prefill token 数。
+- 对照配置：启动时打开或关闭 `--disable-radix-cache`，先比较 prefix hit 与 extend token 数，再在固定硬件、并发和输出长度下解释 TTFT。
 - 断点顺序：`match_prefix_for_req` → `RadixCache.match_prefix` → `PrefillAdder.add_one_req` → `ScheduleBatch.prepare_for_extend` → `RadixAttention.forward`。
 - 显存问题：从 `cache_unfinished_req` 的 duplicate free、`cache_finished_req` 的 unaligned tail free、`evict` 的 leaf free 三处查起。
 

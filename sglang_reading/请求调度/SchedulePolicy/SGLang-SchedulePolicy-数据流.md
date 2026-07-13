@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # SchedulePolicy · 数据流
 
@@ -43,6 +43,7 @@ flowchart LR
  TC["tree_cache"]
  KV["token_to_kv_pool_allocator"]
  SB["ScheduleBatch"]
+ CR["Scheduler.chunked_req<br/>跨轮专用槽位"]
 
  WQ --> SP
  SP --> REQ
@@ -53,7 +54,8 @@ flowchart LR
  TC --> PA
  PD -.-> PA
  PA -->|"can_run_list"| SB
- PA -->|"new_chunked_req"| WQ
+ PA -->|"new_chunked_req"| CR
+ CR -->|"下一轮先 add_chunked_req"| PA
  PA -->|"preempt_list"| WQ
 ```
 
@@ -71,14 +73,18 @@ flowchart LR
 
 ## 预算字段如何流动
 
-`PrefillAdder` 的预算可以分成四层：
+`PrefillAdder` 不是保存一组静态“剩余值”，而是保存 offset，再用 allocator 当前可用量与 cache 当前可驱逐量动态计算 `rem_total_tokens`、`cur_rem_tokens` 和 `rem_swa_tokens`。因此加锁、host load back 或驱逐状态变化后，同一个请求会再次过容量门。
+
+读预算时至少分成六个口径：
 
 | 层 | 字段 | 用途 |
 |----|------|------|
 | 总生命周期预算 | `rem_total_tokens` | 覆盖本次 prefill 输入加未来 decode 估算 |
 | 本轮即时预算 | `cur_rem_tokens` | 覆盖当前 extend 分配 |
 | 输入预算 | `rem_input_tokens` | 对应 `max_prefill_tokens` |
-| 特殊 allocator 预算 | `rem_swa_tokens`、`rem_mamba_slots` | 防止 SWA 或 Mamba 被总 KV 口径掩盖 |
+| 分块预算 | `rem_chunk_tokens` | 普通 chunked prefill 本轮还能提交多少 token |
+| diffusion 预算 | `rem_dllm_tokens` | DLLM block 本轮还能提交多少 token |
+| 特殊 allocator 预算 | `rem_swa_tokens`、`rem_mamba_slots` | 防止 SWA 子池或 Mamba 可恢复容量被 full-KV 口径掩盖 |
 
 预算扣减集中在 `_update_prefill_budget`：
 
@@ -208,7 +214,7 @@ flowchart LR
         return req if truncated else None
 ```
 
-这里的失败边界很清楚：如果中间块没有被重新加入 `can_run_list`，请求既不是完整 running，也不是普通 waiting，资源生命周期会变得不可回收。
+这里的状态边界很清楚：未完成请求返回同一个 `req`，Scheduler 把它继续保存在 `self.chunked_req`，而不是塞回普通 `waiting_queue`；下一轮在扫描普通等待请求前先调用 `add_chunked_req`。对 hybrid SWA，若本轮连安全的一块都放不下，函数直接返回 `req` 且不加入 `can_run_list`，让专用槽位保留状态等待下一轮，而不是冒险分配。
 
 ## PrefillDelayer 的 single-pass 数据
 
@@ -260,7 +266,7 @@ class PrefillDelayerSinglePassExecutor:
 
 ## 跨 rank 协商的数据形状
 
-`PrefillDelayer` 每个 rank 打包 5 个整数，再 `all_gather`：
+`PrefillDelayer` 的每个参与 rank 打包 5 个整数再 `all_gather`；buffer 形状是 `(dp_size_dim, attn_tp_size, 5)`，决策只读取每个 DP 组的 attention-rank 0 切片 `[:, 0, :]`。未启用 DP attention 时 `dp_size_dim=1`，不要把这个张量机械理解成所有配置下都有 `dp_size × attn_tp_size` 个独立决策者。
 
 | 字段 | 含义 |
 |------|------|

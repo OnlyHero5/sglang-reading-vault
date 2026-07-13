@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/exercise
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Ray参数 · 学习检查
 
@@ -60,7 +60,7 @@ updated: 2026-07-10
 4. `slime_validate_args` 的 delta 校验分支失败；colocate 走 CUDA IPC handle，delta 的磁盘 diff 没有意义。
 5. 不会。源码没有普通 decoupled 的通用 fallback，实际运行应显式传数字或使用 external discovery。
 
-## 必跑验证
+## 运行验证与静态替代
 
 ```powershell
 python -m pytest slime/tests/test_placement_group.py -q
@@ -73,11 +73,13 @@ python -m pytest slime/tests/test_megatron_argument_validation.py -q
 python -m pytest slime/tests/test_external_sglang_engines.py -q
 ```
 
-预期结果：
+依赖齐全时的预期结果：
 
 - placement group 矩阵全部通过。
 - argument validation 覆盖 zero rollout、larger rollout、delta + colocate。
 - external tests 覆盖 `/server_info` discovery 和 `rollout_num_engines` 写回。
+
+当前 Windows 轻量环境中，argument validation 14 项已通过；placement group 与 external tests 分别缺 `ray`、`httpx`，会在 collection 阶段失败。无法安装依赖时，完整阅读对应测试参数表并手算预期值，作为静态替代；不要勾选“运行通过”。
 
 ## 下一步
 

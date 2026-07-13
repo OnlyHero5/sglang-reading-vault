@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Sample数据契约 · 数据流
 
@@ -33,10 +33,10 @@ flowchart LR
 
 ## 1. rollout 函数输出是分组批
 
-训练路径不是单条 `Sample`，而是 `list[list[Sample]]`：外层是本轮 rollout batch 的 prompt 组，内层是同 prompt 的多次采样。新版返回值是 `RolloutFnTrainOutput`，legacy 裸列表会被 `call_rollout_fn` 包装。
+训练路径不是单条 `Sample`。默认形状是 `list[list[Sample]]`；compact/subagent 可以再增加 sibling 层。新版返回值是 `RolloutFnTrainOutput`，legacy 裸列表会被 `call_rollout_fn` 包装。
 
 ```python
-# 来源：slime/rollout/base_types.py L7-L26
+# 定位骨架（据 `slime/rollout/base_types.py` L7-L26 删节）：
 @dataclass
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
@@ -63,7 +63,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
 `RolloutManager._get_rollout_data` 先拿到 rollout 函数输出，再在 flatten 前检查 compact/subagent 结构的 `rollout_id`。这个检查必须在 flatten 前做，因为 flatten 后 sibling 关系就丢了。
 
 ```python
-# 来源：slime/ray/rollout.py L635-L665
+# 定位骨架（据 `slime/ray/rollout.py` L635-L665 删节）：
 if self.args.load_debug_rollout_data:
     data = torch.load(
         self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
@@ -89,12 +89,14 @@ return data, metrics
 | debug load | 磁盘 dict | `Sample.from_dict` 恢复后的扁平列表 |
 | 正常 rollout | `RolloutFnTrainOutput.samples` | 校验后 flatten 的 `list[Sample]` |
 
+debug load 已丢失嵌套 sibling 结构，不会重跑 compact id 校验；正常路径还要求非空且批内嵌套层级一致，因为 flatten 循环只观察 `data[0]`。
+
 ## 3. compact rollout 的 sibling 必须共享 rollout_id
 
 默认形状 `list[list[Sample]]` 不强制每个 leaf 都写 `rollout_id`；compact/subagent 多一层，表示一次 rollout execution 拆成多个训练样本，这时 sibling 必须共享同一个 `rollout_id`。
 
 ```python
-# 来源：slime/ray/rollout.py L898-L925
+# 定位骨架（据 `slime/ray/rollout.py` L898-L925 删节）：
 def _validate_rollout_id_annotated(node, depth=0):
     if isinstance(node, Sample):
         return
@@ -119,7 +121,7 @@ def _validate_rollout_id_annotated(node, depth=0):
 `Sample` 是行对象；训练侧需要列式 batch。`_convert_samples_to_train_data` 把每个字段抽成一列，并补齐默认 `rollout_id`。
 
 ```python
-# 来源：slime/ray/rollout.py L713-L745
+# 定位骨架（据 `slime/ray/rollout.py` L713-L745 删节）：
 raw_rewards, rewards = self._post_process_rewards(samples)
 
 rollout_ids = [sample.rollout_id for sample in samples]
@@ -150,7 +152,7 @@ train_data = {
 filter 或 RM 可以设置 `remove_sample=True`。这不会删除行，而是在转换阶段把这条 sample 的 `loss_mask` 全部改成 0。
 
 ```python
-# 来源：slime/ray/rollout.py L747-L778
+# 定位骨架（据 `slime/ray/rollout.py` L747-L778 删节）：
 loss_masks = []
 for sample in samples:
     if sample.loss_mask is None:
@@ -179,7 +181,7 @@ train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id
 `rollout_log_probs`、top-p replay、routed experts、teacher logprobs、多模态训练输入都不是每个任务都有。Slime 只在需要时写入列式 batch。
 
 ```python
-# 来源：slime/ray/rollout.py L792-L824
+# 定位骨架（据 `slime/ray/rollout.py` L792-L824 删节）：
 if samples[0].rollout_log_probs is not None:
     train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
@@ -199,12 +201,14 @@ if samples[0].rollout_routed_experts is not None:
 
 排障抓手：这些字段很多用 `samples[0]` 作为存在性哨兵。混合 batch 里如果第一条没有字段、后面有字段，训练侧可能看不到这列。
 
+`rollout_routed_experts` 与 top-p/logprob 使用不同坐标系：首维对应 `len(tokens)-1`，不是 response token 数。默认路径的 `tokens` 在生成前已放入 prompt ids；该字段是完整序列快照，`_apply_meta_info` 不做增量合并。
+
 ## 7. per-rank rollout_data 是 train_data 的切片
 
 列式 `train_data` 还不是最终训练输入。`_split_train_data_by_dp` 根据 DP schedule 给每个 rank 切片，并把对应列放进 `rollout_data`。
 
 ```python
-# 来源：slime/ray/rollout.py L829-L895
+# 定位骨架（据 `slime/ray/rollout.py` L829-L895 删节）：
 dp_size = self.train_parallel_config["dp_size"]
 total_lengths = [len(t) for t in data["tokens"]]
 data["total_lengths"] = total_lengths
@@ -248,7 +252,7 @@ for r in range(dp_size):
 top-p replay 不只服务训练，也服务可观测指标。metric 计算时只统计 `loss_mask=True` 的 token，并跳过 `remove_sample`。
 
 ```python
-# 来源：slime/ray/rollout.py L1427-L1448
+# 定位骨架（据 `slime/ray/rollout.py` L1427-L1448 删节）：
 def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
     total_kept = 0
     total_tokens = 0

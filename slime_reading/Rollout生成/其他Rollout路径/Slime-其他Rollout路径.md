@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 其他Rollout路径
 
@@ -43,7 +43,7 @@ flowchart TB
 
 | 目标 | 应该替换 | 还保留什么 | 主要代价 |
 |------|----------|------------|----------|
-| 让 rollout 与训练 step 重叠 | `train_async.py` + `fully_async_rollout.generate_rollout_fully_async` | `generate_and_rm_group`、custom generate、custom RM | 不支持 eval；不支持 colocate async train |
+| 让 rollout 与训练 step 重叠 | `train_async.py` + `fully_async_rollout.generate_rollout_fully_async` | `generate_and_rm_group`、custom generate、custom RM | 不支持 eval/colocate；不继承默认 filter/metrics；当前超额 drain 会丢 group |
 | 在 abort 前保存流式 partial token | `--custom-generate-function-path generate_streaming` | 默认水位、semaphore、dynamic filter、partial 回灌 | 依赖 SGLang cumulative SSE 语义 |
 | 做 SFT | `sft_rollout.generate_rollout` | RolloutManager、训练后端、checkpoint/logging | 不走在线生成和 RM |
 | 做 OPD | custom RM + reward post-process | 默认生成主线 | reward 里要写入 `teacher_log_probs` |
@@ -110,9 +110,11 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
 - 整段 rollout 替换必须满足 `generate_rollout(args, rollout_id, data_source, evaluation=False)` 形状。
 - 单 sample generate 替换只应该改变生成方式，不应该绕过默认 semaphore、RM、filter、abort 主线。
 - fully-async 保留 `generate_and_rm_group`，但不复制默认 dynamic filter 和 oversampling 主循环。
+- fully-async 的全局 worker 固定首份 args/DataSource；异常结果、失败回灌和超目标 drain 当前都可能丢 group，不能把“热队列”理解成可靠消息队列。
 - streaming 只替换 HTTP 层，partial 回灌仍由默认 `sglang_rollout` 负责。
 - SFT rollout 是数据转换器，不是在线生成器。
 - OPD 把 teacher logprob 写到 Sample，标量 reward 可以只是兼容接口。
+- SFT 与 OPD 都必须显式处理 `response_length==0`；Python 的 `seq[-0:]` 返回全序列而不是空序列。
 - forge load 不能覆盖样本 `rollout_id`，否则会破坏下游 DP schedule 分组。
 
 ## 验证抓手

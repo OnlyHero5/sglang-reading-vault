@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ScheduleBatch数据结构 · 源码走读
 
@@ -19,17 +19,17 @@ updated: 2026-07-10
 
 ## 长文读法
 
-这篇按“对象逐层收窄”读：`GenerateReqInput` 是 API 入口对象，`TokenizedGenerateReqInput` 是 TokenizerManager 发给 Scheduler 的 IPC 消息，`Req` 是 Scheduler 的请求状态，`ScheduleBatch` 是一轮调度的批对象，`ForwardBatch` 才是进入 ModelRunner 的执行快照。不要把这些对象当成同一个结构的不同名字。
+这篇按“对象逐层收窄”读：`GenerateReqInput` 是 API 入口对象，`TokenizedGenerateReqInput` 是 TokenizerManager 发给 Scheduler 的 IPC 消息，`Req` 是 Scheduler 的请求状态，`ScheduleBatch` 是可跨 decode 轮次演化的批次工作台，`ForwardBatch` 才是本轮进入 ModelRunner 的执行视图。不要把这些对象当成同一个结构的不同名字。
 
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
 | 第一次建立 generate 数据流 | 主线图、1 到 4 | 请求先在 TokenizerManager 归一化，再由 Scheduler 变成 `Req` 并进入等待队列 |
-| 排查 IPC 序列化或 opaque 字段 | 1 到 3 | 结构化字段走 msgspec，只有多模态、共享内存、time stats 等特殊载荷显式包 pickle |
+| 排查 IPC 序列化或 opaque 字段 | 1 到 3 | 结构化字段走 msgspec；优先字段级 wrapper，少数请求类型才允许顶层整体回退 |
 | 排查 prefix cache 命中异常 | 4 到 7 | prefix matching 写回 `Req`，`prepare_for_extend` 再把 cached prefix 和本轮 extend token 切开 |
 | 排查 embedding / 多模态覆盖 | 1、7、8 | token id 仍是主轴，embedding 覆盖只落到本轮 extend 张量的对应位置 |
 | 区分 prefill 与 decode | 6 到 10 | prefill 可能处理多 token 和 prefix；decode 每轮只推进一个位置，最后统一转成 `ForwardBatch` |
 | 判断哪些字段会进模型 | 10 | `ForwardBatch.init_new` 消费 `ScheduleBatch` 当前快照，清理一次性 override，并只携带执行所需张量和元信息 |
-| 排查输出回程 | 11 | Scheduler 输出仍是 token 级，字符串增量要经过 Detokenizer 再回 TokenizerManager |
+| 排查输出回程 | 11 | 普通生成经 Detokenizer 产出文本；skip-tokenizer 直接回 token；embedding 无需字符串解码 |
 
 读的时候沿对象边界做断点：API 归一化问题看 TokenizerManager，调度排队和 prefix 问题看 `Req` / `ScheduleBatch`，模型输入问题看 `ForwardBatch`，客户端文本问题看输出回程。
 
@@ -46,12 +46,15 @@ flowchart LR
     E["waiting_queue<br/>等待调度"]
     F["ScheduleBatch.init_new<br/>组 prefill batch"]
     G["prepare_for_extend / prepare_for_decode<br/>准备张量与 KV slot"]
-    H["ForwardBatch.init_new<br/>执行快照"]
+    H["ForwardBatch.init_new<br/>执行视图 + one-shot 消费"]
     I["ModelRunner.forward<br/>模型执行"]
     J["BatchTokenIDOutput<br/>token 级输出"]
     K["BatchStrOutput<br/>字符串输出"]
+    L["TokenizerManager<br/>token 结果"]
 
-    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J
+    J -->|"普通生成"| K
+    J -->|"skip-tokenizer-init"| L
 ```
 
 ---
@@ -113,7 +116,7 @@ flowchart LR
 
 ## 2. 发送前：opaque 字段显式包 pickle
 
-默认 IPC 走 msgpack。TokenizerManager 在发送前调用 `wrap_pickle_fields()`，只把多模态、Mooncake 多模态数据、time stats 这类 opaque 字段包成 `PickleWrapper`。
+默认 IPC 走 msgpack。TokenizerManager 在发送前调用 `wrap_pickle_fields()`，把多模态、Mooncake 多模态数据、time stats 等明确列出的 opaque 字段包成 `PickleWrapper`。这是字段级路径；编码 hook 还保留第二层兜底：列入 `_REQ_TYPES_WITH_OPAQUE_FIELDS` 的少数 request struct 可被整体包成顶层 `PickleWrapper`。
 
 ```python
 # 来源：python/sglang/srt/managers/tokenizer_manager.py L1331-L1340
@@ -129,7 +132,7 @@ flowchart LR
         tokenized_obj.time_stats = time_stats
 ```
 
-这一步证明一个设计选择：SGLang 没有把整个请求都变成 pickle blob，而是让结构化字段继续走 msgspec，只有无法结构化的载荷走兜底口。排查 IPC 序列化失败时，先看新字段是否属于 opaque 载荷。
+这一步证明一个设计选择：SGLang 的主路径仍让结构化字段走 msgspec，不透明载荷才走 pickle。排查新字段时，决策顺序应是“精确 msgspec 类型 → 字段级 wrapper → 有审计理由的整个 struct 回退”，不能因为存在 `_REQ_TYPES_WITH_OPAQUE_FIELDS` 就把任意新请求整体塞进 pickle。
 
 ---
 
@@ -482,7 +485,7 @@ prefill 的核心是“未缓存 prompt 的批量计算”；decode 的核心是
 
 ---
 
-## 10. ForwardBatch：进入 ModelRunner 前的执行快照
+## 10. ForwardBatch：进入 ModelRunner 前的执行视图
 
 Scheduler 的 `run_batch` 把 `ScheduleBatch` 交给 worker，worker 在 forward 前构造 `ForwardBatch`。
 
@@ -551,13 +554,40 @@ Scheduler 的 `run_batch` 把 `ScheduleBatch` 交给 worker，worker 在 forward
             extend_logprob_start_lens = batch.extend_logprob_start_lens
 ```
 
-这就是 Scheduler 与 ModelRunner 的分界：`ForwardBatch` 不是把 `Req` 原样搬过去，而是从 `ScheduleBatch` 里抽出执行所需的张量和标志。
+这就是 Scheduler 与 ModelRunner 的分界：`ForwardBatch` 不是把 `Req` 原样搬过去，而是从 `ScheduleBatch` 里抽出执行所需的张量和标志。这里也不是纯函数式复制：`capture_hidden_mode`、`seq_lens_cpu_cache`、`return_hidden_states_before_norm` 被读出后会在原 batch 上复位；部分 GPU 张量则仍按引用借用。更准确的心智模型是“本轮执行视图 + one-shot 消费点”。
+
+开启 overlap 后还多一层容易混淆的快照：Scheduler 把 `batch.copy()` 与异步结果一起放进 `result_queue`。这个 copy 只保留 `process_batch_result` 需要的字段，并浅拷贝 `reqs` 列表，目的在于防止原 batch 为下一轮执行 filter/merge 后打乱上一轮结果的索引；它不是另一个可继续调度的完整 batch，更不是 `ForwardBatch`。
 
 ---
 
 ## 11. 输出回程：先 token，再字符串
 
-Scheduler 侧输出聚合器把每条请求的 token 级结果打包成 `BatchTokenIDOutput`。
+Scheduler 侧输出聚合器把每条请求的 token 级结果打包成 `BatchTokenIDOutput`。先看聚合动作本身，才能避免把两个 token 字段混成一个：
+
+```python
+# 来源：python/sglang/srt/managers/scheduler_components/output_streamer.py L354-L372
+        send_token_offset = req.send_token_offset
+        send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+        self.rids.append(req.rid)
+        self.http_worker_ipcs.append(req.http_worker_ipc)
+        self.finished_reasons.append(
+            req.finished_reason.to_json() if req.finished_reason else None
+        )
+        self.decoded_texts.append(req.decoded_text)
+        decode_ids, read_offset = req.init_incremental_detokenize()
+
+        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+
+        # Exclude the tokens after stop condition
+        output_ids_ = req.output_ids_through_stop
+
+        req.send_decode_id_offset = len(decode_ids)
+        self.read_offsets.append(read_offset)
+        self.output_ids.append(output_ids_[send_token_offset:])
+        req.send_token_offset = len(output_ids_)
+```
+
+`decode_ids` 按 `send_decode_id_offset` 切的是 Detokenizer 窗口传输增量；首次窗口可能从 prompt 尾部开始，为 tokenizer 合并和不完整 UTF-8 提供 surrounding context。`output_ids` 则按 `send_token_offset` 从 `output_ids_through_stop` 切片，是客户端可见的 output-token 增量。
 
 ```python
 # 来源：python/sglang/srt/managers/scheduler_components/output_streamer.py L508-L525
@@ -602,7 +632,7 @@ Detokenizer 收到 token 级输出后，才生成 `output_strs`，并返回 `Bat
             output_ids=recv_obj.output_ids,
 ```
 
-所以 `BatchTokenIDOutput.decode_ids` 是增量 token 辅助 detokenize 的输入；`BatchStrOutput.output_strs` 才是上层 API 可以直接消费的字符串。
+因此必须把三者逐项命名：`decode_ids` 是 Detokenizer 窗口片段，可能含 prompt surrounding context；`output_ids` 是客户端 output-token 增量；`output_strs` 是 Detokenizer 维护 per-rid 状态后生成的文本增量。普通生成走 `BatchTokenIDOutput → Detokenizer → BatchStrOutput`；`--skip-tokenizer-init` 会让 `BatchTokenIDOutput` 直接到 TokenizerManager；embedding 输出也不做字符串 detokenize。
 
 ---
 
@@ -612,9 +642,10 @@ Detokenizer 收到 token 级输出后，才生成 `output_strs`，并返回 `Bat
 
 1. 在 `TokenizerManager._send_one_request` 后打印 `type(tokenized_obj)`、`len(tokenized_obj.input_ids)`，预期是 `TokenizedGenerateReqInput` 且 `input_ids` 已经是 `array("q")`。
 2. 在 `Scheduler.handle_generate_request` 构造 `Req` 后打印 `req.rid`、`len(req.origin_input_ids)`、`req.output_ids`，预期 `output_ids` 为空。
-3. 在 `ScheduleBatch.prepare_for_extend` 后打印 `batch.prefix_lens`、`batch.extend_lens`、`batch.extend_num_tokens`，第二次相同长 prompt 若 prefix cache 命中，预期 `prefix_lens` 增大、`extend_num_tokens` 下降。
-4. 在 `TpModelWorker.forward_batch_generation` 中打印 `type(forward_batch)`，预期是 `ForwardBatch`，不是 `ScheduleBatch`。
-5. 在 Detokenizer `handle_batch_token_id_out` 中比较 `recv_obj.decode_ids` 和返回对象的 `output_strs`，预期前者是 token 增量，后者是字符串增量。
+3. 在 `ScheduleBatch.prepare_for_extend` 后打印 `batch.prefix_lens`、`batch.extend_lens`、`batch.extend_num_tokens`。验证第二次相同长 prompt 前，先确保第一请求已完成或前缀已插入 cache、cache 未禁用或驱逐，且 `extra_key`、LoRA、embedding override、多模态 pad hash 等匹配条件一致。命中后预期 `prefix_lens` 增大、`extend_num_tokens` 下降；为保留下一 token 的计算边界，通常不应期待完整 prompt 每个 token 都命中。
+4. 在 `TpModelWorker.forward_batch_generation` 中打印 `type(forward_batch)`，预期是 `ForwardBatch`，不是 `ScheduleBatch`；同时观察三项 one-shot override 在 `init_new` 后复位。
+5. 在 `SchedulerOutputStreamer.accept` 和 Detokenizer `handle_batch_token_id_out` 中同时比较 `decode_ids`、`output_ids`、`output_strs`。预期 `decode_ids` 可能含 surrounding context，`output_ids` 只含新客户端 token，`output_strs` 是可打印文本增量。
+6. 分别以普通模式、`--skip-tokenizer-init`、embedding 模式检查回程对象类型，预期依次为 `BatchStrOutput`、`BatchTokenIDOutput`、`BatchEmbeddingOutput`。
 
 ---
 

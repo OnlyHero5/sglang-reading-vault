@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/template
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 
 # SGLang 专题模板
@@ -35,15 +35,17 @@ title: "SGLang {主题} 源码走读"
 type: walkthrough
 framework: sglang
 topic: "{主题}"
-learning_role: deep-dive
+learning_role: reference
 source_baseline: "70df09b"
 tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 ```
+
+`learning_role` 只使用 `core`、`reference`、`debug`、`practice`。源码走读通常是 `reference`；首次学习主线中的必读页才使用 `core`。
 
 ## 正文模板
 

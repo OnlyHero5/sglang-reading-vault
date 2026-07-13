@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # SchedulePolicy
 
@@ -23,7 +23,7 @@ updated: 2026-07-10
 
 ## 模块位置
 
-`SchedulePolicy` 不执行模型，也不创建最终执行张量。它处在 `Scheduler` 的 prefill 分支里，把 `waiting_queue` 转换成 `can_run_list`，随后交给 [[SGLang-ScheduleBatch数据结构|ScheduleBatch-IO]] 构造可执行批次。
+严格说，`SchedulePolicy` 类只负责给 `waiting_queue` 排序，并在需要时写回 prefix match 元数据；把候选请求变成 `can_run_list` 的是同文件中的 `PrefillAdder`，维护专用 `chunked_req` 槽位、更新等待队列并创建 `ScheduleBatch` 的是 `Scheduler`。本专题把这三层作为一条 prefill 准入链来读，但不会把它们混成一个类的职责。
 
 ```mermaid
 flowchart LR
@@ -47,7 +47,7 @@ flowchart LR
 
 | 顺序 | 文件 | 读者任务 |
 |------|------|----------|
-| 1 | [[SGLang-SchedulePolicy-核心概念]] | 先建立“prefill 准入裁判”的心理模型 |
+| 1 | [[SGLang-SchedulePolicy-核心概念]] | 先建立“排序—准入—提交”三层心理模型 |
 | 2 | [[SGLang-SchedulePolicy-源码走读]] | 沿一轮 prefill 调度追踪真实调用顺序 |
 | 3 | [[SGLang-SchedulePolicy-数据流]] | 看清 `Req` 字段、预算字段、delayer 状态如何流动 |
 | 4 | [[SGLang-SchedulePolicy-排障指南]] | 按症状排查策略退化、预算不足、延迟过强与 chunked prefill |
@@ -64,7 +64,7 @@ flowchart LR
 
 ## 先抓住一句话
 
-`SchedulePolicy` 像一个 prefill 准入裁判：先按策略给等待请求排队，再按 KV、SWA、Mamba、chunk、slot 和跨 rank 节奏决定本轮能进场的请求。
+这条链路有三个裁决点：`SchedulePolicy` 决定“先看谁”，`PrefillAdder` 决定“本轮收谁”，Scheduler 决定“如何把结果提交为可执行批次并保存跨轮状态”。
 
 ## 首次阅读路径
 

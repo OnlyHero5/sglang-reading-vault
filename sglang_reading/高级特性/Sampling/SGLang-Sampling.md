@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Sampling
 
@@ -20,8 +20,8 @@ updated: 2026-07-10
 读完本专题，你应该能解决三类问题：
 
 1. OpenAI 或原生请求里的采样字段，在哪里被规范化成内部 `SamplingParams`。
-2. JSON schema、regex、tool/reasoning 等约束，为什么可能让请求先排队而不是马上进 batch。
-3. 一个 decode step 中，logits 会按什么顺序经历 penalty、grammar mask、logit bias、greedy 或随机采样。
+2. JSON schema、regex，以及由 tool/reasoning 派生的约束，为什么可能让请求先排队而不是马上进 batch。
+3. 一个 decode step 中，logits 会按什么顺序经历 penalty、grammar mask、logit bias、custom processor、greedy 或概率采样。
 
 ## 源码主线
 
@@ -33,8 +33,11 @@ SamplingParams
   -> SamplingBatchInfo
   -> ModelRunner._preprocess_logits
   -> Sampler.forward
-  -> BatchResultProcessor advances grammar and penalties
+  -> BatchResultProcessor commits token / advances grammar
+  -> ScheduleBatch prepares the next step's penalty state
 ```
+
+这不是每个请求都严格经过的单线：无 grammar 的请求跳过编译队列；speculative decode 在 verify 后一次提交多个 token；overlap 调度会提前快照 penalty；Ascend、RL on-policy 和普通 CUDA/CPU 采样也会在 `Sampler` 内部分叉。
 
 `SamplingParams` 是第一站。它把 API 字段和内部字段放在同一个结构里，但 `stop`、`stop_regex` 这类 API alias 会在 normalize 后清掉。
 
@@ -110,3 +113,5 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
 | `Sampler.forward` | 从 logits 选择下一 token |
 
 如果你从 OpenAI API 读过来，要注意边界：OpenAI handler 只负责把 `response_format` 等字段翻译进 `sampling_params`；Sampling 专题解释的是这些内部参数怎样真正改变 logits 和 token 选择。
+
+再记住两个反直觉边界：`temperature=0` 不是把 logits 除以零，而是在 `SamplingParams.__post_init__` 中改写为 `temperature=1.0、top_k=1`；`sampling_seed` 只有服务器开启 deterministic inference 后才会变成 batch tensor，且不同 backend 的支持范围并不相同。

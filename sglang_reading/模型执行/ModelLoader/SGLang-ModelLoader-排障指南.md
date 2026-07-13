@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # ModelLoader · 排障指南
 
@@ -21,11 +21,11 @@ updated: 2026-07-10
 |------|--------|----------|
 | `Cannot find any model weights` | `_prepare_weights` | 文件后缀、allow pattern、safetensors index 过滤 |
 | `Unexpected extra config keys` | `DefaultModelLoader.__init__` | 当前 loader 是否接受这个 extra config |
-| 某个 TP rank OOM 或 shape mismatch | `param.weight_loader` | 分片是否在参数写入时 narrow |
+| 某个 TP rank OOM 或 shape mismatch | 当前 loader 的 rank-local 协议 | 是全量、presharded、iterator 内切片、rank state 还是 direct transfer |
 | `Parameter not found in params_dict` | 模型类 `load_weights` | checkpoint name 是否被 remap、跳过或落空 |
 | `remote_instance` 没走远端 | `ServerArgs._handle_load_format` | 配置不完整会回退到 `auto` |
 | 量化模型加载后输出异常 | `load_weights_and_postprocess` | `quant_method.process_weights_after_loading` 是否执行 |
-| 热更新失败后状态不清楚 | `update_weights_from_disk` | 磁盘更新失败会尝试回滚，distributed/tensor 更新失败可能部分写入 |
+| 热更新失败后状态不清楚 | `update_weights_from_disk` | 所有原地更新都按可能部分写入处理；现有“rollback”不证明恢复旧 checkpoint |
 
 ## Q1：找不到权重时，先查文件模式，不要查模型类
 
@@ -88,9 +88,9 @@ updated: 2026-07-10
 
 判断方法：先确认 factory 实际返回哪个 loader，再确认该 loader 的 `__init__` 接受哪些 key。不要把 `model_loader_extra_config` 当作所有 loader 共享的自由字典。
 
-## Q3：TP 分片不是 `_prepare_weights` 做的
+## Q3：TP/rank-local 化到底在哪里发生？
 
-文件 iterator 读出的是 checkpoint tensor。TP rank 的切片在参数自己的 `weight_loader` 里做，以 `RowParallelLinear` 为例，`start_idx = tp_rank * shard_size`。
+没有一个对所有 loader 都成立的位置。普通 HF 全量 tensor + `RowParallelLinear` 的基线是在 parameter loader 中以 `start_idx = tp_rank * shard_size` narrow：
 
 ```python
 # 来源：python/sglang/srt/layers/linear.py L1448-L1487
@@ -136,7 +136,9 @@ updated: 2026-07-10
         param_data.copy_(loaded_weight)
 ```
 
-验证方法：断点放在对应 layer 的 `weight_loader`，观察 `self.tp_rank`、`param_data.shape`、`loaded_weight.shape`。如果这里 assert 失败，回头查模型参数定义和 checkpoint tensor 形状，而不是查 HF 下载。
+源码条件同时给出了反例：BitsAndBytes 4bit 和 `use_presharded_weights` 会跳过二次 narrow。ShardedState 直接读 rank 文件；Remote KV 可调用 `weight_iterator(rank)`；BitsAndBytes 非预量化会在 iterator 内切片；RemoteInstance 直接广播/写入已初始化参数。
+
+验证方法：先打印 loader 类型和 tensor 在进入模型前的 shape，再看 parameter 上的 `use_presharded_weights`/quant 属性。目标不是找到某个固定切片函数，而是证明该 tensor 恰好完成一次 rank-local 化。普通 linear 的 `self.tp_rank` 默认来自运行时 `get_parallel()`，不要误认为由 `LoadConfig.tp_rank` 注入。
 
 ## Q4：名字不匹配时，先读模型类 `load_weights`
 
@@ -208,7 +210,7 @@ Llama 类模型会改写 scale 名、跳过 rope cache、跳过部分 vision tow
 
 判断方法：如果日志里有 `Parameter <name> not found in params_dict`，先把原始 checkpoint name 按这段规则手算一遍。若手算后仍不在 `params_dict`，再看模型结构是否和 checkpoint 架构一致。
 
-## Q5：多线程加载只影响读盘，不改变写入语义
+## Q5：为什么用了 generator，CPU 内存仍然很高？
 
 `_get_weights_iterator` 决定 safetensors、fastsafetensors、PT、NPCACHE 和多线程路径。无论走哪个 iterator，输出都仍是 `(name, tensor)`。
 
@@ -296,9 +298,11 @@ Llama 类模型会改写 scale 名、跳过 rope cache、跳过部分 vision tow
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 ```
 
-验证方法：如果开启多线程后加载更慢，观察磁盘、NFS、CPU 和 page cache；如果开启后 shape mismatch，根因不在多线程本身，而在同一批 tensor 进入模型后的名字或 shape。
+generator 只定义迭代接口，不保证常数内存。mmap safetensors 可按 key 获取；`disable_mmap` 整文件读取；buffered 多线程维持 `max_workers + 1` shard 窗口；PT 多线程会为全部文件提交 future；page-cache prefetch 又由本机 ranks 分摊后台读取。
 
-## Q6：量化后处理是加载主线的最后一道门
+验证方法：同时记录 shard size、`num_threads`、mmap、prefetch、drop-cache、RSS 与 page cache。多线程通常不改变名字语义，但会显著改变在途 shard 数、完成顺序和 CPU/page-cache 峰值。
+
+## Q6：参数已 copy，为什么模型仍不可执行？
 
 权重 copy 完不等于量化模型可执行。loader 会遍历所有 module，调用量化方法的 `process_weights_after_loading`。
 
@@ -316,11 +320,13 @@ Llama 类模型会改写 scale 名、跳过 rope cache、跳过部分 vision tow
                     quant_method.process_weights_after_loading(module)
 ```
 
-验证方法：量化模型加载后 logits 异常或 kernel 报 dtype/layout 错时，确认对应 module 有 `quant_method`，并在这一行断点看后处理是否执行。CPU offload 场景还要确认参数是否在 `device_loading_context` 内临时搬到目标设备。
+这张卡证明默认路线的 quant process。还要区分模型级 `post_load_weights`：绕过 `model.load_weights` 的 Dummy、ShardedState、RemoteInstance、Remote KV 等路线需要显式调用。前者常做 repack/quantize/layout，后者补模型派生状态；KV scale 又是第三条完成轨。
+
+验证方法：量化模型异常时，分别确认 module quant process、model post-load fixup、KV scale 是否由当前 loader 路线负责。CPU offload 还要观察 `device_loading_context` 在 parameter 被替换或改变 storage 后如何恢复。
 
 ## Q7：热更新失败的风险取决于入口
 
-从磁盘热更新失败时，代码会重新构造 iterator 并尝试把原模型再加载回来；分布式和 tensor 更新失败时，错误消息提示可能已经部分写入，需要丢弃整套权重或重启恢复。
+从磁盘热更新失败时，日志声称回滚原权重，但代码在更新前已经把 `self.model_config.model_path` 改成目标路径；异常后又用同一个目标配置重建 iterator。
 
 ```python
 # 来源：python/sglang/srt/model_executor/model_runner.py L1854-L1858
@@ -331,7 +337,9 @@ Llama 类模型会改写 scale 名、跳过 rope cache、跳过部分 vision tow
                 return False, message
 ```
 
-这段源码里有一个容易忽略的不变量：回滚也依赖同一个 `get_weight_iter` 能再次读到可用权重。如果底层文件被替换到一半，回滚也可能失败。生产排障时要保留原 checkpoint 目录的原子性。
+因此这段只能证明“再次尝试装载目标 checkpoint”，不能证明恢复旧权重。第一次 `model.load_weights` 还可能已经部分改写参数。分布式/tensor 更新同样没有事务提交。
+
+生产处置：失败实例应先隔离；若要求原子切换，应保留旧模型副本/备用实例或显式版本化恢复。不要根据返回字符串继续把该实例视为旧权重一致状态。
 
 ## 小结
 
@@ -340,5 +348,5 @@ Llama 类模型会改写 scale 名、跳过 rope cache、跳过部分 vision tow
 1. `ServerArgs` 最终把 `load_format` 改成了什么。
 2. `_prepare_weights` 找到的是哪些文件。
 3. iterator 产出的 `(name, tensor)` 是否符合模型类 `load_weights` 的名字规则。
-4. 参数 `weight_loader` 是否按当前 TP rank 得到正确 shape。
-5. 量化后处理和运行时热更新是否完成到一致状态。
+4. 当前路线在哪里完成 rank-local 化，是否漏切或重切。
+5. quant process、model fixup、KV scale 和热更新失败一致性是否闭合。

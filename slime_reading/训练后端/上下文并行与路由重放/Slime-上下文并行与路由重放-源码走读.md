@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 上下文并行与路由重放 · 源码走读
 
@@ -69,7 +69,7 @@ flowchart TD
 设计选择：`get_batch` 保留 `unconcat_tokens`，然后根据 `allgather_cp` 选择 contiguous global chunk 或 zigzag `slice_with_cp`。同时把 `loss_masks` pad 到 token 流坐标，再按相同 CP 方式切分。
 
 ```python
-# 来源：slime/backends/megatron_utils/data.py L63-L148
+# 定位骨架（基于 slime/backends/megatron_utils/data.py L63-L148；拼接两种 CP layout 与 mask 对齐主干）
 batch["unconcat_tokens"] = tokens
 cp_size = mpu.get_context_parallel_world_size()
 cp_rank = mpu.get_context_parallel_rank()
@@ -96,6 +96,8 @@ for loss_mask, total_length, response_length in zip(...):
 - zigzag CP 的 `cu_seqlens` 乘 `cp_size`，因为 THD packed API 需要逻辑序列长度。
 - allgather-CP 是全局拼接后再 chunk，`cu_seqlens` 保持全局坐标。
 
+这里的 `cu_seqlens` 描述全局拼接流，而当前 rank 的 `tokens` 已是 contiguous local chunk；不要把 metadata 坐标和 tensor 所有权混成一个空间。logprob/value 产出后还会经 `_allgather_cp_redistribute` 转成每样本 zigzag-local response list。
+
 失败模式：如果 `full_loss_masks.shape != tokens.shape`，先看这段 pad 和 slice 是否与 `tokens` 同步。
 
 ## 2. offset 函数定义 CP 下的 response 位置
@@ -105,7 +107,7 @@ for loss_mask, total_length, response_length in zip(...):
 设计选择：`get_logits_and_tokens_offset_with_cp` 以完整 prompt+response 为原点，先算 rank 的两段 chunk，再与 logits response 区间求交。
 
 ```python
-# 来源：slime/backends/megatron_utils/cp_utils.py L9-L44
+# 定位骨架（基于 slime/backends/megatron_utils/cp_utils.py L9-L44；省略空区间归零）
 prompt_length = total_length - response_length
 chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
 chunk_0 = (cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
@@ -119,7 +121,7 @@ return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
 `slice_log_prob_with_cp` 用同一套 offset 把 full response logprob 切成本地两段。
 
 ```python
-# 来源：slime/backends/megatron_utils/cp_utils.py L320-L344
+# 定位骨架（据 `slime/backends/megatron_utils/cp_utils.py` L320-L344 删节）：
 prompt_length = total_length - response_length
 _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
 chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
@@ -135,7 +137,7 @@ chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][
 设计选择：`all_gather_with_cp` 根据本 rank 的两段 logits offset，把本地 tensor pad 到 full response 形状；由于 rank 间有效区间不重叠，`dist.nn.all_reduce(sum)` 等价于 gather。
 
 ```python
-# 来源：slime/backends/megatron_utils/cp_utils.py L235-L284
+# 定位骨架（基于 slime/backends/megatron_utils/cp_utils.py L235-L284；压缩四种 chunk 分支）
 chunk_0 = tensor[: logits_offset[0][1] - logits_offset[0][0]]
 chunk_1 = tensor[logits_offset[0][1] - logits_offset[0][0] :]
 ...
@@ -150,6 +152,8 @@ return full_tensor
 
 这不是普通 `all_gather` API，因为它要保留 autograd 路径，并把不连续 CP chunk 放回正确 response 位置。
 
+调用契约仍需外部证明：函数只显式检查第二段长度和最终 full 长度，没有验证传入 tensor 第一维恰好等于两段 offset 长度之和；空 rank 的零叶子保证 collective backward 可达，但不证明字段语义正确。
+
 ## 4. loss reducer 保持 CP/DP 数值等价
 
 系统压力：每个 CP rank 只贡献局部分子，但日志和梯度应等价于没有 CP 时的完整样本。尤其 compact/subagent 场景下，一个 rollout 的 sibling samples 可能跨 micro-batch。
@@ -157,7 +161,7 @@ return full_tensor
 设计选择：`get_sum_of_sample_mean` 在 CP 分支用本地 mask 切片算局部分子，分母使用上游传入的完整 `sample_denoms`；`reduce_train_step_metrics` 再跨 DP*CP all-reduce。
 
 ```python
-# 来源：slime/backends/megatron_utils/cp_utils.py L47-L124
+# 定位骨架（基于 slime/backends/megatron_utils/cp_utils.py L47-L124；摘取 denominator 与 CP reducer 主干）
 if sample_denoms is None:
     sample_denoms = [m.sum() for m in loss_masks]
 ...
@@ -175,7 +179,7 @@ def sum_of_sample_mean(x):
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/cp_utils.py L127-L168
+# 定位骨架（基于 slime/backends/megatron_utils/cp_utils.py L127-L168；省略 docstring 与局部累加细节）
 for x in losses_reduced:
     values = x["values"] if values is None else values + x["values"]
 dist.all_reduce(values, group=dp_with_cp_group)
@@ -191,6 +195,8 @@ return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(key
 
 验证入口：`tests/test_cp_utils.py` 用 sibling samples 跨 micro-batch 的例子证明 denom 必须来自 whole step。
 
+这些 reducer 仍大量使用 `zip(strict=False)`。测试证明了给定正确、等长输入时的数值不变量；它没有把列表覆盖集校验内建进生产函数。
+
 源码入口：来源：tests/test_cp_utils.py L64-L176
 
 ## 5. rollout engine 把 routed experts 带回来
@@ -200,13 +206,13 @@ return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(key
 设计选择：SGLang server args 和 rollout payload 都在 `use_rollout_routing_replay` 时开启 routed expert 返回。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L625-L627
+# 来源：slime/backends/sglang_utils/sglang_engine.py L625-L626
 if args.use_rollout_routing_replay:
     kwargs["enable_return_routed_experts"] = True
 ```
 
 ```python
-# 来源：slime/rollout/sglang_rollout.py L174-L182
+# 定位骨架（据 `slime/rollout/sglang_rollout.py` L174-L182 删节）：
 payload = {
     "sampling_params": sampling_params,
     "return_logprob": True,
@@ -226,7 +232,7 @@ if args.use_rollout_routing_replay:
 设计选择：`fill_routing_replay` 读取 `rollout_routed_experts`，先补最后一个 token，再 `slice_with_cp`，再按 sequence parallel 切 TP 局部段，最后按 MoE layer 顺序写入每个 `RoutingReplay`。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L284-L360
+# 定位骨架（基于 slime/backends/megatron_utils/actor.py L284-L360；省略 iterator reset、layer offset 与 dense-layer 过滤）
 if "rollout_routed_experts" not in rollout_data:
     raise ValueError("rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set.")
 ...
@@ -243,6 +249,8 @@ RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_exp
 
 不变量：这里的 CP 切片必须和 `get_batch` 一致，否则 replay shape 可能过关，但 token 与 expert 路径已经错位。
 
+当前实现恰好暴露一个未封口组合：这里无条件调用 zigzag `slice_with_cp`，而 `get_batch(allgather_cp=True)` 使用全局 contiguous chunk；参数校验没有禁止两者同开。因此 allgather-CP + rollout routing replay 目前只能视为未证明兼容。
+
 ## 7. stage 编排由 actor 和 model 共同完成
 
 系统压力：ref/teacher forward 应该正常 routing；actor old logprob 和 policy backward 才需要 record/replay。Megatron training forward 内部还会临时设置 `replay_forward`，以配合后续 backward 游标。
@@ -250,7 +258,7 @@ RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_exp
 设计选择：actor 负责高层 stage，model training forward 负责在 forward body 内临时切换。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L436-L539
+# 定位骨架（基于 slime/backends/megatron_utils/actor.py L436-L539；拼接 ref/teacher、old actor、train 与清理阶段）
 if self.args.use_rollout_routing_replay:
     self.fill_routing_replay(...)
 ...
@@ -272,7 +280,7 @@ if self.args.use_routing_replay:
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/model.py L602-L638
+# 定位骨架（基于 slime/backends/megatron_utils/model.py L602-L638；省略 forward kwargs 与 schedule-plan 分支）
 if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
     old_stage = os.environ["ROUTING_REPLAY_STAGE"]
     os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -286,6 +294,8 @@ return output_tensor, partial(loss_function, args, batch, num_microbatches, step
 
 读者抓手：`forward_only` 自身不设置 stage；actor 在调用前设置。training forward 会临时切 `replay_forward`，然后恢复原 stage，让 backward 使用 `replay_backward`。
 
+这套恢复不是事务性的：model 的 stage 恢复、actor step 末尾的 `clear_all()` 都没有统一 `try/finally`。forward、loss 或 backward 抛异常时，环境变量、两个游标和 buffer 可能留在中间态，下一 step 不能直接复用该 worker 而不审计/重建状态。
+
 ## 8. compute_topk wrapper 固定 expert ids，但保留当前梯度
 
 系统压力：replay 必须固定 expert 路径，但不能冻结当前 router scores 的梯度。
@@ -293,7 +303,7 @@ return output_tensor, partial(loss_function, args, batch, num_microbatches, step
 设计选择：`replay_forward` / `replay_backward` 从 buffer 取 `top_indices`，然后用当前 `scores.gather(1, top_indices)` 取概率。
 
 ```python
-# 来源：slime/utils/routing_replay.py L13-L92
+# 定位骨架（基于 slime/utils/routing_replay.py L13-L92；拼接 buffer、wrapper 与 pre-hook 主干）
 class RoutingReplay:
     def record(self, top_indices):
         buf = torch.empty_like(top_indices, device="cpu", pin_memory=True)
@@ -311,6 +321,8 @@ elif routing_replay_stage == "replay_backward":
 
 `register_routing_replay` 通过 forward pre-hook 把当前 module 的 replay buffer 放到全局指针上，供 patched `compute_topk` 使用。
 
+这个指针是进程级全局变量，不是线程局部或 context-local；正确性依赖 module pre-hook 后紧接该 module 的 `compute_topk`。未知 stage 没有显式 `else` 抛错，空 buffer/游标越界则以底层索引错误暴露。
+
 源码入口：来源：slime/utils/routing_replay.py L85-L92
 
 ## 运行验证
@@ -322,19 +334,20 @@ elif routing_replay_stage == "replay_backward":
 CP reducer CPU 验证：
 
 ```powershell
-python -m pytest slime/tests/test_cp_utils.py
+Set-Location slime
+python -m pytest tests/test_cp_utils.py
 ```
 
 top-p mask 与 CP response row 对齐：
 
 ```powershell
-python -m pytest slime/tests/test_logprob_response_spans.py
+python -m pytest tests/test_logprob_response_spans.py
 ```
 
 CP loss/grad 等价：
 
 ```powershell
-python -m pytest slime/tests/test_loss_cp_invariance.py
+python -m pytest tests/test_loss_cp_invariance.py
 ```
 
 如果当前 Windows 环境在导入 `torch.compile` 时失败，可以先把这些命令作为 Linux/GPU CI 验证入口；文档审计仍应本地通过。
@@ -346,3 +359,5 @@ python -m pytest slime/tests/test_loss_cp_invariance.py
 - reducer 的分子可以 local，分母必须来自完整 rollout。
 - RoutingReplay 固定 expert ids，不固定 router scores。
 - actor 是 replay stage 生命周期的编排者，`routing_replay.py` 只是底层状态机。
+- allgather-CP 与 rollout replay 目前缺少同布局实现和组合门禁，不能由“单项都存在”推导出组合受支持。
+- replay stage、全局指针、双游标和 buffer 没有统一回滚，异常后必须显式检查。

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # SGLang-Engine · 源码走读
 
@@ -82,7 +82,7 @@ sequenceDiagram
 设计选择：`start_rollout_servers` 先分 external 与本地模式；本地模式解析 `SglangConfig`，每个 model 启动自己的 router，再为每个 group 累积 `gpu_offset` 和 `engine_offset`。
 
 ```python
-# 来源：slime/ray/rollout.py L1089-L1128
+# 定位骨架（据 `slime/ray/rollout.py` L1089-L1128 删节）：
 def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
     if args.rollout_external:
         return start_external_rollout_servers(args, start_router=_start_router)
@@ -122,7 +122,7 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
 设计选择：从 Placement Group 的 `reordered_gpu_ids` 取 `base_gpu_id`，Ray actor 只申请少量 GPU 占位，实际 SGLang GPU 绑定交给 `ServerArgs.base_gpu_id`。
 
 ```python
-# 来源：slime/ray/rollout.py L154-L216
+# 定位骨架（据 `slime/ray/rollout.py` L154-L216 选取创建主干）：
 num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
 pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
@@ -207,7 +207,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 ```
 
 ```python
-# 来源：slime/ray/rollout.py L989-L1009
+# 定位骨架（据 `slime/ray/rollout.py` L989-L1009 删节）：
 for i in range(num_engines_on_this_node):
     current_rank = rank + i
     addr_and_ports.setdefault(current_rank, {})
@@ -244,7 +244,7 @@ else:
 设计选择：`init` 先格式化 host 和 `dist_init_addr`，再调用 `_compute_server_args`，最后按 local/external 分支初始化。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L119-L169
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L119-L169 删节）：
 def init(
     self,
     dist_init_addr,
@@ -303,6 +303,10 @@ def init(
 - `rsplit(":", 1)` 说明端口只从末尾切，IPv6 地址主体可以包含冒号。
 - `self.node_rank` 决定后续是否发 HTTP 控制请求。
 - local 和 external 都会调用 `_register_to_router`，只是 server 进程来源不同。
+
+external 的 sanity check 不能从这里被读成“完整 ServerArgs 对等”：待检查字段在 `_compute_server_args` 合入通用 `sglang_*` 与 YAML overrides 之前就已固定，且 topology、地址、并行尺寸等大量字段在 skip list 中。
+
+external 还有 rank 复用风险：构造器给每个公开地址传递 `rank=enumerate(infos)`，这里再以 `rank % nnodes` 得出 `node_rank`。当 `num_gpus_per_engine` 跨节点且地址数大于一时，后续地址 adapter 可能不是 node 0，因而 `_register_to_router` 与 `_make_request` 早退。它需要多 external × 多节点的专门测试。
 
 ### 5. 本地模式启动 SGLang 子进程并等 node 0 health
 
@@ -368,6 +372,7 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
 
 - server 子进程提前退出，`_wait_server_healthy` 会抛异常，Ray `init` ref 失败。
 - node 0 没有健康响应，`ray.get(init_handles)` 会卡在初始化阶段。
+- 健康循环没有总超时，`session.get` 也没传 timeout；子进程一直存活但端点永久不健康时，不是“等 60 秒失败”，而是可能无限等待。
 - 非 node 0 不等待 HTTP health，这不是缺失检查，而是多节点 server 的控制面边界。
 
 ### 6. router 注册随版本和 worker type 分叉
@@ -419,10 +424,10 @@ def _register_to_router(self, server_args_dict):
 
 系统压力：多模型场景可能有 reference/reward/frozen 模型，训练权重只应该推给 `update_weights=True` 的模型。
 
-设计选择：`RolloutManager.get_updatable_engines_and_lock` 返回第一组可更新 server 的 node 0 engines、GPU 计数、GPU offset、所有 actor 以及共享 lock。
+设计选择：`RolloutManager.get_updatable_engines_and_lock` 返回第一组可更新 server 的控制面 engines、GPU 计数、GPU offset、`all_engines` 以及共享 lock。managed 多节点下前者是 node 0、后者含各节点；external 下通常都是一公开地址一 adapter，不代表外部 server 的每个 host。
 
 ```python
-# 来源：slime/ray/rollout.py L511-L540
+# 定位骨架（据 `slime/ray/rollout.py` L511-L540 删节）：
 def _get_updatable_server(self) -> Any | None:
     """Return the server with ``update_weights=True``.
 
@@ -446,8 +451,8 @@ def get_updatable_engines_and_lock(self):
 
 执行逻辑：
 
-- `engines` 是 node 0 控制面 actor 列表，适合发 HTTP 更新命令。
-- `all_engine_actors` 给 disk delta 这类“每台 host 都要应用本地 checkpoint”的路径使用。
+- managed 模式的 `engines` 是 node 0 控制面 actor 列表，适合发 HTTP 更新命令。
+- managed 模式的 `all_engine_actors` 可给 disk delta 做“每台 host 应用本地 checkpoint”；external construction 不会自动产生每 host adapter，因此不能外推该保证。
 - `rollout_engine_lock` 防止多个 bucket 同时触发 distributed broadcast。
 
 ### 8. Megatron actor 决定是否重连 engine
@@ -457,7 +462,7 @@ def get_updatable_engines_and_lock(self):
 设计选择：`MegatronTrainRayActor` 从 rollout manager 拉取最新 engine 集合；只要 `num_new_engines > 0` 或需要重连，就调用 weight updater 的 `connect_rollout_engines`。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L592-L620
+# 定位骨架（据 `slime/backends/megatron_utils/actor.py` L592-L620 删节）：
 (
     rollout_engines,
     rollout_engine_lock,
@@ -496,7 +501,7 @@ if num_new_engines > 0 or reconnect_rollout_engines:
 设计选择：训练 rank 0 加全部 engine GPU 构成一个 NCCL group；`init_weights_update_group` 通过 HTTP 让 SGLang 子进程 join；后续每个 bucket 先发 metadata，再由训练 rank 0 `dist.broadcast` tensor。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L268-L314
+# 定位骨架（据 `slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py` L268-L314 删节）：
 def connect_rollout_engines_from_distributed(
     args: Namespace,
     group_name: str,
@@ -561,14 +566,14 @@ rank 布局例子：
 | 2 个 TP=2 engine | `[2, 2]` | 5 | 0 是 Megatron，1-2 是 engine0，3-4 是 engine1 |
 | prefill TP=2 + decode TP=4 | `[2, 4]` | 7 | 0 是 Megatron，1-2 是 prefill，3-6 是 decode |
 
-### 10. update 前后必须暂停流量并清空 cache
+### 10. distributed updater 的 pause/flush/update/continue
 
 系统压力：decode 中的请求和权重 reload 同时发生，会让 logits、KV cache 和 NCCL 接收状态都变得不可解释。
 
-设计选择：distributed、tensor、disk、delta 路径都在 rank 0 上先 `pause_generation`，再 `flush_cache`，权重更新完成后 `continue_generation`。
+设计选择：本节的 distributed updater 在 rank 0 上维护 pause/flush/update/continue 顺序；tensor、disk、delta 和 external 路径应分别回到各自 updater 核对，不能由这一段替它们作证，也不能假设混合拓扑中的所有 engine 都受同一闸门覆盖。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L102-L134
+# 定位骨架（据 `slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py` L102-L134 删节）：
 @torch.no_grad()
 def update_weights(self) -> None:
     self.weight_version += 1
@@ -626,7 +631,7 @@ def flush_cache(self):
 执行逻辑：
 
 - `pause_generation` 阻止新请求进入。
-- `flush_cache` 最多重试 60 秒，pending request 会导致非 200。
+- `flush_cache` 最多尝试 60 轮，pending request 会导致非 200；每次 `requests.get` 没有 timeout，因此总时长不受 60 秒硬上限约束，单次连接也可能卡住。
 - barrier 保证训练各 rank 在同一个更新阶段。
 
 运行验证：日志中应该看到 pause/flush 先于 `Update weights` 进度；如果 `Timeout while flushing cache` 出现，先查是否有长尾请求未 abort 或 router 仍在派发。
@@ -638,7 +643,7 @@ def flush_cache(self):
 设计选择：`update_weights_from_distributed` 先向每个 engine actor 发 remote；actor 把 metadata POST 给 SGLang；训练 rank 0 同步 broadcast 每个 tensor。
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L326-L355
+# 定位骨架（据 `slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py` L326-L355 删节）：
 def update_weights_from_distributed(
     group_name: str,
     group: dist.ProcessGroup,
@@ -708,7 +713,7 @@ def update_weights_from_distributed(
 系统压力：部署形态不同，最佳传输介质不同。SGLangEngine 通过统一 HTTP 控制面暴露多条路径，让训练侧根据配置选择。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L278-L301
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L278-L301 删节）：
 def update_weights_from_tensor(
     self,
     serialized_named_tensors: list[str],
@@ -730,7 +735,7 @@ def update_weights_from_tensor(
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L415-L437
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L415-L437 删节）：
 def update_weights_from_disk(
     self,
     model_path: str,
@@ -759,7 +764,7 @@ def update_weights_from_disk(
 
 系统压力：delta 文件需要在每个 host 的本地 checkpoint 上应用；node 0 actor 只代表 HTTP 控制面，不代表所有 host 的本地文件系统。
 
-设计选择：disk delta updater 保存 `all_engine_actors`，在 reload 前对每个 host 调 `sync_local_checkpoint`，然后只对 node 0 engines 发 `update_weights_from_disk`。
+设计选择：disk delta updater 保存 `all_engine_actors`，在 reload 前对每个 managed host actor 调 `sync_local_checkpoint`，然后只对控制面 engines 发 `update_weights_from_disk`。
 
 ```python
 # 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L60-L72
@@ -779,7 +784,7 @@ def connect_rollout_engines(
 ```
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py L172-L185
+# 定位骨架（据 `slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py` L172-L185 删节）：
 dist.barrier(group=get_gloo_group())
 if dist.get_rank() == 0:
     ray.get([actor.sync_local_checkpoint.remote(self.weight_version) for actor in self.all_engine_actors])
@@ -795,7 +800,7 @@ if dist.get_rank() == 0:
     ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
 ```
 
-读者抓手：多节点 delta reload 出现某些节点旧权重时，先检查 `all_engine_actors` 是否覆盖每个 host，而不是只看 `rollout_engines`。
+读者抓手：managed 多节点 delta reload 出现某些节点旧权重时，先检查 `all_engine_actors` 是否覆盖每个 host，而不是只看 `rollout_engines`。external 模式的一地址一 adapter 不自动满足这个前提，必须由部署方式证明共享挂载或另建 host-local actor。
 
 ---
 
@@ -828,7 +833,7 @@ def resume_memory_occupation(self, tags: list[str] = None):
 系统压力：异步 rollout 可能已有请求排队或运行；只靠 `/flush_cache` 会等到超时。`server_control` 提供主动 abort 并轮询 `/v1/loads` 的工具。
 
 ```python
-# 来源：slime/backends/sglang_utils/server_control.py L43-L67
+# 定位骨架（据 `slime/backends/sglang_utils/server_control.py` L43-L67 删节）：
 async def abort_server_until_idle(url: str, retry_interval: int = ABORT_RETRY_INTERVAL_SECONDS) -> None:
     attempt = 1
     while True:
@@ -857,12 +862,14 @@ async def abort_servers_until_idle(urls: list[str]) -> None:
 
 注意：拿不到 load 时函数会记录 warning 后返回，不会无限重试。调用方仍要用后续验证判断 server 是否真的空闲。
 
-### 16. shutdown 只清理本地 engine，external 模式不杀进程
+### 16. shutdown 只清理本地 engine，external 模式连 router 注销也跳过
 
-系统压力：本地 SGLang 子进程由 Slime 创建，Slime 应负责 router 移除和进程树清理；external engine 由外部系统管理，Slime 不能杀。
+系统压力：本地 SGLang 子进程由 Slime 创建，Slime 应负责 router 移除和进程树清理；external engine 由外部系统管理，当前实现从函数入口直接返回。
+
+这意味着 external `shutdown()` 不只“不 kill”：它也不会执行后面的 router worker 删除逻辑。若 Slime router 仍存活，外层生命周期必须负责停 router 或移除陈旧 worker，不能把清理责任算在 adapter 上。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L334-L361
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L334-L361 合并分支）：
 def shutdown(self):
     if self.args.rollout_external:
         return
@@ -902,7 +909,7 @@ def shutdown(self):
 系统压力：权重更新是否真的生效、性能瓶颈在哪里，都需要跨进程可观测入口。
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L363-L378
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L363-L378 删节）：
 def get_weight_version(self):
     if self.node_rank != 0:
         return
@@ -916,7 +923,7 @@ def set_weight_version(self, new_version: str):
 ```
 
 ```python
-# 来源：slime/backends/sglang_utils/sglang_engine.py L519-L550
+# 定位骨架（据 `slime/backends/sglang_utils/sglang_engine.py` L519-L550 删节）：
 def start_profile(
     self,
     output_dir: str | None = None,
@@ -952,12 +959,14 @@ def start_profile(
 - CI 检查里随机挑一个 rollout engine 比较 `get_weight_version` 和 updater version。
 - 性能问题可以用 profile 端点触发 SGLang 侧 profiler，再对照 rollout metrics。
 
+当前轻量验证：empty colocated bucket 测试 2 passed；`test_external_sglang_engines.py` 直接 collection 缺 `httpx`，只 stub 未被该测试使用的 HTTP client 类型后原测试 4 passed。从当前源码 AST 额外检查 6 项并通过：健康等待无限循环且 GET 无 timeout、external shutdown 提前返回、external check-list 早于通用参数/overrides、flush 60 轮但 GET 无 timeout、并行/地址字段位于 skip list，以及 external 地址序号复用为 node-rank 输入。真实 server 启动、router 注册和权重数据通道仍待完整环境。
+
 ---
 
 ## 复盘
 
 1. `SGLangEngine` 的主价值不是推理，而是把 SGLang server 变成 Ray 可控资源。
 2. node 0 actor 是 HTTP 控制面代表；所有节点是否参与数据通道要看 SGLang 内部分布式或 `all_engine_actors`。
-3. 权重同步的正确顺序是 pause、flush、metadata、数据通道、load 完成、continue。
+3. distributed 权重同步的顺序是 pause、flush、metadata、数据通道、load 完成、continue；其他 updater 的正确性要按各自 writer/lock、介质、cache/commit 与版本点判断。
 4. port 名称不能混用：SGLang 推理 `nccl_port` 和权重 update `master_port` 是两条不同通道。
-5. external 模式仍要过 Slime 控制台，只是 server 进程生命周期交给外部系统。
+5. external 模式只接入 Slime 的部分控制面：有限校验、router 注册和服务端点；本地进程、router 注销、recover/offload 与 host-local delta 前提仍属外部部署责任。

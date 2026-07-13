@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Detokenizer
 
@@ -21,9 +21,10 @@ updated: 2026-07-10
 
 - 为什么 detokenize 被放到独立进程，而不是堵在 Scheduler 或 HTTP 协程里。
 - 流式输出里的 `output_strs[i]` 为什么是增量文本，不是全量文本。
+- 为什么 `decode_ids` 是带 surrounding context 的解码窗口片段，`output_ids` 才是客户端 token 增量。
 - `DecodeStatus` 如何处理 UTF-8 边界、stop 裁剪和最终收尾。
 - `skip_tokenizer_init=True` 时为什么主 generate 回路会绕过 Detokenizer。
-- 多 tokenizer worker 和多 detokenizer worker 时，结果如何回到正确的 HTTP worker。
+- 多 tokenizer worker 和多 detokenizer worker 时，结果如何回到正确的 HTTP worker，以及为什么亲和键是比 rid 更粗的 `http_worker_ipc`。
 
 ## 模块位置
 
@@ -67,7 +68,7 @@ flowchart LR
 
 ## 先抓住一句话
 
-Detokenizer 的核心不是调用 `tokenizer.decode`，而是在独立进程里维护一个可恢复的流式解码状态机：token 边界、字符串边界、已发送边界三者必须一起对齐。
+Detokenizer 的核心不是调用一次 `tokenizer.decode`，而是在独立进程里维护一个可恢复的流式解码状态机：解码窗口、已提交字符串、已发送字符串三条边界必须一起对齐。它产出的 `output_strs` 永远是内部文本 delta；客户端最终看到 delta 还是累积全文，还要由 TokenizerManager 的 `incremental_streaming_output` 策略决定。
 
 ## 与相邻专题的边界
 

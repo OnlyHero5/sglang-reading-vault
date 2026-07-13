@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 训练与Rollout参数 · 数据流
 
@@ -77,10 +77,11 @@ flowchart TB
     N["n_samples_per_prompt<br/>同 prompt 多 response"]
     VALID["有效 rollout data<br/>rollout_batch_size groups"]
     ALL["all_data<br/>含被 filter 观察到的 group"]
-    TRAIN["train_data<br/>按 sample 展开"]
-    GBS["global_batch_size<br/>训练步消费样本数"]
+    TRAIN["train_data<br/>按 Sample 行展开"]
+    RID["rollout_id groups<br/>execution 计数"]
+    GBS["global_batch_size<br/>每步 rollout 数"]
 
-    PROMPT --> N --> VALID --> TRAIN --> GBS
+    PROMPT --> N --> VALID --> TRAIN --> RID --> GBS
     N --> ALL
 ```
 
@@ -90,9 +91,9 @@ flowchart TB
 |----------|------|
 | `rollout_batch_size` | 本轮要保留多少 prompt group |
 | `n_samples_per_prompt` | 每个 prompt group 内生成多少 response |
-| `rollout_batch_size * n_samples_per_prompt` | 本轮有效训练 sample 数 |
-| `num_steps_per_rollout` | 用几步训练消化本轮 sample |
-| `global_batch_size` | 每步训练消费的 sample 数 |
+| `rollout_batch_size * n_samples_per_prompt` | 默认路径预期的 rollout execution 数；通常也是 Sample 行数，但 compact 时不是 |
+| `num_steps_per_rollout` | 用几步训练消化本轮 rollout execution |
+| `global_batch_size` | 每步训练消费的唯一 rollout id 数 |
 
 validate 的公式是权威来源：
 
@@ -109,7 +110,7 @@ if args.num_steps_per_rollout is not None:
     args.global_batch_size = global_batch_size
 ```
 
-例子：
+下表只适用于默认“一次 execution → 一条 Sample”的路径；compact/subagent 应保持同样的 rollout-id 计数，不能按展开行数重算：
 
 | `rollout_batch_size` | `n_samples_per_prompt` | `num_steps_per_rollout` | `global_batch_size` |
 |----------------------|------------------------|--------------------------|---------------------|
@@ -117,6 +118,8 @@ if args.num_steps_per_rollout is not None:
 | 64 | 4 | 1 | 256 |
 | 64 | 4 | 2 | 128 |
 | 128 | 8 | 4 | 256 |
+
+converter 在展平前验证 compact sibling 的 `rollout_id`，DP scheduler 再把相同 id 的所有 Sample 放在同一个训练 step；因此 Sample 行数可以变化，step 数仍由唯一 id 数决定。
 
 ## 生成流：整条 rollout 与 per-sample generate
 
@@ -273,7 +276,7 @@ elif args.advantage_estimator in ["grpo", "gspo", "cispo"]:
 SGLang 参数会变成 `args.sglang_*`，但 Slime 跳过了自己要管理的字段。
 
 ```python
-# 来源：slime/backends/sglang_utils/arguments.py L88-L115
+# 定位骨架（据 `slime/backends/sglang_utils/arguments.py` L88-L115 删节）：
 if isinstance(item_flag, str) and item_flag.startswith("-"):
     original_flag_stem = item_flag.lstrip("-")  # "foo-bar" from "--foo-bar", or "f" from "-f"
     prefixed_item = f"--sglang-{original_flag_stem}"
@@ -349,7 +352,8 @@ if len(errors) > 0:
 | `tests/plugin_contracts/test_plugin_rollout_contracts.py` | `rollout_function_path` 整条函数契约 |
 | `tests/plugin_contracts/test_plugin_generate_contracts.py` | per-sample custom generate 与 eval 覆盖 |
 | `tests/plugin_contracts/test_plugin_runtime_hook_contracts.py` | runtime hook callsite 和签名 |
-| `tests/test_megatron_argument_validation.py` | validate 推导、HF 校验、delta/disk 约束 |
+| `tests/test_dp_schedule.py` | rollout-id 分步、compact sibling、动态/静态 micro-batch 与尾部裁剪 |
+| `tests/test_megatron_argument_validation.py` | HF/AllGather-CP 校验、zero rollout、delta/disk 约束；不覆盖 batch 公式或 eval 继承 |
 
 contract tests 明确固定了 path 参数的签名：
 
@@ -399,5 +403,7 @@ SYNC_CASES = [
         check_rollout_all_samples_process_path,
     ),
 ```
+
+覆盖边界：runtime hook contract 目前只检查 custom converter 返回旧的最小字段集合，而当前 scheduler 还要求 `rollout_ids`。因此它证明“path 可加载、签名可调用”，不能单独证明自定义 converter 能走完整训练链。
 
 下一篇 [[Slime-训练与Rollout参数-排障指南]] 按症状进入这些流。

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Policy-Loss · 数据流
 
@@ -68,6 +68,8 @@ sequenceDiagram
 
 源码入口：来源：slime/backends/megatron_utils/loss.py L911-L932
 
+这条 fallback 只解决 policy loss 的 old baseline。Advantage 阶段若需要一个零 KL shape template，仍必须先找到 `log_probs`、`rollout_log_probs` 或 critic `values`；两处快路不能互相替代。
+
 ## CP 与 sequence-level 功能
 
 大多数 policy loss 在本地 response chunk 上就能算。两类功能需要完整 response：
@@ -95,7 +97,7 @@ flowchart LR
 `policy_loss_function` 返回的是 detached metrics dict，`loss_function` 把它转换成 Megatron 日志三元组：
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L1300-L1320
+# 定位骨架（基于 slime/backends/megatron_utils/loss.py L1300-L1320；压缩 logging values 构造）
 return (
     loss,
     (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
@@ -116,12 +118,14 @@ return (
 
 源码入口：来源：slime/backends/megatron_utils/model.py L687-L696
 
+`torch.tensor([num_tokens] + list(log.values()))` 会把 detached 日志值重新装入一个新 tensor；这是日志载体，不是反向传播通道。per-rollout-mean 模式把首位留为 `0` 占位，消费者改用常量 `step_global_batch_size`；per-token 模式才让首位携带当前 micro-batch 的 token normalizer。
+
 ## value/SFT 旁路
 
 `loss_type` 决定进入哪条分支：
 
 ```python
-# 来源：slime/backends/megatron_utils/loss.py L1264-L1274
+# 来源：slime/backends/megatron_utils/loss.py L1264-L1272
 match args.loss_type:
     case "policy_loss":
         func = policy_loss_function
@@ -146,6 +150,8 @@ match args.loss_type:
 - `pg_loss` 是逐 token 张量，直到 reducer 之后才是 scalar。
 - mismatch/TIS 指标默认用 pre-RS mask 聚合，防止被修改后的 mask 改变指标分母。
 - allgather-CP 空 shard 也必须保持 autograd 连通，否则可能死锁。
+- `zip(strict=False)` 不会校验样本列表覆盖集；full/current/old/mask/local 列表长度必须在进入 loss 前被证明一致。
+- custom PG reducer 只改变 PG 标量；entropy、clip、`ppo_kl`、reference KL 和 mismatch 指标并不会自动切换到同一口径。
 
 ## 运行验证
 

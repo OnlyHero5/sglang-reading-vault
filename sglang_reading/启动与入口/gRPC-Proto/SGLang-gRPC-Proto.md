@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # gRPC-Proto
 
@@ -32,7 +32,7 @@ updated: 2026-07-10
 
 ## 心理模型
 
-把 gRPC 入口想成一个“跨语言协议闸门”：
+把 Native gRPC 实现想成一个“跨语言协议闸门”。typed RPC 直接把 Proto 字段改写成内部请求；只有 OpenAI-compatible RPC 才把 JSON body 交给既有 serving handler，并在回程解析 SSE。当前 `--grpc-mode` 则是另一条依赖外部 servicer 的 legacy 启动路径，不能套用下面每一个 Rust/PyO3 细节。
 
 ```mermaid
 flowchart LR
@@ -48,7 +48,7 @@ flowchart LR
   T --> C
 ```
 
-这不是独立推理后端。它只把 HTTP 层的 JSON/SSE 换成 Proto/Tonic stream；真正的请求排队、分词、调度、生成和 abort 仍然回到 Python runtime。
+Native gRPC 不是独立推理后端：typed generate/embed 最终构造 `GenerateReqInput` 或 `EmbeddingReqInput`，OpenAI pass-through 则复用 Python serving handler；两路都把模型执行交回 Python runtime。Proto/Tonic 替换的是入口 wire protocol，不是 Scheduler、KV Cache 或模型执行层。
 
 ## 源码范围
 
@@ -108,7 +108,7 @@ def run_server(server_args):
 | 相邻专题 | 衔接点 |
 |----------|--------|
 | [[SGLang-启动链路]] | `ServerArgs.grpc_mode` 如何从 CLI 进入 `run_server` |
-| [[SGLang-HTTP-Server]] | gRPC 最终仍复用 `TokenizerManager.generate_request`，只是入口协议不同 |
+| [[SGLang-HTTP-Server]] | Native typed/OpenAI bridge 最终复用 `TokenizerManager` 以下主线；legacy servicer 的内部实现不能从 Native bridge 反推 |
 | [[SGLang-OpenAI-API]] | Proto 里的 OpenAI-compatible RPC 走 JSON pass-through |
 | [[SGLang-TokenizerManager]] | `RuntimeHandle` 把 typed request 变成 `GenerateReqInput`/`EmbeddingReqInput` 后进入这里 |
 

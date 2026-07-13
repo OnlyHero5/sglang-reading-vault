@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # RadixAttention · 排障指南
 
@@ -85,9 +85,9 @@ updated: 2026-07-10
         return plain if self.extra_key is None else (self.extra_key, plain)
 ```
 
-排查顺序：先比对 system prompt token 序列，再比对 `extra_key`、LoRA id、cache salt、动态模板字段。常见问题是 prompt 模板里含时间戳或 request id。
+排查顺序：先比对 system prompt token 序列，再比对 `extra_key`、LoRA id、cache salt、动态模板字段；随后检查 `Req.init_next_round_input` 是否因 positional embedding override 主动把 match key 置空，以及 `_compute_max_prefix_len` 是否为采样/EAGLE/会话边界保留了不可复用 token。相同 prompt 只是必要条件，不是充分条件。
 
-## Q3：为什么命中长度少了几个 token？
+## Q3：为什么可复用长度与 tree-owned 长度不一样？
 
 `page_size > 1` 时，tree 只接管完整页面。未对齐 tail 会留在 `req.prefix_indices` 或请求私有 KV 中，下一次 unfinished/finished cache 再释放。
 
@@ -120,7 +120,7 @@ updated: 2026-07-10
             )
 ```
 
-验证：打印 `len(radix_key)`、`len(kv_indices)`、`req.cache_protected_len`。如果差值小于 page size，通常是 tail 对齐问题。
+验证：同时打印 `len(radix_key)`、`len(kv_indices)`、`len(req.prefix_indices)`、`req.cache_protected_len`。若 `len(prefix_indices) > cache_protected_len`，多出的部分可供下一 chunk 跳过，但仍由请求私有 slot 持有；只有 `cache_protected_len` 以内能用于判断 duplicate-free 下界。差值小于 page size 时通常是 page tail，EAGLE 还可能额外体现 bigram 的 N→N-1。
 
 ## Q4：EAGLE 模式为什么会差 1？
 
@@ -229,7 +229,7 @@ classic `evict` 的单位是 leaf node，不是单 token。它从 heap 里弹 le
 
 ## Q7：什么时候需要 Unified，而不是 classic `RadixCache`？
 
-当同一前缀需要同时管理 Full KV、SWA、Mamba state、host/device copy 或 streaming session 时，需要 Unified。它的 node 上挂多种 component data，锁也逐 component acquire/release。
+当同一前缀需要同时管理 Full KV、SWA、Mamba state，或叠加 host/storage tier、sidecar pool、streaming session 时，需要 Unified。真正的 `ComponentType` 是 Full/SWA/Mamba 等资源视图；HiCache 是 device↔host↔storage 控制面，不是另一种 component。
 
 ```python
 # 来源：sglang/python/sglang/srt/mem_cache/unified_radix_cache.py L82-L89
@@ -279,7 +279,7 @@ classic `evict` 的单位是 leaf node，不是单 token。它从 heap 里弹 le
         return DecLockRefResult()
 ```
 
-首次阅读可以把 Unified 看成“同一前缀树，多套资源账本”。只有当你排查 SWA、Mamba、HiCache 或 streaming session 时，才需要深入 component 细节。
+首次阅读可以把 Unified 看成“同一前缀 key，多套资源状态机”，但要保留三个不对称点：Full 是节点生存骨架并由 leaf set 驱逐；辅助 component 使用独立 device/host LRU；HiCache 下 `best_match_node` 可以深于 `last_device_node`，host 命中要经过 load-back 才能追加到 device `prefix_indices`。
 
 ## Q8：piecewise CUDA Graph 下为什么要 narrow `out_cache_loc`？
 
@@ -357,6 +357,6 @@ classic `evict` 的单位是 leaf node，不是单 token。它从 heap 里弹 le
 | page 对齐 | 命中长度向下取整到 page 边界 | `RadixKey.page_aligned` |
 | 强制 miss | 开关打开时必 miss | `SGLANG_RADIX_FORCE_MISS` |
 | lock | 活跃节点不可驱逐 | `inc_lock_ref` / `dec_lock_ref` |
-| finished insert | 请求结束后 tree 有新节点 | `cache_finished_req` |
+| finished insert | 在允许 insert 且存在未缓存的 page-aligned suffix 时，tree ownership/size 才应增长；全重复前缀不要求新节点 | `cache_finished_req` |
 
 如果所有检查都符合预期，但 hit rate 仍异常低，再去看上层模板是否包含动态字段，或者调度策略是否让请求没有机会复用相同前缀。

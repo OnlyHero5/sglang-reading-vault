@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 数据源 · 核心概念
 
@@ -29,7 +29,7 @@ stateDiagram-v2
     InFlight --> Partial: abort 且 partial_rollout
     Partial --> Buffer: add_samples
     Buffer --> Grouped: 下一次 get_samples 优先出队
-    FreshPrompt --> NextEpoch: sample_offset 越界
+    FreshPrompt --> NextEpoch: 本次请求跨过 dataset 尾部
     NextEpoch --> FreshPrompt: epoch_id 加一并可选 shuffle
 ```
 
@@ -45,7 +45,7 @@ stateDiagram-v2
 `DataSource` 抽象要求实现 `get_samples`、`add_samples`、`save`、`load` 和 `__len__`。这说明 Slime 关心的是“rollout 侧如何取一批 prompt group，并保存这个取样状态”，而不是强制所有实现都必须从本地文件读 prompt。
 
 ```python
-# 来源：slime/rollout/data_source.py L17-L46
+# 来源：slime/rollout/data_source.py L17-L34
 class DataSource(abc.ABC):
     @abc.abstractmethod
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
@@ -83,7 +83,7 @@ class DataSource(abc.ABC):
 `Dataset` 读 jsonl/parquet 后，把每条记录转换成 prompt 阶段的 `Sample`。这个阶段不生成 token，也不算 reward，只准备模型请求所需的 prompt、label、metadata 和多模态输入。
 
 ```python
-# 来源：slime/utils/data.py L219-L264
+# 定位骨架（据 `slime/utils/data.py` L219-L264 删节）：
         origin_samples = []
         for data in read_file(path):
             as_conversation = apply_chat_template or (multimodal_keys is not None)
@@ -138,7 +138,7 @@ class DataSource(abc.ABC):
 
 ## 概念五：buffer 是优先队列，不是第二个 dataset
 
-`RolloutDataSourceWithBuffer.get_samples(N)` 先从 buffer 拿，拿不到的部分才向父类 dataset 要。单次请求总量仍是 N。
+`RolloutDataSourceWithBuffer.get_samples(N)` 先从 buffer 拿，拿不到的部分才向父类 dataset 要。在正常的“小于等于一个 epoch 可供给量、filter 不超额返回”前提下，总量是 N；源码没有对这两个前提做完整防御。
 
 ```python
 # 来源：slime/rollout/data_source.py L177-L189
@@ -158,6 +158,8 @@ class DataSource(abc.ABC):
 ```
 
 默认 filter 是 FIFO 的 `pop_first`。它原地删除已弹出的 group，避免同一组半成品被重复 rollout。
+
+自定义 buffer filter 若返回超过 N 组，`get_samples` 会把剩余请求数减成负数，随后仍可能调用父类并倒退 `sample_offset`；当前没有返回数量断言。自定义实现必须保证 `0 <= len(result) <= num_samples`，且同步删除或更新 buffer。
 
 ## 概念六：checkpoint 保存消费位置
 
@@ -183,6 +185,8 @@ DataSource checkpoint 保存 `sample_offset`、`epoch_id`、`sample_group_index`
 
 如果开启 shuffle，恢复后还要按 `epoch_id` 重建同一个 epoch 的排列，否则同一个 `sample_offset` 会指向不同 prompt。
 
+“可重建”不等于“无副作用”：`Dataset.shuffle` 使用 `random.seed(seed + epoch_id)` 和模块级 `random.shuffle`，会覆盖当前进程的 Python 全局 RNG 状态。若同一进程还有 `random` RM、随机插件或其他随机决策，它们的后续序列会被 dataset shuffle 改写。
+
 ## 常见误解
 
 | 误解 | 正确模型 |
@@ -192,6 +196,8 @@ DataSource checkpoint 保存 `sample_offset`、`epoch_id`、`sample_group_index`
 | dynamic filter 丢弃的样本会自动回 buffer | 默认不会，源码注释明确未回写 unused samples |
 | `__len__` 表示 buffer + dataset | 默认实现只返回 dataset 长度；无 dataset 时为 0 |
 | checkpoint 能恢复 buffer | 默认只恢复 dataset 游标和 metadata |
+| `get_samples(N)` 永远返回 N 组 | 默认跨 epoch 逻辑只补一次；N 大于剩余尾部加一个完整 epoch 时会少返回，并可能留下大于 dataset 长度的 offset |
+| 配了 `multimodal_keys` 但某行没有媒体字段等价于纯文本 | 此时 `multimodals` 为空却仍构造空正则，字符串 content 会被拆成逐字符 text item |
 
 ## 下一步
 

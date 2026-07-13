@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # PlacementGroup · 数据流
 
@@ -67,7 +67,7 @@ def train(args):
 | 场景 | 本地 PG 申请量 | rollout 视图 |
 |------|----------------|--------------|
 | 普通分离 | `actor_num_gpus + rollout_num_gpus` | 从 actor 后面开始 |
-| colocate | `max(actor_num_gpus, rollout_num_gpus)` | 从 0 开始，与 actor 重叠 |
+| colocate | `max(actor_num_gpus, rollout_num_gpus)` | 从 0 开始；仅共同前缀重叠，较大一侧保留独占后缀 |
 | external | `actor_num_gpus` | 空切片 |
 | debug rollout only | `rollout_num_gpus` | 全部给 rollout |
 | debug train only | `actor_num_gpus` | 与 actor 相同，但下游不启动 rollout |
@@ -147,7 +147,7 @@ while not ray.wait([ready_ref], timeout=log_interval)[0]:
 探测和排序后返回两个列表：
 
 ```python
-# 来源：slime/ray/placement_group.py L69-L97
+# 来源：slime/ray/placement_group.py L69-L88
 # use info actor to get the GPU id
 info_actors = []
 for i in range(num_bundles):
@@ -183,6 +183,7 @@ pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
 # 来源：slime/ray/placement_group.py L123-L137
 num_gpus, rollout_offset = _get_placement_group_layout(args)
 
+logger.info(f"Creating placement group with {num_gpus} GPUs...")
 pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
 rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
 rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
@@ -193,6 +194,8 @@ result = {
 }
 
 result["critic"] = result["actor"] if args.use_critic else None
+
+return result
 ```
 
 三种典型形状：
@@ -200,10 +203,10 @@ result["critic"] = result["actor"] if args.use_critic else None
 | 模式 | actor view | rollout view | critic view |
 |------|------------|--------------|-------------|
 | 分离 | `0..A+R-1` 的完整 logical 列表 | 从 `A` 开始的后缀 | actor view 或 None |
-| colocate | 完整 logical 列表 | 同一个完整列表 | actor view 或 None |
+| colocate | 长度 `max(A,R)` 的完整列表，但训练只消费前 A | 同一列表，rollout 配置只消费前 R | actor view 或 None |
 | external | actor logical 列表 | 空列表 | actor view 或 None |
 
-注意：actor view 是完整 logical 列表，但 RayTrainGroup 只按 `world_size` 消费前 `actor_num_nodes * actor_num_gpus_per_node` 个 rank。
+注意：actor view 是完整 logical 列表，但 RayTrainGroup 只按 `world_size` 消费前 `A=actor_num_nodes * actor_num_gpus_per_node` 个 rank。colocate 的交集因此是前 `min(A,R)`，不是无条件全量重合。critic 的 world size 被参数校验强制等于 actor，并复用同一前缀。
 
 ## rollout 消费流：RolloutManager 到 ServerGroup
 
@@ -289,7 +292,7 @@ def _compute_megatron_num_gpus(args) -> int:
 下游用它计算每组 engine 的绝对起点：
 
 ```python
-# 来源：slime/ray/rollout.py L1113-L1150
+# 来源：slime/ray/rollout.py L1113-L1140
 # Compute megatron GPU range for per-group offload decisions.
 rollout_pg_offset = _compute_rollout_offset(args)
 megatron_num_gpus = _compute_megatron_num_gpus(args)
@@ -320,7 +323,7 @@ for model_idx, model_cfg in enumerate(config.models):
         needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
 ```
 
-这解释了一个容易混的点：PlacementGroup 切的是 rollout 视图；EngineTopology 再在 rollout 视图内部按 group 切段，并判断是否与 Megatron 范围重叠。
+这解释了两个容易混的点：PlacementGroup 切的是 rollout 视图；EngineTopology 再在 rollout 视图内部按 group 切段。`megatron_num_gpus` 虽然 docstring 写 actor+critic，数值只取 actor GPU 数，因为 critic 复用相同 slot，并不相加。`needs_offload` 也只比较 group 的绝对起点，没有计算 group 区间与 Megatron 区间的精确交集；一个跨越边界的 group 会整体被标记。
 
 ## training 消费流：RayTrainGroup rank 到 bundle
 
@@ -366,9 +369,9 @@ for rank in range(world_size):
 
 如果 actor world size 大于视图长度，这里会在索引或 Ray 调度阶段暴露；因此 `actor_num_nodes * actor_num_gpus_per_node` 必须和 PG 布局匹配。
 
-## 训练初始化流：rollout id 对齐后才进入主循环
+## 训练初始化流：选择 rollout id 后才进入主循环
 
-`create_training_models` 不只创建资源，还会初始化 actor/critic，并确定 `start_rollout_id`。
+`create_training_models` 不只创建资源，还会初始化 actor/critic，并确定 `start_rollout_id`。需要特别注意：启用 critic 时，代码选择 critic 返回列表，只验证 critic 各 rank 一致；actor 返回的 ids 没有与 critic 做交叉比较。
 
 ```python
 # 来源：slime/ray/placement_group.py L189-L217
@@ -407,7 +410,7 @@ for rank in range(world_size):
 
 - PG 先决定“进程坐哪里”。
 - RolloutManager 先于 training models，因为可能要推导 `num_rollout`。
-- Training models 初始化后才确定 resume 的 `start_rollout_id`。
+- Training models 初始化后才确定 resume 的 `start_rollout_id`；启用 critic 时默认采用 critic id，不能把当前 assert 误读为 actor/critic 一致性证明。
 - global dataset load 要等这个 id 确定。
 
 ## 验证抓手
@@ -415,6 +418,7 @@ for rank in range(world_size):
 运行：
 
 ```powershell
+Set-Location slime
 python -m pytest tests/test_placement_group.py -q
 ```
 

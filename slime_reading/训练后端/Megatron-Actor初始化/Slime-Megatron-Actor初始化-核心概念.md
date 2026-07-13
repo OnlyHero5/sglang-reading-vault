@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Megatron-Actor初始化 · 核心概念
 
@@ -42,9 +42,11 @@ updated: 2026-07-10
 | role | 会加载模型吗 | 会建 `weights_backuper` 吗 | 会建 `weight_updater` 吗 | init 末尾 |
 |------|--------------|----------------------------|---------------------------|-----------|
 | `actor` | 会 | 会 | 会 | 可能 `sleep()` |
-| `critic` | 会 | 不会 | 不会 | offload 下直接 `sleep()` 后返回 |
+| `critic` | 会 | 不会 | 不会 | offload 下直接 `sleep()` 后返回；跳过 actor-only 收尾 |
 
 critic 仍然是完整 Megatron 训练模型，只是不负责向 SGLang 推 actor 权重。因此 critic 的初始化比 actor 短，但不是“轻量假模型”。
+
+提前返回还意味着 critic 不执行后面的 `clear_memory()`、`rollout_data_postprocess` 加载与 `prof.on_init_end()`；这些并非 critic 当前训练路径必需，但排查 profiler/自定义 postprocess 时不能假设两种 role 有完全相同的 init 收尾。
 
 ## 权重 tag 是同一个模型对象的多份状态
 
@@ -62,13 +64,13 @@ actor init 里维护的不是多套独立模型实例，而是同一个 Megatron
 
 ## start_rollout_id 是恢复训练的对齐点
 
-`initialize_model_and_optimizer` 读 checkpoint 后返回 `loaded_rollout_id`，actor init 返回 `loaded_rollout_id + 1`。上层要求所有 rank 返回同一个值，然后把它作为下一轮 rollout 起点。
+`initialize_model_and_optimizer` 读 checkpoint 后返回 `loaded_rollout_id`，actor init 返回 `loaded_rollout_id + 1`。上层只对当前选中的列表做一致性检查：无 critic 时检查 actor ranks，有 critic 时检查 critic ranks；它不比较 actor 与 critic 两组返回值。并且只有 `args.start_rollout_id is None` 才采用返回值，显式起点优先。
 
 ```mermaid
 flowchart LR
   A["load_checkpoint<br/>loaded_rollout_id"]
   B["actor init<br/>+ 1"]
-  C["Ray 聚合所有 rank"]
+  C["Ray 聚合所选 role 的 ranks"]
   D["args.start_rollout_id"]
   E["下一轮 rollout"]
 
@@ -91,6 +93,8 @@ stateDiagram-v2
 
 `sleep()` 的重点不是普通清 cache，而是暂停 `torch_memory_saver` 管理的训练内存，并销毁可重建的 process groups。`wake_up()` 则恢复内存、重载 process groups，并把 actor 权重 tag 切回来。
 
+这张图只描述无异常路径。`train/save/update_weights` 都是先 wake、末尾再 sleep，没有 `try/finally`；中途失败会让模型保持唤醒、process group 或 updater 连接停在半状态。恢复策略应以重建 actor 为基线，除非能逐项证明当前资源状态。
+
 ## debug 模式边界
 
 | 模式 | train actor init | rollout 侧 | 用途 |
@@ -104,9 +108,11 @@ stateDiagram-v2
 
 - 所有 train actor 必须进入同一个 PyTorch world，再由 Megatron 切子组。
 - 每个 rank 都必须返回相同 `start_rollout_id`。
+- 更准确地说，是 driver 选中的 actor 或 critic rank 列表内部一致；actor/critic 跨组进度当前没有自动交叉校验。
 - actor 的 `weight_updater` 依赖已经初始化好的 model、HF config 和 `weights_backuper`。
 - `colocate` 下只能走 full tensor 推权；delta 模式不能与 colocate 组合。
 - offload 的动态库注入必须发生在 Ray actor 创建前，不能等到 `init()` 里再补。
+- NumPy 1.x 是硬门禁，而且断言发生在 Megatron 子组创建之后；失败 actor 已有部分 distributed 状态。
 
 ## 下一步
 

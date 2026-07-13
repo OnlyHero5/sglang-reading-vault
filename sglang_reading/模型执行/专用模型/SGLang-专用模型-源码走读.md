@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 专用模型 · 源码走读
 
@@ -43,7 +43,7 @@ flowchart LR
 | 首次建立 DeepSeek 专用主线 | 主线图、第 1 到 2 节 | 专用模型仍挂在 CausalLM 骨架下，差异通过 import、mixin 和 forward 上下文接入 |
 | 排查 PP / DSA topk 传递 | 第 2、3 节 | `PPProxyTensors` 不只传 hidden/residual，DSA 场景还可能要跨 stage 传 `topk_indices` |
 | 理解 decoder layer 为什么复杂 | 第 4 节 | layer communicator 先处理 attention 输入，再进入 attention，随后才进入 MLP/MoE 和 postprocess |
-| 判断 attention 走 MHA、MLA、DSA 还是 NPU | 第 5 节 | backend handler 依据 forward mode、prefill/decode、CP 和 backend 名称选择 prepare/core 路径 |
+| 判断 attention 走 MHA、MLA、DSA 还是 NPU | 第 5 节 | 先确认 backend key 命中哪个 handler，再核对图/CP/deterministic/prefix/spec 门禁；未知 key 会落到 Triton |
 | 判断 MoE 性能分支 | 第 6 节 | MoE forward 负责在 mega MoE、dual stream、normal、DeepEP 等后端之间选路 |
 | 排查 DeepSeek 权重加载 | 第 7 节、运行验证 | loader 把 checkpoint 名称映射到运行时参数，并处理 PP rank、fused shared experts、fused QKV A proj |
 
@@ -172,7 +172,7 @@ forward 入口先根据 DSA/MLA prefill CP 条件写 `forward_batch.attn_cp_meta
             return hidden_states
 ```
 
-注意这里没有直接跑 attention，也没有直接跑 MoE。ForCausalLM 入口只设置运行态上下文，并保持 PP last rank 才产出 logits 的通用边界。
+注意这里没有直接跑 attention，也没有直接跑 MoE。ForCausalLM 入口只设置运行态上下文，并保持 PP last rank 才产出 logits 的通用边界。它只在 split 条件成立时写 metadata，没有显式清空分支；因此正确性依赖本次 `ForwardBatch`/runner view 进入时没有陈旧 CP 状态。
 
 ## 3. Model forward 保留 PP 骨架，额外传递 DSA topk
 
@@ -277,7 +277,7 @@ forward 入口先根据 DSA/MLA prefill CP 条件写 `forward_batch.attn_cp_meta
             return PPProxyTensors(proxy_tensors)
 ```
 
-这段解释了为什么 DeepSeek PP 问题不能只按 Llama 的 hidden states 传递来排查。V3.2 DSA 会多一条 top-k index 状态链。
+这段解释了为什么 DeepSeek PP 问题不能只按 Llama 的 hidden states 传递来排查。V3.2 DSA 会多一条 top-k index 状态链；但 `_dsa_forward_uses_topk()` 还读取实际 backend 的 `use_mha`，若 DSA backend 已选 MHA，这条跨层状态链会被关闭。
 
 ## 4. Decoder layer 是专用优化的汇合点
 
@@ -434,7 +434,7 @@ MoE buffer context 和 allreduce fusion 都在 layer 内部处理：
         return handler(self, forward_batch)
 ```
 
-handler 层再把 backend 和 batch 形态转成具体 method。例如 flashinfer/fa3/flashmla/cutlass_mla 共享 `_handle_attention_backend`：
+handler 层再把 backend 和 batch 形态转成具体 method。Registry 对未知 backend key 会静默返回 Triton handler，而不是报 unsupported；完整证据见 [[SGLang-专用模型-核心概念]]。例如 flashinfer/fa3/flashmla/cutlass_mla 共享 `_handle_attention_backend`：
 
 ```python
 # 来源：python/sglang/srt/models/deepseek_common/attention_backend_handler.py L78-L108
@@ -470,6 +470,8 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
 ```
+
+这张 generic 卡的顺序不能外推所有 backend：TC piecewise graph 与 MLA prefill CP 先强制 MLA；prefix 总长为 0 也进入 MHA 分支；FA3 deterministic、FA4、Aiter、TRT-LLM/tokenspeed、DSA、Triton、Ascend 均有独立规则。
 
 `forward_prepare` 把 method 分派到不同 prepare 函数，`forward_core` 再按同一个 method 调 core：
 
@@ -612,11 +614,11 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
             )
 ```
 
-模型层只负责组织 routing 和后端入口；expert dispatch、combine、EPLB、DeepEP 细节属于 [[SGLang-MoE]]。
+模型层只负责组织 routing 和后端入口；expert dispatch、combine、EPLB、DeepEP 细节属于 [[SGLang-MoE]]。这里还说明“DeepEP”不是单一分支：shared-expert fusion 默认会被更早的安全门禁关闭，只有强制开启等情况下才把 shared expert 编成 EP-size 个 home slots；`ep_num_redundant_experts` 则是另一条独立扩容。
 
 ## 7. 权重加载把 checkpoint 名字翻译成运行时参数
 
-DeepSeek weight loader 先处理 PP stage skip 和 shared expert fusion remap：
+DeepSeek weight loader 先处理 PP stage skip 和 shared expert fusion remap。CPU tensor 的参数写入可提交线程池；源码会在循环后等待全部 future 并传播异常，再进入 post-load：
 
 ```python
 # 来源：python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py L202-L224
@@ -643,6 +645,15 @@ DeepSeek weight loader 先处理 PP stage skip 和 shared expert fusion remap：
                     )
 
                 weight_names.append(name)
+```
+
+```python
+# 来源：python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py L432-L436
+            # Wait for all tasks to complete and raise any exceptions.
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 ```
 
 随后分别处理 dense stacked mapping、expert mapping、PP embedding/norm skip、fused qkv_a：
@@ -728,7 +739,28 @@ DeepSeek weight loader 先处理 PP stage skip 和 shared expert fusion remap：
                             )
 ```
 
-最后 `post_load_weights` 还会把 `kv_b_proj` 拆成 MLA 需要的 `w_kc` 和 `w_vc`：
+fused A-proj 只有 `q_a_proj` 与 `kv_a_proj_with_mqa` 都到齐才提交写入；FP8 indexer `wk` 同样要 weight 与 scale 成对。两个 pending map 在 iterator 结束时没有非空断言，因此“没有 warning”不等于 pair 完整。RunAI streamed tensor 会先 clone，避免 iterator 复用底层 storage 后缓存失效。
+
+```python
+# 来源：python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py L191-L203
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
+        )
+        cached_a_proj = {} if fuse_qkv_a_proj else None
+
+        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
+```
+
+这里还有一个强制开关的边界：loader 对 fused shared experts 只接受 1 个；若 `enforce_shared_experts_fusion` 绕过 config 安全门禁并让 `n_shared_experts != 1`，会在加载阶段触发断言，而不是获得一个泛化的多 shared-expert fused 实现。
+
+最后 `post_load_weights` 还会按 AWQ、FP8、INT8 与 DeepGEMM 等条件处理 `kv_b_proj`，再拆成 MLA 需要的 `w_kc` 和 `w_vc`：
 
 ```python
 # 来源：python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py L472-L483
@@ -745,7 +777,7 @@ DeepSeek weight loader 先处理 PP stage skip 和 shared expert fusion remap：
         - Splitting weights into w_kc and w_vc components for MLA
 ```
 
-所以 DeepSeek 权重问题不能只看 `params_dict` 是否有同名参数。要先经过 stage skip、fused shared expert remap、NextN、fused qkv_a 和 post-load MLA 权重拆分。
+所以 DeepSeek 权重问题不能只看 `params_dict` 是否有同名参数。要先经过 stage skip、fused shared expert remap、NextN、成对 qkv_a/indexer fusion、async join 和量化感知 post-load。部分权重更新时，post-load 只处理 `weight_names` 中实际出现 `kv_b_proj` 的 layer。
 
 ## 运行验证
 
@@ -754,8 +786,8 @@ DeepSeek weight loader 先处理 PP stage skip 和 shared expert fusion remap：
 | 当前 attention 实际走哪个方法 | 在 `dispatch_attn_forward_method` 后记录 `self.current_attention_backend` 和返回的 `AttnForwardMethod` |
 | PP 传递是否带 DSA topk | 非 last rank 的 `PPProxyTensors.tensors` 是否含 `topk_indices` |
 | sparse 层分布是否符合预期 | 打印 `_is_layer_sparse(i, False)`，对照 `first_k_dense_replace` 与 `moe_layer_freq` |
-| shared expert 是否 fusion | 查看 `server_args.disable_shared_experts_fusion` 和 `num_fused_shared_experts` |
-| 权重名为何缺失 | 在 `DeepseekV2WeightLoaderMixin.do_load_weights` 中记录原始 name、remap 后 name、是否 stage skip |
+| shared expert 是否 fusion | 记录全局 disable/enforce、DeepEP backend、fused/home/redundant slot 的分别来源 |
+| 权重名为何缺失 | 记录原始/remap name、stage skip、future 异常，并在 iterator 结束断言两个 pending map 为空 |
 
 ## 复盘
 

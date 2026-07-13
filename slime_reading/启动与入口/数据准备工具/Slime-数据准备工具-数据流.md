@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 数据准备工具 · 数据流
 
@@ -56,7 +56,7 @@ flowchart LR
 | `--load` | Megatron actor resume | Megatron checkpoint 根目录，含 `latest_checkpointed_iteration.txt` 或可被 Megatron loader 识别 | resume 失败后回退到 `--ref-load`，训练从初始权重开始 |
 | `--save` | Megatron actor 保存 | checkpoint 根目录 | 训练保存位置不符合预期，后续导出找不到 step |
 | `--input-dir` | `convert_torch_dist_to_hf.py` | 单个 Megatron checkpoint 目录，含 `common.pt` 和 dist metadata | 导出脚本找不到 `common.pt` 或 metadata |
-| `--output-dir` | HF 导出脚本 | 不存在或配合 `--force` 覆盖 | 默认报 output exists |
+| `--output-dir` | HF 导出脚本 | 最好是全新目录；`--force` 仅允许写入既有目录 | 默认报 output exists；强制重跑可能遗留旧分片/assets |
 | `--origin-hf-dir` | HF 导出脚本 | 原始 HF 目录 | 无法推导 model name，或导出目录缺 tokenizer/config |
 | `--save-hf` | 训练中 actor 保存路径模板 | 可格式化 `{rollout_id}` 的输出路径 | 训练保存 Megatron checkpoint 但没有同步产出 HF 目录 |
 
@@ -105,15 +105,17 @@ CKPT_ARGS=(
 ```
 
 ```bash
-# 来源：scripts/run-qwen3-4B.sh L148-L155
+# 来源：scripts/run-qwen3-4B.sh L146-L155
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{
-     "env_vars": {
-        "PYTHONPATH": "'${PYTHONPATH}'"
-     }
-   }' \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes ${num_nodes} \
+   --actor-num-nodes 1 \
+   --actor-num-gpus-per-node ${NUM_GPUS} \
+   --colocate \
+   ${MODEL_ARGS[@]} \
+   ${CKPT_ARGS[@]} \
+   ${ROLLOUT_ARGS[@]} \
+   ${OPTIMIZER_ARGS[@]} \
 ```
 
 这一段的读法是：`MODEL_ARGS` 不属于 checkpoint，但它决定 Megatron 如何解释 checkpoint；`CKPT_ARGS` 不只是一组路径，而是把训练侧和 rollout 侧接到不同权重形态上。
@@ -148,12 +150,14 @@ dist.destroy_process_group()
 
 注意：实际 tracker 文件名由 Megatron `get_checkpoint_tracker_filename(args.save)` 决定，不要在文档里硬编码推断。
 
+同样不要把该转换当成可幂等重跑：目标 `release/` 若已存在，代码不会清理它。稳妥做法是为每次转换使用全新 `--save` 根目录。
+
 ## 训练中的保存与离线导出
 
 训练 actor 保存时，先走 Megatron `save()`；如果配置了 `--save-hf`，再导出 HF。
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L558-L578
+# 来源：slime/backends/megatron_utils/actor.py L558-L577
 def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
     if self.args.debug_rollout_only:
         return
@@ -185,7 +189,7 @@ def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
 
 ## torch_dist 到 HF 的输出生命周期
 
-反向脚本先确认 output 是否允许覆盖，再确定 model name，再读 `common.pt` 和 dist metadata，最后写 safetensors 与 assets。
+反向脚本先确认 output 是否允许写入，再确定 model name，再直接从 `--input-dir/common.pt` 和同目录 dist metadata 加载，最后写 safetensors 与 assets。这里的 `--input-dir` 是具体版本目录，不是带 tracker 的根目录。
 
 ```python
 # 来源：tools/convert_torch_dist_to_hf.py L209-L244
@@ -235,6 +239,8 @@ if args.origin_hf_dir:
 | `model-xxxxx-of-yyyyy.safetensors` | `save_tensors` 写出 | 转换后的模型权重 |
 | `config.json`、tokenizer 文件、generation config | `copy_assets(origin_hf_dir, output_dir)` | 让输出目录能被 HF/SGLang 生态直接消费 |
 
+`copy_assets()` 只复制原 HF 目录顶层的普通非权重文件；子目录不会递归复制。`--force` 也不会预清理旧输出，因此发布前应校验 index 中每个 shard 存在，并确认目录没有来自旧版本的额外权重分片。
+
 ## 与 RL 热路径的交互边界
 
 Tools-DataPrep 不在每轮 `generate → train → update_weights` 热路径里。它只在训练前和保存后介入。
@@ -253,12 +259,14 @@ Tools-DataPrep 不在每轮 `generate → train → update_weights` 热路径里
 最小静态验证：
 
 ```powershell
+Set-Location slime
 python -m py_compile tools/convert_hf_to_torch_dist.py tools/convert_torch_dist_to_hf.py
 ```
 
 完整转换验证：
 
 ```bash
+cd /root/slime
 source scripts/models/qwen3-4B.sh
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
   ${MODEL_ARGS[@]} \

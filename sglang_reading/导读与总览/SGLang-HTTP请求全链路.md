@@ -49,7 +49,7 @@ updated: 2026-07-10
 
 ## 源码阅读依据
 
-改写本文前已阅读下列 upstream 源码的相关函数和调用上下文；正文中的设计判断均回指这些源码。
+改写本文前已阅读下列 upstream 源码的相关函数和调用上下文；正文中的设计判断均回指这些源码。代码块第一行写“来源”时，表示下面是该连续区间的逐字摘录；写“定位”时，表示为了突出控制流而删去旁支的摘要骨架，不能把它当成可直接复制的源码。
 
 | upstream 文件 | 本文使用方式 |
 |---------------|--------------|
@@ -98,8 +98,8 @@ flowchart LR
 | 不变量 | 为什么重要 | 破坏后现象 |
 |--------|------------|------------|
 | `rid` 在全链路唯一 | `TokenizerManager.rid_to_state` 用它唤醒等待中的 HTTP generator | chunk 找不到 state、请求泄漏或错误日志 |
-| Scheduler 只调度 tokenized 请求 | 分词、多模态预处理、LoRA 解析在 TokenizerManager 侧收束 | Scheduler 需要理解前台协议，调度状态会膨胀 |
-| 输出分两段：token id 先回 Detokenizer，再回 TokenizerManager | Detokenizer 从 Scheduler 热路径外移，避免调度进程做字符串处理 | decode 卡住时 GPU 可能仍在跑，但 HTTP 没有新文本 |
+| Scheduler 的生成主线只调度 tokenized 请求 | 分词、多模态预处理、LoRA 解析先在 TokenizerManager 侧收束；控制 RPC 是另一类输入 | 若把前台协议直接塞进热循环，调度状态会膨胀 |
+| baseline 输出分两段：token id 先回 Detokenizer，再回 TokenizerManager | tokenizer 已初始化的普通文本路径把字符串处理移出 Scheduler 热路径；`--skip-tokenizer-init` 是另一条边界 | decode 卡住时 GPU 可能仍在跑，但 HTTP 没有新文本 |
 
 ## 贯穿场景
 
@@ -144,7 +144,7 @@ flowchart LR
 HTTP server 的 docstring 直接说明 runtime 的三件核心组件：
 
 ```python
-# 来源：python/sglang/srt/entrypoints/http_server.py L2480-L2508
+# 来源：python/sglang/srt/entrypoints/http_server.py L2482-L2488
     The SRT server consists of an HTTP server and an SRT engine.
 
     - HTTP server: A FastAPI server that routes requests to the engine.
@@ -169,7 +169,7 @@ HTTP server 的 docstring 直接说明 runtime 的三件核心组件：
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/entrypoints/http_server.py L784-L826
+# 来源：python/sglang/srt/entrypoints/http_server.py L785-L801
 @app.api_route(
     "/generate",
     methods=["POST", "PUT"],
@@ -187,6 +187,37 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
+```
+
+异常、SSE 结束标记和 abort task 位于同一路由的后半段：
+
+```python
+# 来源：python/sglang/srt/entrypoints/http_server.py L802-L826
+            except ValueError as e:
+                # A client disconnect also surfaces here. It's a client-side
+                # cancellation, not a server error or bad input -- log it and
+                # stop (the request was already aborted upstream) instead of
+                # emitting a 400.
+                if request is not None and await request.is_disconnected():
+                    logger.info(f"[http_server] Client disconnected: {e}")
+                    return
+                out = {
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "code": 400,
+                        "retryable": False,
+                    }
+                }
+                logger.error(f"[http_server] Error: {e}")
+                yield b"data: " + dumps_json(out) + b"\n\n"
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+            background=_global_state.tokenizer_manager.create_abort_task(obj),
+        )
 ```
 
 **执行逻辑：**
@@ -207,7 +238,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/tokenizer_manager.py L589-L633
+# 定位：python/sglang/srt/managers/tokenizer_manager.py L589-L633（摘要骨架；省略 routed_dp_rank 校验）
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -247,7 +278,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 `_init_req_state` 是 `rid` 状态的创建点：
 
 ```python
-# 来源：python/sglang/srt/managers/tokenizer_manager.py L2850-L2893
+# 定位：python/sglang/srt/managers/tokenizer_manager.py L2850-L2893（摘要骨架；省略 trace context 初始化）
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -311,14 +342,14 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 - 请求在进入 Scheduler 前失败时，异常路径会 `_discard_pending_req_states`，避免 `rid_to_state` 泄漏。
 - 权重更新 pause 期间，`is_pause_cond` 会阻止新请求继续 dispatch。
 
-### 4. Scheduler 收包：只有入口 rank 拉 ZMQ，其余 rank 通过广播拿到同一批请求
+### 4. Scheduler 收包：入口 rank 拉外部请求，再按 PP/TP/CP/DP 拓扑同步
 
 **系统压力：** 多 TP/CP/DP rank 不能同时消费同一个 ZMQ socket。否则一个请求可能只被某个 rank 读走，其他 rank 没有同步视图。
 
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L72-L99
+# 定位：python/sglang/srt/managers/scheduler_components/request_receiver.py L72-L99（摘要骨架；省略装饰器与 SHM finalize/return）
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -347,7 +378,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 拉取 raw request 的入口 rank 条件：
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/request_receiver.py L101-L139
+# 定位：python/sglang/srt/managers/scheduler_components/request_receiver.py L101-L139（摘要骨架；只保留 pp_rank=0 的 tokenizer socket 分支）
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -365,9 +396,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
 **执行逻辑：**
 
-- `pp_rank == 0 && attn_tp_rank == 0 && attn_cp_rank == 0` 的 rank 从 TokenizerManager 拉请求。
-- 之后 `_broadcast_reqs_across_ranks` 把请求广播到需要参与 forward 的 rank。
-- pickle wrapper 在 PP rank0 解包，避免所有进程重复做前台协议工作。
+- `pp_rank == 0 && attn_tp_rank == 0 && attn_cp_rank == 0` 的入口 rank 从 TokenizerManager socket 拉请求；同一入口还会拉 scheduler RPC。
+- PP 后续 stage 不再消费这个 socket，而是通过点对点通信接收；入口拿到的对象随后再按 TP/CP/DP 拓扑同步。
+- pickle wrapper 在 PP rank0 解包；之后还会经过多模态接收与 SHM feature finalize，不能把“socket 已读到对象”当成收包流程已经结束。
 
 **读者抓手：** 如果你在多卡场景里以为“每个 TP rank 都各自收 HTTP 请求”，后续所有调度理解都会错。Scheduler 的模型是“单入口收包，多 rank 同步执行”。
 
@@ -378,7 +409,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2022-L2088
+# 定位：python/sglang/srt/managers/scheduler.py L2022-L2088（摘要骨架；省略 Req 其余构造字段）
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -415,7 +446,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 入队分支：
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2288-L2309
+# 定位：python/sglang/srt/managers/scheduler.py L2288-L2309（摘要骨架；只展示 baseline 与 PREFILL 分支）
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -441,8 +472,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 **不变量与失败模式：**
 
 - 进入 `waiting_queue` 的请求必须已经完成 tokenization。
-- priority scheduling 关闭时仍传 priority，可能被 `_set_or_validate_priority` abort。
-- PD 请求缺 bootstrap room 时不能进入普通队列，否则 KV transfer 无法建立。
+- priority scheduling 关闭时仍传 priority，只有同时启用 `abort_on_priority_when_disabled` 才会被 `_set_or_validate_priority` abort。
+- PD 请求依赖 bootstrap/transfer metadata，并进入专用 prefill bootstrap 或 decode prealloc 队列；不能按 baseline `waiting_queue` 推理它的生命周期。
 
 ### 6. 调度循环：默认 overlap 把“上一轮结果处理”和“当前 GPU forward”错开
 
@@ -477,7 +508,7 @@ normal loop 的形状更容易读：
 默认 overlap loop 多了 `result_queue`：
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L1551-L1613
+# 定位：python/sglang/srt/managers/scheduler.py L1551-L1613（摘要骨架；保留收包阶段，省略同步边界、launch 与结果出队）
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
@@ -515,7 +546,7 @@ normal loop 的形状更容易读：
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler.py L2586-L2714
+# 定位：python/sglang/srt/managers/scheduler.py L2586-L2714（摘要骨架；省略 chunked、HiSparse 与 DP/MLP sync 旁支）
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self.process_pending_chunked_abort()
 
@@ -569,7 +600,7 @@ normal loop 的形状更容易读：
 
 - 上一轮 extend batch 先 merge 到 `running_batch`。
 - 再尝试从 waiting queue 组新的 prefill batch。
-- 有新 prefill 就先跑 prefill；没有新 prefill 才更新 running decode。
+- baseline 决策是：`get_new_batch_prefill()` 返回可运行 batch 时优先返回它，否则更新 running decode；DP/MLP sync 还可能把 idle/sync batch 插入这个决策。
 - chunked prefill、HiSparse、DLLM、DP MLP sync 都是在这个主决策周围插入的分支。
 
 **不变量与失败模式：**
@@ -584,7 +615,7 @@ normal loop 的形状更容易读：
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/tp_worker.py L482-L561
+# 定位：python/sglang/srt/managers/tp_worker.py L482-L561（摘要骨架；省略 DLLM、延迟 sampling、prefill-only 与附加输出）
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -629,7 +660,7 @@ normal loop 的形状更容易读：
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L2954-L3046
+# 定位：python/sglang/srt/model_executor/model_runner.py L2954-L3046（摘要骨架；省略 debugger、canary、elastic EP 与捕获器收尾）
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -662,7 +693,7 @@ normal loop 的形状更容易读：
 实际路径选择在 `_forward_raw`：
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L3048-L3141
+# 定位：python/sglang/srt/model_executor/model_runner.py L3048-L3141（摘要骨架；突出 decode graph 门禁，省略 HiSparse、split-prefill、prefill graph 与 eager 分派）
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -701,7 +732,7 @@ normal loop 的形状更容易读：
 sampling 把 logits 转成 next token：
 
 ```python
-# 来源：python/sglang/srt/model_executor/model_runner.py L3160-L3191
+# 定位：python/sglang/srt/model_executor/model_runner.py L3160-L3191（摘要骨架；省略 sampler 的其余参数与返回收尾）
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -740,7 +771,7 @@ sampling 把 logits 转成 next token：
 **源码证据：**
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/batch_result_processor.py L629-L721
+# 定位：python/sglang/srt/managers/scheduler_components/batch_result_processor.py L629-L721（摘要骨架；省略 metrics、KV free group、logprob/hidden state/grammar 分支）
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,
@@ -782,7 +813,7 @@ sampling 把 logits 转成 next token：
 `output_streamer` 聚合成 `BatchTokenIDOutput`：
 
 ```python
-# 来源：python/sglang/srt/managers/scheduler_components/output_streamer.py L93-L164
+# 定位：python/sglang/srt/managers/scheduler_components/output_streamer.py L93-L164（摘要骨架；省略测试钩子、返回字段探测与 overlap 注释）
     def stream_output(
         self,
         reqs: List[Req],
@@ -834,7 +865,7 @@ sampling 把 logits 转成 next token：
 输出对象契约：
 
 ```python
-# 来源：python/sglang/srt/managers/io_struct.py L1194-L1213
+# 来源：python/sglang/srt/managers/io_struct.py L1194-L1212
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -894,7 +925,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 ```
 
 ```python
-# 来源：python/sglang/srt/managers/detokenizer_manager.py L406-L455
+# 定位：python/sglang/srt/managers/detokenizer_manager.py L406-L455（摘要骨架；省略 BatchStrOutput 的其余透传字段）
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -970,7 +1001,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 流式文本构造：
 
 ```python
-# 来源：python/sglang/srt/managers/tokenizer_manager.py L1971-L2012
+# 定位：python/sglang/srt/managers/tokenizer_manager.py L1971-L2012（摘要骨架；只展示 incremental stream 分支）
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
@@ -1002,7 +1033,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 事件唤醒：
 
 ```python
-# 来源：python/sglang/srt/managers/tokenizer_manager.py L2080-L2120
+# 定位：python/sglang/srt/managers/tokenizer_manager.py L2080-L2120（摘要骨架；省略 metrics 与 LoRA release）
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
@@ -1026,7 +1057,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 等待侧取出 chunk：
 
 ```python
-# 来源：python/sglang/srt/managers/tokenizer_manager.py L1446-L1515
+# 定位：python/sglang/srt/managers/tokenizer_manager.py L1446-L1515（摘要骨架；只展示等待与断连 abort，省略 drain/coalesce/yield）
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1061,7 +1092,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 - `handle_loop` 从 Detokenizer socket 收 `BatchStrOutput`。
 - `_handle_batch_output` 按 `rid` 找 `ReqState`。
 - 对 stream 请求，构造 `{"text": delta_text, "output_ids": ..., "meta_info": ...}`。
-- 写入 `state.out_list` 后 `state.event.set()`。
+- 写入 `state.out_list` 后先进入 `pending_notify`；达到 `batch_notify_size` 或处理完本批输出时再统一 `state.event.set()`。
 - `_wait_one_response` 被唤醒，yield dict 给 HTTP route。
 
 **不变量与失败模式：**
@@ -1115,9 +1146,31 @@ curl -N http://127.0.0.1:30000/generate \
 预期：
 
 - normal loop 更容易断点：`run_batch` 后立刻 `process_batch_result`。
-- overlap 默认更高吞吐，但结果处理和 batch launch 相差一拍。
+- overlap 的设计目标是把 CPU 结果处理与 GPU 计算错开，结果处理和 batch launch 会相差一拍；吞吐是否改善必须在相同模型、硬件和 workload 下实测，不能由控制流直接推出。
 
 对应源码：`event_loop_normal` 与 `event_loop_overlap`。
+
+### 验证 4：无 GPU 时做静态契约检查
+
+操作（在仓库根目录运行）：
+
+```powershell
+$checks = @(
+  @{ Path = 'sglang/python/sglang/srt/entrypoints/http_server.py'; Pattern = 'async def generate_request' },
+  @{ Path = 'sglang/python/sglang/srt/managers/tokenizer_manager.py'; Pattern = 'async def _wait_one_response' },
+  @{ Path = 'sglang/python/sglang/srt/managers/scheduler.py'; Pattern = 'def event_loop_overlap' },
+  @{ Path = 'sglang/python/sglang/srt/managers/tp_worker.py'; Pattern = 'ForwardBatch.init_new' },
+  @{ Path = 'sglang/python/sglang/srt/managers/detokenizer_manager.py'; Pattern = 'def handle_batch_token_id_out' },
+  @{ Path = 'sglang/python/sglang/srt/managers/tokenizer_manager.py'; Pattern = 'pending_notify' }
+)
+
+foreach ($check in $checks) {
+  rg -n --fixed-strings $check.Pattern $check.Path
+  if ($LASTEXITCODE -ne 0) { throw "missing: $($check.Pattern)" }
+}
+```
+
+预期：六组定位全部命中。它只证明 baseline 入口和交接点仍存在，不证明服务能启动、SSE 时序正确或 GPU 性能达标；这些结论仍需验证 1 到 3 的目标环境。
 
 ## 失败模式与排障入口
 

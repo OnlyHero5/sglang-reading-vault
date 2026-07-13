@@ -15,7 +15,7 @@ updated: 2026-07-10
 
 ## 你为什么要读
 
-这篇先建立五个模型：`train.py` 是同步闭环节拍器，placement group 决定资源拓扑，offload/onload 是 colocate 的显存闸门，critic-only 改变训练消费者，`train_async.py` 只做 step 间预取。理解这些后，再读源码不会把 `async_train`、fully-async rollout 和 Ray remote future 混在一起。
+这篇建立七个模型：显式节拍器、资源拓扑、bootstrap、同步闭环、critic-only、step 间预取与周期动作。理解这些后，再读源码不会把 `async_train`、pipeline async、fully-async rollout 和 Ray remote future 混在一起。
 
 ## 模型一：主循环是节拍器，不是 Trainer 类
 
@@ -38,7 +38,7 @@ from slime.utils.misc import should_run_periodic_action
 `create_placement_groups` 根据 debug、external、colocate、decoupled 等模式决定 actor 和 rollout 是否共享同一个 placement group，或者 rollout 从 actor GPU 后面切片。
 
 ```python
-# 来源：slime/ray/placement_group.py L100-L137
+# 来源：slime/ray/placement_group.py L100-L117
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
@@ -105,9 +105,9 @@ stateDiagram-v2
 
 关键点：`async_train` 是 Ray 方法名，sync 主循环仍然用 `ray.get` 等它完成。
 
-## 模型五：critic-only 是消费者分支，不是 generate 分支
+## 模型五：critic-only 改变 optimizer 消费者，不取消 actor 发布
 
-PPO 会启用 critic。前 `num_critic_only_steps` 步可以只训练 value head，actor 暂不更新，但 rollout 数据仍由同一个 generate 产生。
+PPO 会启用 critic。前 `num_critic_only_steps` 步只执行 critic 的训练，actor 不做 optimizer step，但 rollout 数据仍由同一个 generate 产生。
 
 ```python
 # 来源：train.py L72-L81
@@ -123,11 +123,11 @@ PPO 会启用 critic。前 `num_critic_only_steps` 步可以只训练 value head
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 ```
 
-不变量：`actor_trains_this_step` 同时影响训练分支、保存分支和清显存分支，不能只在一个地方理解。
+不变量：`actor_trains_this_step` 同时影响训练分支、保存分支和清显存分支，不能只在一个地方理解。它没有包住 step 尾部的 `actor_model.update_weights()`：同步入口仍会发布 actor 当前状态。因此“actor 没训练”不等于“没有发布调用”，版本序号也可能前进而参数数值不变。
 
 ## 模型六：`train_async.py` 是 step 间预取
 
-`train_async.py` 不是 fully-async rollout。它只让 `generate(N+1)` 和 `train(N)` 重叠，仍然通过 RolloutManager 生成完整 batch。
+`train_async.py` 不是 fully-async rollout。它让 `generate(N+1)` 和 `train(N)` 重叠，仍然通过 RolloutManager 生成完整 batch。因为 N+1 在 N 的 optimizer step/发布前已经启动，即使 `update_weights_interval=1`，它也天然使用较旧 policy；更大的 interval 会扩大多步不发布的窗口。
 
 ```python
 # 来源：train_async.py L30-L39
@@ -193,7 +193,7 @@ def should_run_periodic_action(
 | `async_train` 表示主循环异步 | sync `train.py` 会 `ray.get` 等训练完成 |
 | RolloutManager 可以晚于 Actor 创建 | training models 需要绑定 rollout manager，且 rollout manager 负责步数推导 |
 | `train_async.py` 可以配 colocate | 源码直接 assert 禁止 |
-| `update_weights_interval > 1` 没影响 | async 下 rollout policy 会相对 actor 训练权重滞后 |
+| `update_weights_interval=1` 就完全 on-policy | 预取的 N+1 在 train N 完成前启动，流水线本身已有 staleness；更大 interval 进一步扩大窗口 |
 | eval-only 不需要 bootstrap | eval-only 仍先创建角色并推权，再 eval |
 
 下一步读 [[Slime-训练主循环-源码走读]]，沿一次完整 step 把这些模型对齐到源码顺序。

@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # HTTP-Server · 数据流
 
@@ -20,7 +20,7 @@ updated: 2026-07-10
 - 启动对象：`ServerArgs → PortArgs → scheduler_infos → _GlobalState`
 - 协议对象：HTTP body → `GenerateReqInput` 或 OpenAI request → handler
 - 运行对象：`TokenizerManager`、`TemplateManager`、`SubprocessWatchdog`
-- readiness 对象：`ServerStatus`、`last_receive_tstamp`、health `rid`
+- readiness 对象：`ServerStatus`、`last_receive_tstamp`、health `rid`、warmup HTTP 响应
 
 ## 1. 启动数据流
 
@@ -284,19 +284,19 @@ multi tokenizer worker 不能共享主进程里的 Python 对象。主进程写 
 
 ## 6. readiness 数据流
 
-health 请求不是普通用户请求，但深度探活也会构造内部请求对象，并通过 tokenizer manager 走一次后端往返。它用独立 `rid`，完成后从 `rid_to_state` 清理。
+health 请求不是普通用户请求，但深度探活会构造内部请求对象，并尝试通过 tokenizer manager 发起后端往返。它用独立 `rid`；成功或超时后都会从 `rid_to_state` 清理，但成功条件并不要求这个 `rid` 自身完成。
 
 ```mermaid
 flowchart LR
  A["/health_generate"] --> B["GenerateReqInput or EmbeddingReqInput"]
  B --> C["TokenizerManager.generate_request"]
- C --> D["last_receive_tstamp updated"]
+ C --> D["任意后端回包更新<br/>last_receive_tstamp"]
  D --> E["server_status = Up"]
  C --> F["timeout"]
  F --> G["server_status = UnHealthy"]
 ```
 
-因此，`/health` 适合低成本 liveness，`/health_generate` 适合确认 Scheduler/Detokenizer 链路。如果集群经常在高负载下探活超时，要确认探针是否误用了深度生成探活。
+因此，`/health` 适合低成本 liveness，但它不会拒绝既有 `UnHealthy`；`/health_generate` 适合确认后端仍有响应，却不保证 health `rid` 自己完成。集群在高负载下探活异常时，要同时看正常流量是否更新了共享时间戳，以及探针是否误把它当成 request-specific 测试。
 
 ## 7. 对象归属表
 
@@ -307,11 +307,11 @@ flowchart LR
 | `scheduler_infos[0]` | scheduler ready 结果 | 模型 ready 后返回 | `max_req_input_len`、模型信息 |
 | `_GlobalState` | HTTP 进程内状态 | HTTP setup 或 worker lifespan 设置 | import `app` 后未初始化 |
 | `app.state.openai_serving_*` | 协议 handler | lifespan 初始化 | OpenAI route AttributeError |
-| `ServerStatus` | readiness 状态 | warmup/health 更新 | `/health` 503、UnHealthy |
+| `ServerStatus` | readiness 状态 | warmup/health 更新 | `/health` 只特判 Starting；深度探活才会改 Up/UnHealthy |
 | `rid_to_state` | 请求状态 | TokenizerManager 管理 | health rid 清理、abort |
 
 ## 复盘
 
-HTTP Server 的数据流可以压缩成一句话：启动时把 engine 事实写进 HTTP 可访问状态，请求时把协议对象转交给 tokenizer manager，readiness 时用最小请求证明后端链路仍有响应。
+HTTP Server 的数据流可以压缩成一句话：启动时把 engine 事实写进 HTTP 可访问状态，请求时把协议对象转交给 tokenizer manager，readiness 时用状态、HTTP warmup 与共享回包时间戳组合判断后端是否仍有响应。
 
 下一篇 [[SGLang-HTTP-Server-排障指南]] 按症状展开这些边界。

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # PlacementGroup · 排障指南
 
@@ -24,7 +24,8 @@ updated: 2026-07-10
 | colocate 下显存 OOM | offload 标志和 onload/offload 生命周期 | `slime/utils/arguments.py` L1885-L1901 | 参数校验测试和运行日志 |
 | SGLang engine 绑定错 GPU | `reordered_bundle_indices` 与 `gpu_offset` | `slime/ray/rollout.py` L154-L187 | 看 `bundle -> actual_bundle_index` 日志 |
 | Megatron rank 资源错位 | RayTrainGroup 是否用 reordered bundle index | `slime/ray/actor_group.py` L105-L116 | 对照 rank 与 PG 日志 |
-| critic resume id 不一致 | actor/critic checkpoint 是否对齐 | `slime/ray/placement_group.py` L189-L217 | 检查 `async_init` 返回 id |
+| actor/critic resume id 看似不一致却未报错 | 当前只校验被选中的 critic 各 rank，并不比较 actor 与 critic | `slime/ray/placement_group.py` L189-L208 | 分别记录两侧 init 返回值，必要时显式指定恢复策略 |
+| rollout-only 后缀也发生 offload | `needs_offload` 是否按跨边界 group 的起点粗粒度判定 | `slime/ray/rollout.py` L1113-L1146 | 看 group `gpu_offset/abs/needs_offload` 日志并拆 group 验证 |
 | zero rollout 还创建训练 PG | 这是不是 non-colocate 场景 | `tests/test_placement_group.py` L39-L40 | 跑布局测试 |
 
 ## Q1：PG 等待会不会自动超时失败？
@@ -93,7 +94,7 @@ pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
 Ray 视角上它们可以共享同一套 bundle；显存能否同时占用由 offload/onload 生命周期控制。参数校验会在 colocate 下默认打开 train 和 rollout offload。
 
 ```python
-# 来源：slime/utils/arguments.py L1885-L1901
+# 来源：slime/utils/arguments.py L1885-L1899
 # always true on offload for colocate at the moment.
 if args.colocate:
     if args.offload_train is None:
@@ -114,7 +115,7 @@ if args.offload_rollout is None:
 测试覆盖了 colocate 的几个关键边界：
 
 ```python
-# 来源：tests/test_megatron_argument_validation.py L264-L289
+# 来源：tests/test_megatron_argument_validation.py L264-L285
 def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(colocate=True, rollout_num_gpus=0)
@@ -139,7 +140,7 @@ def test_slime_validate_args_preserves_larger_rollout_gpus_under_colocate(monkey
     module.slime_validate_args(args)
 ```
 
-排障动作：colocate OOM 时，不要只看 PG layout。继续看 `offload_rollout`、`offload_train`、`rollout_manager.offload`、actor wake/sleep 以及 SGLang memory saver。
+排障动作：colocate OOM 时，不要只看 PG layout。先算前 `min(A,R)` 个重叠 slot，再看 `offload_rollout`、`offload_train`、`rollout_manager.offload`、actor wake/sleep 以及 SGLang memory saver。若一个 ServerGroup 横跨 actor 边界，当前 group-start 判定会让整组进入 offload 生命周期。
 
 ## Q4：external rollout 时 PG 如何分配？
 
@@ -213,9 +214,9 @@ for rank in range(world_size):
 
 解释边界：0.4 是 Ray 调度 accounting，不表示 Megatron 只使用 0.4 张 GPU。rank 仍被固定到一个 placement group bundle，actor 内部设备可见性由 Ray 和 Slime 环境变量共同控制。
 
-## Q6：critic 和 actor 的 `start_rollout_id` 不一致怎么办？
+## Q6：为什么 actor 和 critic 的 `start_rollout_id` 不一致也可能不报错？
 
-源码要求最终选择的 start rollout id 在所有 rank 上一致。启用 critic 时，当前逻辑采用 critic 返回的 ids，并用待办注释提醒这个决策还可改进。
+源码只要求“最终被选择的列表”在其内部一致。启用 critic 时，最终列表是 `critic_start_rollout_ids`；`actor_start_rollout_ids` 虽然被计算，却没有与 critic 列表比较。待办注释说明这个所有权尚未妥善决定。
 
 ```python
 # 来源：slime/ray/placement_group.py L189-L208
@@ -243,9 +244,9 @@ for rank in range(world_size):
 
 排障动作：
 
-- actor/critic resume checkpoint 要对齐。
-- 如果恢复策略特殊，显式传 `--start-rollout-id`。
-- rank 间不一致会在 assert 处失败，不应继续运行。
+- 分别打印或检查 actor、critic 的 init 返回值，不要拿当前 assert 当成交叉一致性证明。
+- critic 各 rank 不一致会在 assert 处失败；actor 各 rank 在 use_critic 路径中不会被该 assert 检查。
+- 显式 `--start-rollout-id` 只阻止自动写回，并不会新增 actor/critic 交叉校验；恢复策略仍需操作者保证。
 
 ## Q7：delta weight update 为什么拒绝 colocate？
 

@@ -1,19 +1,23 @@
 ---
 title: "AI Infra 源码学习库"
-type: index
+type: guide
 framework: cross-framework
 topic: "首页"
 learning_role: core
 tags:
   - framework/cross-framework
-  - content/index
+  - content/guide
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 
 # AI Infra 源码学习库
 
 > 从请求、训练样本和 Q/K/V tensor 出发，理解 LLM serving、RL 后训练与 GPU attention kernel。
+
+## 读完能做什么
+
+本页不负责讲完三个框架，而是帮你在两分钟内选路：从零学习走课程，需要排障按症状进入专题，准备改源码则先建立对象生命周期和证据边界。
 
 ## 第一次进入
 
@@ -54,6 +58,8 @@ flowchart LR
 ### FlashAttention · Attention Kernel
 
 Q/K/V 如何从 Python API 进入 C++/CUDA/CuTe，并通过 tile 与 online softmax 减少 HBM traffic。
+
+这条路线用于建立 attention kernel 心智模型；它不表示 SGLang 在任意版本、硬件和配置下都必然分派到本仓库的 FlashAttention 实现。判断真实 backend 必须回到运行时配置、dispatch 分支和 profiler 证据。
 
 [[Attention算子主线]] · [[FlashAttention学习指南]] · [[FlashAttention性能实验]]
 

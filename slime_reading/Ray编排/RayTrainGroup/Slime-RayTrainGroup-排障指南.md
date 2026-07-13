@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RayTrainGroup · 排障指南
 
@@ -30,12 +30,12 @@ updated: 2026-07-10
 
 ## Q1：为什么 `async_init` 不 `ray.get`，但 `update_weights` 要同步？
 
-因为 init/train 属于可组合的数据流，driver 可能要同时处理 actor 和 critic；而 update_weights 是一致性闸门，下一轮 generate 前必须完成。
+因为 init/train API 把等待权留给 driver，而 update_weights 是一致性闸门，下一轮 generate 前必须完成。但要区分能力和现状：当前 `create_training_models` 先等待 critic init，再启动并等待 actor init，并未并行初始化两组。
 
 异步 API：
 
 ```python
-# 来源：slime/ray/actor_group.py L121-L149
+# 定位骨架（据 `slime/ray/actor_group.py` L121-L149 删节）：
 def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
     """
     Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.
@@ -66,7 +66,7 @@ def update_weights(self):
 主循环也按这个边界使用：
 
 ```python
-# 来源：train.py L72-L90
+# 来源：train.py L72-L81
 actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
 
 if args.use_critic:
@@ -81,9 +81,9 @@ else:
 
 排障动作：看到 `async_train` 后，确认 driver 最终对返回 refs 做了 `ray.get`；看到 `update_weights`，确认不要再把它当 refs list 使用。
 
-## Q2：rank 0 master 端口为什么是随机 20000 到 21000？
+## Q2：rank 0 master 端口为什么以 20000 到 21000 的随机值起搜？
 
-rank 0 actor 自己在所在节点上找可用端口，避免依赖固定端口。这个端口是 torch distributed rendezvous，不是 Ray head 端口。
+rank 0 actor 自己在所在节点上找可用端口，避免依赖固定端口。这个端口是 torch distributed rendezvous，不是 Ray head 端口。随机值只是 `get_free_port()` 的起点；若被占用，函数会持续递增，因此最终端口可能高于 21000。
 
 ```python
 # 来源：slime/ray/train_actor.py L34-L42
@@ -101,7 +101,7 @@ os.environ["MASTER_PORT"] = str(self.master_port)
 传播发生在 group 创建循环：
 
 ```python
-# 来源：slime/ray/actor_group.py L105-L119
+# 来源：slime/ray/actor_group.py L105-L118
 # Create worker actors
 self._actor_handlers = []
 master_addr, master_port = None, None
@@ -118,7 +118,7 @@ for rank in range(world_size):
         master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
 ```
 
-排障动作：多机环境要确认节点间能访问 rank 0 选出的端口范围；端口冲突或防火墙会表现为 distributed init 卡住。
+排障动作：多机环境要确认节点间能访问 rank 0 最终选出的端口，不要只放行 20000–21000；端口冲突或防火墙会表现为 distributed init 卡住。
 
 ## Q3：fractional GPU 会不会让多个 rank 随机共享一张 GPU？
 
@@ -150,7 +150,7 @@ actor = TrainRayActor.options(
 ).remote(world_size, rank, master_addr, master_port)
 ```
 
-排障动作：如果 rank 与 GPU 对不上，先查 06 里的 `reordered_bundle_indices` 日志，再查 RayTrainGroup 的 rank 到 bundle index，而不是只盯 0.4。
+排障动作：如果 rank 与 GPU 对不上，先查 [[Slime-PlacementGroup]] 的 `reordered_bundle_indices`，再查 RayTrainGroup 的 rank 到 bundle index，而不是只盯 0.4。
 
 ## Q4：为什么不直接 pop `CUDA_VISIBLE_DEVICES`？
 
@@ -174,7 +174,7 @@ def get_local_gpu_id():
 os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
 ```
 
-排障动作：在 actor 进程里同时打印 `CUDA_VISIBLE_DEVICES`、`ray.get_gpu_ids()` 和 `LOCAL_RANK`，确认 local ordinal 是否可被 `torch.cuda.set_device` 使用。
+排障动作：在 actor 进程里同时打印 `CUDA_VISIBLE_DEVICES`、`ray.get_gpu_ids()` 和 `LOCAL_RANK`，确认 local ordinal 是否可被 `torch.cuda.set_device` 使用。若 Ray GPU id 不在 CVD 列表中，当前实现会在 `.index(...)` 直接抛 `ValueError`。
 
 ## Q5：critic 能启用 routing replay 吗？
 
@@ -194,7 +194,7 @@ if self.args.use_routing_replay and self.role == "actor":
 当每个 rank 需要不同外部输入时传 list；否则传单个对象广播给所有 rank。critic values refs 是典型 list 场景。下面只截取控制分支，不摘录文档字符串。
 
 ```python
-# 来源：slime/ray/actor_group.py L131-L149
+# 定位骨架（据 `slime/ray/actor_group.py` L131-L149 删去 docstring 与广播分支）：
 def async_train(self, rollout_id, rollout_data_ref, external_data=None):
     if isinstance(external_data, list):
         assert len(external_data) == len(self._actor_handlers)
@@ -204,11 +204,11 @@ def async_train(self, rollout_id, rollout_data_ref, external_data=None):
         ]
 ```
 
-排障动作：如果传 list，长度必须等于 actor 数。长度不匹配会 assert；传单个 dict 则所有 rank 看到同一个 external data。
+排障动作：如果传 list，长度必须等于 actor 数。长度不匹配会 assert；通过后，第 `i` 个元素只交给第 `i` 个 actor rank。传单个 dict 才是所有 ranks 收到同一个对象。
 
 ## Q7：`set_rollout_manager` 为什么只有 rank 0 上报 parallel config？
 
-训练并行配置只需要一份。rank 0 将 `train_parallel_config` 推给 RolloutManager，供 rollout 侧构造 batch 时使用。
+训练并行配置只需要一份。group 仍会对所有 ranks 调用该方法，使每个 rank 保存 RolloutManager handle；rank 0 才额外将 `train_parallel_config` 推给 RolloutManager，供 rollout 侧构造 batch 时使用。
 
 ```python
 # 来源：slime/ray/train_actor.py L125-L128
@@ -249,14 +249,14 @@ if self.args.offload_train and self.args.train_backend == "megatron":
     env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 ```
 
-排障动作：确认 `torch_memory_saver` 安装路径下存在源码枚举的任一 `.so`。不要等到 Megatron actor init 后再查，这个错误发生在 Ray actor 创建前。
+排障动作：确认 `torch_memory_saver` 安装路径下存在源码枚举的任一 `.so`。不要等到 Megatron actor init 后再查，这个错误发生在 Ray actor 创建前。若启动成功但 sleep/wake_up 卡住，再查 process group 的销毁/重载、memory saver 的 pause/resume，以及 PPO 非 colocate 场景的 rollout-engine 断连与重连。
 
 ## Q9：async train loop 为什么 update 前要 drain generate？
 
 异步训练会预取下一轮 generate。如果此时更新权重，可能在一次 generate 途中改变 rollout engine 权重。`train_async.py` 在 update 前显式等待预取完成并清空 future。
 
 ```python
-# 来源：train_async.py L30-L40
+# 来源：train_async.py L30-L39
 # async train loop.
 rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
 for rollout_id in range(args.start_rollout_id, args.num_rollout):
@@ -270,7 +270,7 @@ for rollout_id in range(args.start_rollout_id, args.num_rollout):
 ```
 
 ```python
-# 来源：train_async.py L65-L70
+# 来源：train_async.py L65-L69
 if (rollout_id + 1) % args.update_weights_interval == 0:
     # sync generate before update weights to prevent update weight in the middle of generation
     rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None

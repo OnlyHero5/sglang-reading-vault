@@ -13,63 +13,99 @@ tags:
   - framework/slime
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
-
 # RL 训练闭环主线
 
-## 读者任务
+## 你为什么要读
 
-这篇只追踪一组 prompt 如何经过 rollout、reward、训练和权重同步，最终让下一轮 rollout 使用新 policy。
+这篇追踪一组 prompt 怎样变成 samples、训练 batch、optimizer step 和新 rollout policy。重点不是背 `generate → train → update`，而是解释每一步使用的对象、policy 身份和版本；同步与异步 loop 在这些钟表上并不相同。
 
-## 先建立心理模型
+## 五只钟与四种身份
 
-RL 闭环里至少有四只钟：`rollout_id` 标记编排轮次，Sample 记录生成事实，optimizer step 推进训练参数，`weight_version` 标记推理侧实际加载版本。四只钟不自动同步；Slime 的工程价值，就是在 Ray、Megatron 和 SGLang 之间把它们对齐。
+| 状态 | 表示什么 | 不能冒充 |
+|------|----------|----------|
+| `rollout_id` | driver 编排轮次 | Sample group id、weight version |
+| Sample `index/group_index` | 样本与比较组身份 | policy 版本 |
+| optimizer step | 训练参数更新次数 | engine 已完成加载 |
+| updater/engine version | rollout engine 可见权重版本 | 每条 Sample 自动携带的字段 |
+| sample age | 生成到训练的时间/step 差 | 单凭 rollout_id 就能精确推出 |
+
+policy 还要分 rollout、old、current、reference；详见 [[RL后训练数学基础]]。
 
 ## 对象生命周期
 
 ```mermaid
 flowchart LR
-    P["prompt group"] --> S["list Sample"]
-    S --> T["列式 train_data"]
-    T --> D["per-DP ObjectRef"]
-    D --> B["rank-local RolloutBatch"]
-    B --> A["advantages returns"]
-    A --> L["policy loss"]
-    L --> O["optimizer step"]
-    O --> W["weight update"]
-    W --> P
+    P["prompt groups"]
+    G["rollout policy + SGLang"]
+    S["grouped Sample<br/>tokens / logprob / reward"]
+    C["RolloutManager convert"]
+    D["per-DP Box(ObjectRef)"]
+    B["rank-local RolloutBatch"]
+    A["advantages / returns"]
+    L["current-policy loss"]
+    O["optimizer step"]
+    W["weight updater / engine commit"]
+    P --> G --> S --> C --> D --> B --> A --> L --> O --> W
+    W --> G
 ```
 
-## 六个边界
+回环连接到“rollout policy”，不是 prompt：DataSource 仍提供 prompt，新权重改变的是下一次生成分布。
 
-| 边界 | 必须保持的语义 |
-|------|----------------|
-| PlacementGroup | rollout、actor、critic 的 GPU 所有权 |
-| RolloutManager | Sample 到训练数据的转换和 rollout 分组 |
-| Ray ObjectRef | 主进程不直接持有所有 rank 数据 |
-| Megatron data iterator | 执行预先计算的 micro-batch 顺序 |
-| loss | current/old/ref logprob 与 advantage 口径一致 |
-| weight sync | 暂停、flush、传输、版本更新、恢复的顺序一致 |
+## 闭环的六个交接边界
 
-## 关键不变量
+| 边界 | 必须保持的语义 | 常见失败 |
+|------|----------------|----------|
+| Placement / lifecycle | actor、critic、engine 的调度与显存所有权 | colocate 峰值重叠、actor pending |
+| DataSource → rollout | prompt group、repeat、buffer/续训身份 | group 拆散、重复/丢样本 |
+| generate → reward/filter | token/logprob/status 与 RM 长度 | `strict=False` 静默截短、fan-out 嵌套 |
+| Sample → train ObjectRef | 拍平、字段转换、DP split | rank batch 不等、mask/length 错位 |
+| advantage → policy loss | reward/value/KL 与 current/old/ref 口径 | baseline 混淆、CP reducer 分叉 |
+| actor → rollout engine | updater 介质、lock、commit/version | 半更新、旧 engine、无统一 rollback |
 
-- 同一个 prompt 的多条 response 在需要 group baseline 时不能被错误拆散。
-- PP 非 last stage 不应假装拥有完整 advantage/logprob 输出。
-- DP normalization 必须使用正确 group 和 mask。
-- 下一轮 rollout 开始前，所有可更新 engine 应看到同一 weight version。
+## 同步与异步的版本差别
+
+### 同步 `train.py`
+
+第 `n` 轮 generate 完成后训练，再更新 engine；下一轮 generate 通常发生在更新之后。首次 rollout 前还有一次 initial weight push。
+
+### `train_async.py`
+
+第 `n+1` 轮 generate 会在第 `n` 轮训练时提前启动。到 `update_weights_interval` 边界，driver 先等待 next-generation future，再更新，避免单次 generation 中途换权重；已生成样本不会因此变新。该入口不支持 colocate。
+
+### fully async
+
+持续生成、训练和版本队列的语义更复杂，应单独阅读 [[Slime-其他Rollout路径]]；不要把它等同于 `train_async.py` 的一轮预取。
+
+## 五个关键不变量
+
+1. 需要 group baseline 的 response 在 normalization 前保留正确组身份。
+2. token、response length、loss mask、logprob 和 advantage 位于相容空间。
+3. advantage 的核心计算只在 pipeline last stage 执行；CP/DP 归约按真实 group 和 mask 完成。
+4. current/old/rollout/reference logprob 的来源与配置一致。
+5. 同步 loop 下一轮生成前应完成计划中的 engine 更新；异步 loop 则必须明确允许的 staleness，而不是宣称所有 engine/sample 随时同版本。
+
+## 权重同步不要背固定动作序列
+
+distributed、tensor/IPC、full disk 和 delta disk 的暂停、传输、cache、commit 与失败状态不同。统一检查的是 writer/reader、metadata、payload、lock/quiescence、cache 失效、engine version 和失败恢复；详见 [[Slime-权重同步]]。
 
 ## 运行验证
 
-操作：按 [[Slime闭环实验]] 分别运行 debug rollout/train 路径，保存日志，并检查 Sample、loss 与 weight version。
+按 [[Slime闭环实验]] 分三层：
 
-预期：`debug_rollout_only` 能生成 Sample 而不训练；`debug_train_only` 能使用已保存数据复现 loss；真实闭环中 weight version 应随更新前进。
+1. `debug_rollout_only`：验证 Sample、reward、trace；预期在 train-data conversion 前返回，actor 不训练。
+2. `load_debug_rollout_data` / `debug_train_only`：重放固定数据，验证 advantage/loss；预期不实例化 SGLang serving 路径。
+3. 真实闭环：记录 initial push、每轮 generate/train/update、engine version、sample 数和失败数。
+
+没有完整 GPU/Ray/Megatron/SGLang 环境时，完成静态调用链和 CPU contract；不要仅凭日志中出现 `update_weights` 就宣称所有 engine 数值一致。
 
 ## 深入入口
 
-- 完整证据：[[Slime-RL训练全链路]]
+- 全链路：[[Slime-RL训练全链路]]
+- Rollout 对象：[[Slime-Rollout生成]]
 - Sample：[[Slime-Sample数据契约]]
-- 训练步骤：[[Slime-训练步骤]]
+- 训练分层：[[Slime-训练后端]]
 - Advantage：[[Slime-Advantage计算]]
 - Policy loss：[[Slime-Policy-Loss]]
-- 权重同步：[[Slime-分布式权重同步]]
+- 权重发布：[[Slime-权重同步]]

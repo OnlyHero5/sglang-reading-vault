@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/concept
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # 分布式权重同步 · 核心概念
 
@@ -44,7 +44,7 @@ Slime 在 actor 初始化时选择 weight updater。本专题只读 `UpdateWeigh
 源码入口：来源：slime/backends/megatron_utils/actor.py L139-L168
 
 ```python
-# 来源：slime/backends/megatron_utils/actor.py L139-L168
+# 定位骨架（基于 slime/backends/megatron_utils/actor.py L139-L168；省略 updater 构造参数）
 if self.args.colocate:
     assert (
         self.args.update_weight_mode == "full"
@@ -77,7 +77,7 @@ else:
 
 ## PP source rank：谁负责发权重
 
-流水线并行下，每个 PP stage 只持有一部分层。该 stage 内只有 `DP rank = 0` 且 `TP rank = 0` 的 rank 是 source，负责创建 `slime-pp_{pp_rank}` group 并向 rollout engines broadcast。
+流水线并行下，每个 PP stage 只持有一部分层。该 stage 内只有 `DP-with-CP rank = 0` 且 `TP rank = 0` 的 rank 是 source，负责创建 `slime-pp_{pp_rank}` group 并向 rollout engines broadcast。开启 CP 时，这个条件也把 source 收缩到 combined DP×CP group 的 rank 0，不应只写成普通 DP rank。
 
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L57-L92
 
@@ -121,7 +121,7 @@ if self._is_pp_src_rank:
 源码入口：来源：slime/backends/megatron_utils/update_weight/common.py L15-L50
 
 ```python
-# 来源：slime/backends/megatron_utils/update_weight/common.py L15-L50
+# 定位骨架（基于 slime/backends/megatron_utils/update_weight/common.py L15-L50；省略 stride 断言与形态修正）
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     if "expert_bias" in name:
         return param
@@ -176,6 +176,8 @@ def _send_weights(self, pbar: tqdm | None) -> None:
 源码入口：来源：slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py L178-L238
 
 Expert chunk 的 buffer 判断会乘上 EP world size，这是 MoE 模型调 `update_weight_buffer_size` 时最容易忽略的点。
+
+`update_weight_buffer_size` 只是 flush 阈值，不是严格峰值上限：非 expert 路径若单个 `convert_to_hf` 结果本身超过阈值，仍会作为一个超大 bucket 发送；expert 路径也会先把至少一个参数放入 batch，再在后续 flush。调参时必须同时看最大单参数或转换 chunk。
 
 ## 双通道传输：Ray 负责形状，NCCL 负责字节
 
@@ -240,6 +242,8 @@ ray.get(self.rollout_engine_lock.release.remote())
 pbar.update(1)
 ```
 
+当前 acquire→update→release 没有 `try/finally`，轮询也没有 timeout。metadata RPC、broadcast 或 `ray.get(refs)` 任一异常都可能让锁永久占用，后续 PP source 只会持续轮询。
+
 ## `weight_version` 是闭环验收信号
 
 `UpdateWeightFromDistributed.update_weights()` 每次递增 `weight_version`，发送 metadata 时传给 engine。CI 模式下 actor 会随机抽一个 engine 校验版本一致。
@@ -249,6 +253,12 @@ pbar.update(1)
 源码入口：来源：slime/backends/megatron_utils/actor.py L625-L636
 
 如果版本不一致，说明至少有一个 engine 没完成这轮更新，下一轮 rollout 可能混用旧权重。
+
+反过来，抽查一致也不能证明全部 engine 一致：CI 只随机选择一个 engine。并且 updater 在 pause/发送之前就递增 `weight_version`；失败不会回退版本，因此它是尝试版本/诊断标记，不是原子 commit id。
+
+## 重连不是无状态替换
+
+`connect_rollout_engines` 先把 `self.rollout_engines` 更新为新列表，再在旧 process group 存在时调用 disconnect。若 fault tolerance 真正替换了 engine actor，销毁 RPC 会发给新列表，旧 actor 上同名 group 可能残留。当前实现更适合“原列表扩展或仍可访问”的情形；替换拓扑需要显式验证旧组清理。
 
 ## HfWeightIteratorDirect 与本专题的关系
 

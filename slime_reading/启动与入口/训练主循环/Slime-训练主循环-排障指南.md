@@ -36,6 +36,10 @@ updated: 2026-07-10
         elapsed += log_interval
         total = ray.cluster_resources().get("GPU", 0)
         available = ray.available_resources().get("GPU", 0)
+        logger.info(
+            f"Waiting for placement group of {num_gpus} GPUs (elapsed {elapsed}s): "
+            f"{total:g} GPUs registered with Ray, {available:g} available."
+        )
 ```
 
 处理：
@@ -109,9 +113,9 @@ updated: 2026-07-10
 - 确认 train 后先释放训练侧，再 onload rollout weights。
 - KV onload 在 update 后，不要提前。
 
-## 症状四：PPO 前几步 actor 没更新
+## 症状四：PPO 前几步 actor 没做 optimizer step，但版本仍变化
 
-判断：这是 `num_critic_only_steps` 的设计。`actor_trains_this_step` 为 false 时，只训练 critic 并等待 `value_refs`。
+判断：这是 `num_critic_only_steps` 的设计。`actor_trains_this_step` 为 false 时，只训练 critic 并等待 `value_refs`；但同步 step 尾部仍调用 actor 发布门面。
 
 ```python
 # 来源：train.py L72-L79
@@ -130,6 +134,7 @@ updated: 2026-07-10
 - 检查 `advantage_estimator` 是否为 PPO，因为参数校验用它设置 `use_critic`。
 - 检查当前 `rollout_id` 是否小于 `num_critic_only_steps`。
 - 保存逻辑也用同一判定，critic-only 阶段不会保存未训练 actor。
+- 不要用 weight version 是否递增判断 actor 是否做过 optimizer step；应检查训练分支、参数/optimizer 状态或数值比较。
 
 ## 症状五：eval-only 没有进入训练循环
 
@@ -167,7 +172,7 @@ def train(args):
 
 ## 症状七：async 下 rollout policy 滞后
 
-判断：`update_weights_interval > 1` 时，多个 rollout 可能在同一批 actor 权重下生成。update 前源码会 drain 正在预取的 generate，避免中途换权重。
+判断：流水预取先启动 `generate(N+1)`，再训练 N，所以即使 interval 为 1，N+1 也相对 train N 的新权重至少滞后一拍。`update_weights_interval > 1` 会进一步让多个训练步之间不发布。update 前源码会 drain 正在预取的 generate，避免同一次生成中途换权重。
 
 ```python
 # 来源：train_async.py L65-L69
@@ -180,7 +185,7 @@ def train(args):
 
 处理：
 
-- 默认倾向 `update_weights_interval=1`。
+- `update_weights_interval=1` 只能缩小额外发布间隔，不能消除流水线固有的一拍 staleness。
 - 增大 interval 前确认算法能容忍 off-policy/staleness。
 - 如果看到吞吐提高但 reward 变差，优先排查这里。
 
@@ -220,7 +225,7 @@ def train(args):
 ```
 
 ```python
-# 来源：slime/utils/arguments.py L1866-L1883
+# 来源：slime/utils/arguments.py L1866-L1879
     if args.debug_rollout_only:
         if args.colocate and args.rollout_num_gpus is None:
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes

@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # 通用模型
 
@@ -18,10 +18,11 @@ updated: 2026-07-10
 读完后应能回答：
 
 1. HF `config.architectures` 如何映射到 `Qwen3ForCausalLM` 或 `LlamaForCausalLM`。
-2. `EntryClass` 为什么是模型文件暴露给 Registry 的入口。
+2. `EntryClass` 为什么是模型模块暴露给 Registry 的入口，以及“模块导入失败”为什么会表现成 architecture 没注册。
 3. 一个 batch 的 `input_ids/positions/ForwardBatch` 如何穿过 embedding、decoder layers、attention、lm_head。
 4. 一个 checkpoint 名字如 `q_proj.weight` 如何变成 fused `qkv_proj` 参数写入。
 5. Llama 与 Qwen3 的通用骨架相同在哪里，Qwen3 的 attention TP、QK-Norm、LayerCommunicator 又改变了哪里。
+6. `tie_word_embeddings`、PP、split-prefill 和 ROCm fused mRoPE 分别有哪些不能省略的适用条件。
 
 ## 阅读路径
 
@@ -54,9 +55,9 @@ flowchart LR
 
 | 账本 | 源码对象 | 负责什么 |
 |------|----------|----------|
-| 类账 | `get_model_architecture` / `ModelRegistry` / `EntryClass` | architecture 字符串到 Python 模型类 |
-| 执行账 | `*Model.forward` / `*DecoderLayer.forward` / `*Attention.forward` | hidden states、residual、PP proxy、attention backend 入口 |
-| 权重账 | `*ForCausalLM.load_weights` / `stacked_params_mapping` | checkpoint name remap、PP stage skip、QKV/gate-up fused 参数写入 |
+| 类账 | `get_model_architecture` / `ModelRegistry` / `EntryClass` | 先选择 native、Transformers 或 MindSpore 路线，再把 architecture key 解析成 Python 类 |
+| 执行账 | `*Model.forward` / `*DecoderLayer.forward` / `*Attention.forward` | hidden states、residual、PP proxy 与模型特有的 Q/K/V 准备；backend 选择仍在 attention 层 |
+| 权重账 | `*ForCausalLM.load_weights` / `stacked_params_mapping` | checkpoint name remap、PP stage skip、tied embedding 补写、QKV/gate-up fused 参数写入 |
 
 ## 核心源码证据
 
@@ -102,7 +103,7 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     return model_cls, resolved_arch
 ```
 
-Registry 本身不理解 Llama 或 Qwen3 的内部结构。它只把候选 architecture 规范化，然后按顺序尝试加载类：
+Registry 本身不理解 Llama 或 Qwen3 的内部结构。当前基线中，模型模块早已在注册阶段被导入；resolve 阶段只是过滤 key，并从字典按顺序取出第一个已注册类：
 
 ```python
 # 来源：python/sglang/srt/models/registry.py L61-L91
@@ -165,7 +166,7 @@ class Qwen3Model(Qwen2Model):
 | 路径 | 读它时关注什么 |
 |------|----------------|
 | `python/sglang/srt/model_loader/utils.py` | architecture 归一化、Transformers/MindSpore fallback、resolved 字段 |
-| `python/sglang/srt/models/registry.py` | `EntryClass` 扫描、外部包覆盖、候选 architecture resolve |
+| `python/sglang/srt/models/registry.py` | 模块扫描与容错导入、`EntryClass.__name__` 注册、外部包覆盖、候选 key resolve |
 | `python/sglang/srt/models/llama.py` | 通用 decoder-only 样板、PP stage、QKV/gate-up 权重映射 |
 | `python/sglang/srt/models/qwen2.py` | Qwen 系模型共享的 `Qwen2Model` 骨架 |
 | `python/sglang/srt/models/qwen3.py` | QK-Norm、attention TP、fused mRoPE、LayerCommunicator、Qwen3 load_weights |
@@ -183,8 +184,8 @@ class Qwen3Model(Qwen2Model):
 
 ## 判断标准
 
-- 看到 `Model architectures <archs> are not supported`，知道先查 `architectures` 字符串和 `EntryClass.__name__`。
-- 看到 native 模型没命中，知道查 `SGLANG_DISABLED_MODEL_ARCHS`、外部包覆盖和 Transformers fallback。
-- 看到 PP 中间 rank 没 logits，知道非 last rank 只返回 `PPProxyTensors` 或 hidden states。
-- 看到 Qwen3 KV cache 被重复写，知道看 fused mRoPE 路径和 `save_kv_cache=False`。
+- 看到 `Model architectures <archs> are not supported`，知道先查 `architectures` 字符串、模型模块是否成功导入和 `EntryClass.__name__`。
+- 看到 native 模型没命中，知道 `SGLANG_DISABLED_MODEL_ARCHS` 按模块 basename 跳过导入，外部包可覆盖同名 key；随后再检查 Transformers 兼容性门禁和实际 resolved backend。
+- 看到 PP 中间 rank 没 logits，知道底层 model 返回 `PPProxyTensors`，CausalLM wrapper 只是把这个对象继续向 stage 边界交付。
+- 看到 Qwen3 KV cache 被重复写，先确认是否真的满足 ROCm/Aiter/MRoPE fused 条件，再核对 `save_kv_cache=False`；普通 Qwen3 decode 不应默认套用这条路径。
 - 看到权重名字不匹配，知道先查模型类 `load_weights`，再查参数 `weight_loader`。

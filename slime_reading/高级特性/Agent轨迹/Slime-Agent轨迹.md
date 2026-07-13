@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-13
 ---
 # Agent轨迹
 
@@ -53,12 +53,24 @@ flowchart LR
 | 文件 | 负责什么 |
 |------|----------|
 | `slime/agent/adapters/common.py` | BaseAdapter session 生命周期、一轮 turn pipeline、SGLang `/generate` 调用 |
-| `slime/agent/adapters/openai.py` | OpenAI Chat Completions wire 翻译、回复封装、session id 解析 |
+| `slime/agent/adapters/openai.py` | OpenAI Chat Completions wire 翻译、回复封装、session id 解析；不实现 `/v1/responses` |
 | `slime/agent/adapters/anthropic.py` | Anthropic Messages wire 翻译、tool block、mid-list system 处理 |
 | `slime/agent/parsing.py` | reasoning 和 tool call 解析，输出 `ParsedModelOutput` |
 | `slime/agent/trajectory.py` | `TurnRecord`、`MessageNode`、drift 分类、tree 到 `Sample` 线性化 |
 | `docs/en/get_started/agent.md` | 推荐集成方式：custom generate、fan-out、session affinity |
 | `tests/test_agent/` | adapter、trajectory branching、harness、CPU rollout 验证 |
+
+## 一页契约图
+
+| 层 | 真正的判定键 | 不保证什么 |
+|----|----------------|--------------|
+| wire → manager message | 规范化后的 dict equality | 完整保留 wire 所有字段、id 和并行 tool call |
+| manager routing tree | `(role, message ==)` 的最深前缀 | token ids 相同，或客户端语义一定相同 |
+| leaf → builder | `prompt_ids` 与已持有 tokens 的 common prefix | 一棵 tree 只产生一个 sample |
+| builder → Sample | `leading_prompt_len`、`loss_mask`、logprob 并行数组 | 截断后仍一定保留训练 token |
+| session → fan-out | DFS leaf 顺序、`response_trained`、每个 sample 完整 reward | reward 在 sibling samples 间平分，或失败后可无损重试 |
+
+两个最容易误解的边界：OpenAI adapter 只实现 `/v1/chat/completions`；官方 agent 文档的 `finish_session(session_id)` 示例省略了当前函数必需的 `base_sample`，不能原样复制运行。
 
 ## 阅读顺序
 

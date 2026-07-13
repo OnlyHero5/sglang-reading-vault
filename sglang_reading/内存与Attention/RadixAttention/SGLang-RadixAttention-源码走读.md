@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/walkthrough
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # RadixAttention · 源码走读
 
@@ -25,7 +25,7 @@ updated: 2026-07-10
 
 ## 长文读法
 
-这篇按“命中、少算、写回、释放”四件事读：调度先用 `RadixKey(token_ids, extra_key)` 做 prefix match，把 `prefix_indices` 和 `last_node` 写回 `Req`；admission 阶段临时锁住命中节点并决定本轮 extend 范围；`prepare_for_extend` 只取未命中的 tail 进入 batch；chunked prefill 和 finished 请求再把 KV 插回树，并释放重复 KV、未对齐 tail 或可驱逐 leaf。
+这篇按“命中、少算、写回、释放”四件事读：调度先用 `RadixKey(token_ids, extra_key)` 做 prefix match，把 `prefix_indices` 和 `last_node` 写回 `Req`；admission 阶段临时锁住命中节点并决定本轮 extend 范围；`prepare_for_extend` 只取本轮尚未计算的 tail 进入 batch；chunked prefill 和 finished 请求再把 KV 插回树，并释放重复 KV、未对齐 tail 或可驱逐 leaf。
 
 | 读者任务 | 先读 | 要抓住的判断 |
 |----------|------|--------------|
@@ -115,7 +115,7 @@ def match_prefix_for_req(
     return match_result
 ```
 
-这里的关键不是函数名，而是写回字段：后续所有“少算多少 token”的判断都看 `req.prefix_indices`。`SGLANG_RADIX_FORCE_MISS` 是最直接的 A/B 验证开关。
+这里的关键不是函数名，而是写回字段：admission 用 `len(req.prefix_indices)` 决定从哪里继续算。此刻它确实等于 device tree hit；但 chunked commit 之后同一字段可能附带请求私有 tail，届时要用 `cache_protected_len` 区分 tree ownership。`SGLANG_RADIX_FORCE_MISS` 是最直接的 A/B 验证开关。
 
 ## 2. tree match 会先处理 EAGLE 与 page 边界
 
@@ -270,9 +270,9 @@ split 不是复制一份完整 KV cache。它把原节点的 key/value 切成前
                 self._req_inc_lock_ref(req)
 ```
 
-读到这里，TTFT 改善的原因已经能落到字段级：如果 2k system prompt 命中，`len(req.prefix_indices)` 就接近 2k，`set_extend_range` 的 start 也会跳过这段。
+读到这里，潜在的 TTFT 收益已经能落到字段级：如果 2k system prompt 命中，`len(req.prefix_indices)` 就接近 2k，`set_extend_range` 的 start 也会跳过这段。端到端 TTFT 是否实际改善仍取决于并发、排队、host load-back、batch 组成和 backend，不由这一行源码单独保证。
 
-## 5. `prepare_for_extend` 只取未命中 tail
+## 5. `prepare_for_extend` 只取本轮尚未计算的 tail
 
 到了 batch 组装阶段，`input_ids` 明确从 `len(r.prefix_indices)` 之后开始取。随后 `alloc_for_extend` 只给这些 extend token 分配 `out_cache_loc`。
 
@@ -405,7 +405,7 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         req.last_node = new_last_node
 ```
 
-这段是整个专题最容易读夹生的地方。正确心理模型是：请求手里原本有一批 KV slot；写树后，tree 可能选择复用已有 slot，所以请求必须丢掉重复 slot，并把 req pool 中的一段改写成 tree 的 canonical indices。
+这段是整个专题最容易读夹生的地方。正确心理模型是：请求手里原本有一批 KV slot；写树后，tree 可能选择复用已有 slot，所以请求必须丢掉重复 slot，并把 req pool 中 tree-owned 的一段改写成 canonical indices。若 page/EAGLE 留下 tail，`prefix_indices` 继续保留它供下一 chunk 跳过，但 `cache_protected_len` 不会把这段冒认成 tree-owned。
 
 ## 7. finished 请求释放重复和未对齐 tail
 

@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # 外部推理引擎
 
@@ -17,7 +17,7 @@ updated: 2026-07-10
 
 这组笔记解决一个部署问题：SGLang server 已经由外部系统启动，Slime 训练任务不再占用 rollout GPU、不再 launch server，但仍要发现这些 server、注册到 router、发 generate 请求，并在训练后同步新权重。
 
-读完后，读者应该能判断什么时候用 `--rollout-external-engine-addrs`，什么时候应该继续用 `--sglang-config`；也应该能排查 external 模式下的发现失败、router 注册失败、PG 仍占 GPU、权重同步路径选错和外部 engine 不可恢复等问题。
+读完后，读者应该能判断什么时候用 `--rollout-external-engine-addrs`，什么时候应该继续用 `--sglang-config`；也应该能排查 external 模式下的发现失败、重复地址计数、PD 拓扑不完整、第二个多节点地址未注册、PG 仍占 GPU、权重同步路径选错和外部 engine 不可恢复等问题。
 
 ---
 
@@ -118,13 +118,16 @@ if args.rollout_external:
 
 ---
 
-## 本专题先记住的五个判断
+## 本专题先记住的八个判断
 
 1. external 模式不是绕过 Slime rollout，而是把 SGLang server 进程生命周期移到外部。
 2. `SGLangEngine` actor 仍存在，但 `num_gpus=0`，它是控制面 adapter，不是推理进程。
 3. `rollout_num_gpus` 在 external 模式下是逻辑容量，用于并发与权重 rank 推导，不代表 PG 预留了这些 GPU。
 4. external 默认只表示一个 default rollout model；需要多模型、冻结 reference/reward 或复杂 server group 时优先用 `--sglang-config`。
 5. external 的故障恢复和 server 重启归外部系统，Slime 只负责发现、注册、发请求和同步权重。
+6. 地址列表没有去重：重复地址会重复计算 engine/GPU、重复创建 adapter，并放大权重 rank 与 offset 账。
+7. fallback GPU 数只按 `TP×PP` 推导，不含 DP/EP；复杂并行部署应让 `/server_info` 显式返回 `num_gpus` 或 `num_gpus_per_engine`。
+8. 一地址一 adapter 不等于一地址一定注册：当前 `rank→node_rank` 复用 managed-engine 公式，多节点 external 地址可能得到 `node_rank!=0`，从而跳过 Router 注册和控制请求；PD 也只检查“存在任一 PD worker”，不验证 prefill/decode 成对。
 
 ---
 
@@ -134,8 +137,9 @@ if args.rollout_external:
 |------------|------|----------|
 | server discovery | 外部 engine `/server_info` 或 `/get_server_info` | 返回 worker type、TP/PP/GPU 数 |
 | Slime 识别 external | 日志 `Detected external SGLang engines` | engine 数与地址数一致，GPU 数来自 server_info |
+| 地址与 PD 拓扑 | 对地址去重并统计 worker type | URL 唯一；prefill/decode 两侧都存在；复杂并行显式给总 GPU 数 |
 | PG 不占 rollout GPU | `test_placement_group.py -k external` 或日志 PG GPU 数 | 普通 external 只创建 actor GPU 数，debug rollout external 为 0 |
-| router 注册 | router `/workers` | regular/prefill/decode worker 出现，prefill 有 bootstrap port |
+| router 注册 | router `/workers` | 每个预期 regular/prefill/decode URL 都出现，prefill 有 bootstrap port；尤其核对第二个多节点地址 |
 | generate 通道 | rollout 请求日志或 HTTP client metrics | 请求打 router，不打 Ray actor 做 forward |
 | 权重同步 | disk/NCCL 路径日志 | external server 热加载新权重，版本与 updater 对齐 |
 

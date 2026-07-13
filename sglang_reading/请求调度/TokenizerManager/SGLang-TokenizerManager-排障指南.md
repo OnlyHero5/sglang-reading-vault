@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # TokenizerManager · 排障指南
 
@@ -22,10 +22,10 @@ updated: 2026-07-10
 | text 请求报 `skip_tokenizer_init=True cannot accept text prompts` | 启动时跳过 tokenizer，却仍传 `text` | `_tokenize_one_request` | 改传 `input_ids`，或关闭 `skip_tokenizer_init` |
 | 请求在权重更新期间迟迟不进入 Scheduler | 等待 pause 解除或 writer lock | `generate_request`、`update_weights_*` | 打日志看是否停在 `is_pause_cond` 或 `model_update_lock.reader_lock` |
 | 流式中间包 `text=None` | 非 incremental streaming 延迟 materialize，避免 O(n^2) 拼接 | `_handle_batch_output`、`_wait_one_response` | 打开 `--incremental-streaming-output` 对比输出形态 |
-| 流式输出一次吐多个 token | 前台消费慢或 `batch_notify_size` 批量唤醒导致 chunk backlog | `_coalesce_streaming_chunks` | 观察 backlog warning、调小 batch notify 或检查客户端消费 |
+| 流式输出一次吐多个 token | 前台消费慢或协程调度期间同一 rid 积压多个 delta | `_coalesce_streaming_chunks` | 观察 backlog warning和客户端消费；不要把 `batch_notify_size` 当成跨消息 token buffer |
 | 多 worker 下回包找不到 state | `http_worker_ipc` 丢失或路由回错误 worker | `_dispatch_to_scheduler`、`_distribute_result_to_workers` | 检查请求对象和回包里的 `http_worker_ipc(s)` |
-| `rid_to_state` 增长 | 请求到 Scheduler 前异常未清理，或后端没有 finished 回包 | `_discard_pending_req_states`、`_handle_batch_output` | 注入超长 prompt 或校验失败，确认异常路径 pop state |
-| 客户端断连后 GPU 仍在跑 | abort 没有及时发到 Scheduler，或 background 请求不检查断连 | `_wait_one_response`、`abort_request` | 断开 SSE 连接，看是否发送 `AbortReq` |
+| `rid_to_state` 增长 | 请求到 Scheduler 前异常未清理、后端没有 finished 回包，或 `n>1` 留下规范化 placeholder state | `_discard_pending_req_states`、`_handle_batch_output`、`_handle_batch_request` | 分别对照失败请求、普通 `n=1`、固定 `B/N` 的 `n>1` 请求完成前后 state 数量 |
+| 客户端断连后 GPU 仍在跑 | streaming background abort 未执行、非流式轮询未命中，或 `AbortReq` 未传播 | `create_abort_task`、`_wait_one_response`、`abort_request` | 区分 SSE 与非流式连接，沿同一 rid 检查 background task 和 Scheduler abort echo |
 
 ## `skip_tokenizer_init=True` 不是“只少一步分词”
 
@@ -182,7 +182,7 @@ updated: 2026-07-10
 
 ## 为什么一次 SSE chunk 会包含多个 token
 
-后台收包不会每条结果都立即唤醒前台；它会按 `batch_notify_size` 批量 set event。前台醒来后如果 `out_list` 积压多个 incremental chunk，会合并：
+前台醒来前如果同一 `rid` 的 `out_list` 已积压多个 incremental chunk，就会合并。`batch_notify_size` 只是在处理同一个批回包时，每通知若干个 rid 后让出 event loop；批尾余数仍会立即通知，它不会跨多个后端消息主动攒 token。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/tokenizer_manager.py L1365-L1400
@@ -224,11 +224,11 @@ updated: 2026-07-10
         return out
 ```
 
-这不是 token 丢失，而是队列积压后的合并。真正要关注的是 backlog warning、ITL、HTTP 客户端消费速度和 `batch_notify_size`。
+这不是 token 丢失，而是队列积压后的合并。真正要关注的是 backlog warning、ITL、HTTP 客户端消费速度和前台协程调度；只有在单个回包 batch 很大时，`batch_notify_size` 才影响后台让出 event loop 的节奏。
 
 ## 客户端断连如何传播
 
-`_wait_one_response` 在等待 event 超时时检查 request 是否断连；如果断连且不是 background，就发 abort：
+非流式请求仍在等待时，`_wait_one_response` 每次等待 event 超时都会检查 request 是否断连；如果断连且不是 background，就发 abort：
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/tokenizer_manager.py L1455-L1472
@@ -252,6 +252,25 @@ updated: 2026-07-10
                 continue
 ```
 
+HTTP streaming 还有另一条更重要的收尾：`StreamingResponse` 注册 `create_abort_task(obj)` 为 background task，响应结束或连接被取消后延迟两秒，再对 single/batch 的实际 rid 发送 abort。正常完成时 single-worker 的 state 已删除，`abort_request` 会成为 no-op；异常断连时它负责兜底。
+
+```python
+# 来源：sglang/python/sglang/srt/managers/tokenizer_manager.py L1808-L1820
+    def create_abort_task(self, obj: GenerateReqInput):
+        # Abort the request if the client is disconnected.
+        async def abort_request():
+            await asyncio.sleep(2)
+            if obj.is_single:
+                self.abort_request(obj.rid)
+            else:
+                for rid in obj.rid:
+                    self.abort_request(rid)
+
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(abort_request)
+        return background_tasks
+```
+
 `abort_request` 只是向 Scheduler 发 `AbortReq`，不是本地强删所有状态：
 
 ```python
@@ -271,7 +290,25 @@ updated: 2026-07-10
         self._dispatch_to_scheduler(req)
 ```
 
-排查断连后 GPU 仍跑的问题，要看断连检测是否触发、`AbortReq` 是否到 Scheduler、Scheduler 是否返回 abort finish reason。
+排查断连后 GPU 仍跑的问题，要先区分 streaming background abort 与非流式轮询检测，再看 `AbortReq` 是否到 Scheduler、Scheduler 是否返回 abort finish reason。background 请求显式跳过 HTTP disconnect 轮询，因为它允许脱离原连接继续运行。
+
+## 为什么不要同时传 `text`、`input_ids` 或 `input_embeds`
+
+公开契约应当三选一。当前 `GenerateReqInput._validate_inputs` 直接拒绝的是三者全空或三者全有；若只同时传两个字段，后续 batch-size 判断和 `_tokenize_one_request` 的优先级可能产生难以预期的组合。不要把这种当前实现细节当成受支持能力，API adapter 应在边界处保持单一输入来源。
+
+验证方式：在调用方构造请求前断言非空输入字段数量为 1；若准备收紧 upstream 校验，要同时覆盖 HTTP schema、Engine API、batch 与 multimodal 用例。
+
+## `n > 1` 为什么会看到额外请求和 rid
+
+parallel sampling 不是简单让 Scheduler 对一个 rid 返回 N 份结果。TokenizerManager 会先发送一次 `max_new_tokens=0` 的前缀预热请求，再复制 tokenized object，为每个实际 sample 重新生成 rid。结果用实际 sample rid 关联，并通过 `index` 恢复 batch 位置。
+
+排查时若只按用户传入的 rid 搜日志，可能漏掉规范化 placeholder、预热和实际采样请求。应同时打印 `parallel_sample_num`、三组内部 rid、输出 `index`，并记录请求完成后的 `len(rid_to_state)`。
+
+当前源码有一个可静态闭合的风险：原始 batch 为 `B`、`n=N>1` 时，normalization 与 `_init_req_state` 创建 `B×N` 个 placeholder state，而 `_handle_batch_request` 只把前 `B` 个当作 prompt，并只显式删除这 `B` 个；余下 `B×(N-1)` 个既没有发给 Scheduler，也没有正常 finished 回包。若线上表现为“只有 `n>1` 时 state 数单调增长”，先用固定 `B/N` 连续请求，检查每轮净增长是否接近 `B×(N-1)`。这是当前基线的生命周期缺口；内存、告警或最终故障强度仍需结合真实 workload 测量，不能直接外推固定阈值。
+
+## 多 detokenizer 为什么不能只看 `MultiTokenizerRouter`
+
+当 detokenizer worker 数大于 1 时，Scheduler 输出先由 `MultiDetokenizerRouter` 根据 `http_worker_ipc` 做稳定哈希，确保同一请求持续进入同一 detokenizer；解码完成后，detokenizer worker 再直接把单条结果发送给 owner tokenizer worker。若只检查 `MultiTokenizerRouter._distribute_result_to_workers`，会漏掉这一条回程。
 
 ## input embeds 为什么要求关闭 radix cache
 

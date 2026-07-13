@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/troubleshooting
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # RolloutManager · 排障指南
 
@@ -66,17 +66,17 @@ updated: 2026-07-10
 
 源码入口：来源：slime/ray/rollout.py L667-L684
 
-**验证：** 使用保存出的 debug 文件，预期 metrics 为 None，但 `_convert_samples_to_train_data` 和 `_split_train_data_by_dp` 仍执行。
+**验证：** 使用保存出的 debug 文件，预期参数归一化强制 `debug_train_only=True`、metrics 为 None，但 `_convert_samples_to_train_data` 和 `_split_train_data_by_dp` 仍执行。注意这条路径恢复的是扁平 Sample，不会重新验证 compact sibling 的嵌套 `rollout_id` 契约。
 
 ## 5. reward normalization 为什么要在 RolloutManager 做？
 
 **症状：** 把 reward 后处理放到训练 rank 后，GRPO 类算法结果不一致。
 
-**原因：** group normalization 需要看到整个 rollout batch。DP split 后，每个 rank 只看到局部样本，无法可靠按 prompt group 归一化。
+**原因：** group normalization 需要看到整个 rollout batch。DP split 后，每个 rank 只看到局部样本，无法可靠按 prompt group 归一化。但默认实现只在固定 fanout 总数匹配时 reshape 成 prompt groups；可变 fanout fallback 会把整批当一组。
 
 源码入口：来源：slime/ray/rollout.py L686-L711
 
-**验证：** 检查 `raw_reward` 与 `rewards` 两列：前者保留原始值，后者在配置开启时被归一化。
+**验证：** 固定 fanout 检查 `raw_reward` 与 `rewards`；可变 fanout 应启用按 `group_index` 分组的 custom reward hook，并用每组均值接近 0 验证。不要把默认 fallback 的整批均值为 0 当作逐组正确。
 
 ## 6. 为什么 remove_sample 不直接删除样本？
 
@@ -98,6 +98,8 @@ updated: 2026-07-10
 
 **验证：** 看 unique `rollout_ids` 数量，而不是 `len(samples)`。如果 unique rollout 数小于 `global_batch_size`，会直接 assert。
 
+补充：若 unique rollout 数大于但不能整除 `global_batch_size`，尾部不足一整 step 的 rollout 会被静默排除。对照 partitions 的并集确认哪些 samples 真正进入训练。
+
 ## 8. static micro batch 为什么会报对齐错误？
 
 **症状：** 静态 micro batch size 下报 `num_mbs` 不是 `dp_size * mb_group` 的倍数。
@@ -107,6 +109,8 @@ updated: 2026-07-10
 源码入口：来源：slime/utils/dp_schedule.py L167-L185
 
 **验证：** 调整 `global_batch_size`、`micro_batch_size`、`dp_size` 或 VPP mb group，使 step 内 mbs 数天然对齐。
+
+若开启 `balance_by_flops`，它只允许动态 batch，并明确不保证 token cap；出现 OOM 时要打印每个实际 bin 的 token 和，不能仅检查 `max_tokens_per_gpu` 配置值。
 
 ## 9. train_parallel_config 缺失该查哪里？
 
@@ -142,7 +146,17 @@ updated: 2026-07-10
 
 **验证：** 检查 SGLang config 中只有 policy server 配 `update_weights=True`。
 
-## 12. offload_rollout 的时序是什么？
+若确实配置了多个可更新模型，当前只取 `servers` 插入顺序中的第一个；需要多模型同步时不能假设 manager 会自动遍历全部目标。
+
+## 12. custom converter 或混合可选字段为什么晚到 split/训练才报错？
+
+**症状：** custom converter 已成功返回，却在 `_split_train_data_by_dp` 报 `KeyError`；或混合来源 batch 的 logprob、teacher、MoE 字段被整列忽略。
+
+**原因：** custom converter 直接绕过默认转换，当前没有独立 schema validator，split 隐式要求 `tokens/rollout_ids`。默认 converter 的多数可选列又用 `samples[0]` 判断是否启用，第一条样本代表了整批字段形态。
+
+**验证：** custom 输出至少检查 `len(tokens) == len(rollout_ids)`，并为所有需要按 partition 切的列检查等长；混合来源数据应先统一字段存在性，不能依赖后续自动补齐。
+
+## 13. offload_rollout 的时序是什么？
 
 **症状：** 训练和 rollout 抢显存，或者 generate 时 engine 还没恢复。
 

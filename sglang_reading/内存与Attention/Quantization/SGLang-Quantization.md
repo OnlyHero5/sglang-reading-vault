@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Quantization
 
@@ -40,7 +40,7 @@ flowchart LR
 
 这六本账对应一条主线：
 
-`HF config / ServerArgs → get_quant_config → QuantizationConfig.get_quant_method → LinearBase/FusedMoE/RadixAttention 绑定 method → create_weights → model.load_weights → process_weights_after_loading → Linear.apply / MoE runner / Attention KV scale`
+`HF config / ServerArgs → ModelConfig 检测、override 与一致性校验 → get_quant_config 实例化平台相关配置类 → QuantizationConfig.get_quant_method → LinearBase/FusedMoE/RadixAttention 绑定 method → create_weights → model.load_weights → process_weights_after_loading → Linear.apply / MoE runner / Attention KV scale`
 
 读量化代码时不要先按 FP8、GPTQ、AWQ 横向扫文件。更稳的读法是先沿生命周期纵向走一遍，再回头比较不同量化格式在每个阶段改了什么。
 
@@ -103,7 +103,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 ```
 
-这张表只回答“有哪些配置类”。真正的问题是：配置类怎样读 HF 元数据、怎样给每层发 method、method 怎样注册参数、loader 何时 postprocess、forward 最后调谁。后面四篇正文按这条链路展开。
+这张表只回答“当前平台有哪些候选配置类”。在它之前，`ModelConfig` 还会从 checkpoint 元数据检测 quant method、遍历候选类执行 `override_quantization_method`，并校验 CLI 与 checkpoint 是否兼容；在它之后，CPU/NPU/out-of-tree 平台还可能替换同名配置类。真正的问题是：最终方法名怎样确定、配置类怎样读元数据、怎样给每层发 method、method 怎样注册参数、loader 何时 postprocess、forward 最后调谁。后面四篇正文按这条链路展开。
 
 ## 快速判断入口
 
@@ -112,7 +112,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 | 启动时报 invalid quantization 或 dtype 不支持 | [[SGLang-Quantization-排障指南]] 的配置与硬件症状 |
 | FP8 backend 与预期不一致 | [[SGLang-Quantization-源码走读]] 的 FP8 dispatch，配合 [[SGLang-Quantization-排障指南]] |
 | GPTQ TP size 报 shape alignment | [[SGLang-Quantization-排障指南]] 的 GPTQ 分片对齐 |
-| AWQ MoE 没走 Marlin | [[SGLang-Quantization-排障指南]] 的 AWQ fallback |
+| AWQ MoE 没走 Marlin | [[SGLang-Quantization-排障指南]] 的 AWQ 配置类矩阵与 Marlin fallback |
 | KV cache 量化输出异常 | [[SGLang-Quantization-数据流]] 的 KV scale 生命周期 |
 | 想新增一种 quant method | [[SGLang-Quantization-学习检查]] 的改代码检查表 |
 

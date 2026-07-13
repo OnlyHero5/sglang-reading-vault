@@ -9,7 +9,7 @@ tags:
   - framework/sglang
   - content/dataflow
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-11
 ---
 # Detokenizer · 数据流
 
@@ -28,9 +28,13 @@ flowchart LR
  DS["DecodeStatus"]
  BSO["BatchStrOutput"]
  RS["TokenizerManager<br/>ReqState"]
+ SKIP["skip-tokenizer<br/>直接累加 output_ids"]
+ EMB["BatchEmbeddingOutput<br/>原样透传"]
 
  REQ --> ACC --> BTO --> DT --> DS
  DS --> BSO --> RS
+ BTO -->|"skip-tokenizer-init"| SKIP
+ EMB --> DT --> RS
 ```
 
 ## 关键对象表
@@ -39,7 +43,7 @@ flowchart LR
 |------|----------|----------|------------|
 | `Req` | Scheduler | 请求执行期 | `output_ids`、`send_token_offset`、`send_decode_id_offset` |
 | `_GenerationStreamAccumulator` | Scheduler | 一次 stream_output 调用 | 把多个 `Req` 打包成 `BatchTokenIDOutput` |
-| `BatchTokenIDOutput` | IPC 消息 | Scheduler 到 Detokenizer 或 skip 下到 TokenizerManager | token ids、read offsets、finish reason、元数据 |
+| `BatchTokenIDOutput` | IPC 消息 | Scheduler 到 Detokenizer 或 skip 下到 TokenizerManager | detokenize 窗口 `decode_ids`、客户端 delta `output_ids`、read offsets、finish reason、元数据 |
 | `DecodeStatus` | Detokenizer | 一个 rid 的 streaming 生命周期 | 三类 offset 和已提交文本 |
 | `BatchStrOutput` | IPC 消息 | Detokenizer 到 TokenizerManager | `output_strs` 和透传元数据 |
 | `ReqState` | TokenizerManager | HTTP 请求生命周期 | 累加文本，唤醒前台协程 |
@@ -72,8 +76,8 @@ class PortArgs:
 
 | 字段组 | 字段 | 消费者 |
 |--------|------|--------|
-| 解码状态 | `decoded_texts`、`decode_ids`、`read_offsets` | Detokenizer |
-| 输出与停止 | `finished_reasons`、`output_ids`、`no_stop_trim` | Detokenizer 和 TokenizerManager |
+| 解码状态 | `decoded_texts`、`decode_ids`、`read_offsets` | Detokenizer；`decode_ids` 首包可含 prompt surrounding context |
+| 输出与停止 | `finished_reasons`、`output_ids`、`no_stop_trim` | `output_ids` 作为客户端 token delta 透传；stop 信息供 Detokenizer 收尾 |
 | decode 配置 | `skip_special_tokens`、`spaces_between_special_tokens` | Detokenizer |
 | 统计与可观测 | token counts、cache details、time stats、DP rank | TokenizerManager |
 | 可选大字段 | logprobs、hidden states、routed experts、indexer top-k | TokenizerManager，部分由 Detokenizer base64 编码 |
@@ -192,7 +196,7 @@ class LimitedCapacityDict(OrderedDict):
 
 ## 多 tokenizer worker 回传
 
-当 `tokenizer_worker_num > 1`，Detokenizer 不再使用单一 `send_to_tokenizer` socket。它把 batch 输出按 `http_worker_ipcs[i]` 切成单请求输出，再推回对应 worker。
+当 `tokenizer_worker_num > 1`，Detokenizer 不再使用单一 `send_to_tokenizer` socket。它把 batch 输出按 `http_worker_ipcs[i]` 切成 one-item batch，再推回对应 worker。对象类型仍通常是 `BatchStrOutput` / `BatchTokenIDOutput`，只是所有 per-request 字段长度变成 1，不要误以为一定会改造成 `BaseReq`。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/multi_tokenizer_mixin.py L351-L376
@@ -228,7 +232,7 @@ class LimitedCapacityDict(OrderedDict):
 
 ## 多 detokenizer worker 路由
 
-多 detokenizer worker 前面还有 `MultiDetokenizerRouter`。它从 Scheduler 公共 socket 收 batch，然后按每条请求的 `http_worker_ipc` 拆分并发给某个 worker。
+多 detokenizer worker 前面还有 `MultiDetokenizerRouter`。它从 Scheduler 公共 socket 收 batch，然后按每条请求的 `http_worker_ipc` 拆成 one-item batch 并发给某个 worker。
 
 ```python
 # 来源：sglang/python/sglang/srt/managers/multi_tokenizer_mixin.py L524-L568
@@ -279,7 +283,7 @@ class LimitedCapacityDict(OrderedDict):
             )
 ```
 
-不变量：有 rid 的 batch 必须携带同长度的 `http_worker_ipcs`，否则 router 无法确定每条输出的归属。
+不变量：有 rid 的 batch 必须携带同长度的 `http_worker_ipcs`，否则 router 无法确定每条输出的归属。亲和键不是 rid：同一 HTTP worker 的所有请求会哈希到同一 Detokenizer。它以更粗粒度换取稳定回传，若 HTTP worker 流量不均，Detokenizer worker 也可能倾斜。
 
 ## skip tokenizer 数据流
 
@@ -351,4 +355,5 @@ Scheduler send_to_detokenizer -> tokenizer_ipc_name -> TokenizerManager
 | 验证普通回程 | `DetokenizerManager.handle_batch_token_id_out` | 每个非空 batch 产生 `BatchStrOutput.output_strs` |
 | 验证 TokenizerManager 累加 | `TokenizerManager._handle_batch_output` | `state.append_text(delta_text)` 后前台协程被 event 唤醒 |
 | 验证多 worker 回传 | `http_worker_ipcs` 与 `_handle_output_by_index` | 每个 worker 只收到自己的 rid |
+| 验证亲和粒度 | `_pick(http_worker_ipc)` | 同一 HTTP worker 的请求落到同一 Detokenizer，而不是按 rid 独立均衡 |
 | 验证 skip 模式 | `SchedulerIpcChannels.create` | `send_to_detokenizer_raw` 指向 `tokenizer_ipc_name` |

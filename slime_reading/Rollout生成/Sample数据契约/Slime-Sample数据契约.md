@@ -9,7 +9,7 @@ tags:
   - framework/slime
   - content/map
   - source-reading
-updated: 2026-07-10
+updated: 2026-07-12
 ---
 # Sample数据契约
 
@@ -57,10 +57,10 @@ flowchart TB
 
 ## 核心源码锚点
 
-**判断：`Sample` 的核心压力是 response 侧多数组对齐。**
+**判断：`Sample` 的核心压力是 response 侧多数组对齐，同时 routed-experts 例外地按整条 token 序列的 next-token 位置对齐。**
 
 ```python
-# 来源：slime/utils/types.py L253-L314
+# 定位骨架（据 `slime/utils/types.py` L253-L314 选取入口校验）：
 def append_response_tokens(
     self,
     args=None,
@@ -84,7 +84,7 @@ def append_response_tokens(
         log_probs = [0.0] * len(tokens)
 ```
 
-这段源码说明 `Sample` 不是“填字段即可”。每次追加 response token，Slime 都在维护同一个时间轴：训练 token 必须带 rollout logprob，非训练 token 必须带 `loss_mask=0`，并且 top-p/routed expert 等元数据要跟 `response_length` 对齐。
+这段源码说明 `Sample` 不是“填字段即可”。每次追加 response token，Slime 都在维护同一个 response 时间轴：训练 token 必须带 rollout logprob，非训练 token 必须带 `loss_mask=0`，top-p offsets 要跟 `response_length` 对齐。`rollout_routed_experts` 是另一根尺子：其首维必须等于 `len(tokens)-1`，训练侧也按这个契约断言。
 
 ## 源码范围
 
